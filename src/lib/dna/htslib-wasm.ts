@@ -32,7 +32,11 @@ let Module: any = null;
 
 /**
  * Initialize the htslib WASM module.
- * Loads and compiles htslib_wasm.wasm.
+ * Loads and compiles htslib_wasm.wasm via the Emscripten-generated JS glue.
+ *
+ * Uses createRequire() to load the CommonJS glue script from
+ * ./pkg/htslib-wasm/htslib_wasm.js, which exports the factory
+ * function createHtslibWasmModule.
  *
  * @returns true if initialization succeeded
  */
@@ -40,26 +44,34 @@ export async function initHtslibWasm(): Promise<boolean> {
   if (initialized) return true;
 
   try {
-    const { readFile } = await import('fs/promises');
-    const { resolve } = await import('path');
+    // In ESM context, create a require() function to load the CJS glue.
+    const { createRequire } = await import('node:module');
+    const { resolve } = await import('node:path');
+    const require = createRequire(resolve(__dirname ?? '.', './pkg/htslib-wasm/htslib_wasm.js'));
 
-    const wasmPath = resolve(__dirname ?? '.', './pkg/htslib-wasm/htslib_wasm.wasm');
-    const wasmBuffer = await readFile(wasmPath);
+    // Load the Emscripten-generated factory function.
+    const createHtslibWasmModule = require('./pkg/htslib-wasm/htslib_wasm.js');
 
-    const jsPath = resolve(__dirname ?? '.', './pkg/htslib-wasm/htslib_wasm.js');
-    const jsCode = await readFile(jsPath, 'utf-8');
+    // Instantiate the WASM module. The glue script will locate
+    // htslib_wasm.wasm relative to its own __dirname.
+    Module = await createHtslibWasmModule();
 
-    const factory = new Function('module', 'require', '__filename', '__dirname',
-      jsCode + '\nreturn createHtslibWasmModule;');
-
-    const createModule = factory({ exports: {} }, require, __filename, __dirname);
-    Module = await createModule({ wasmBinary: new Uint8Array(wasmBuffer) });
+    // Verify that key exports exist.
+    if (
+      !Module ||
+      typeof Module._hts_open_mem !== 'function' ||
+      typeof Module._malloc !== 'function' ||
+      typeof Module.HEAPU8 === 'undefined'
+    ) {
+      throw new Error('htslib WASM module loaded but missing expected exports');
+    }
 
     initialized = true;
     return true;
   } catch (err) {
     console.warn('[htslib-wasm] Failed to initialize:', err);
     initialized = false;
+    Module = null;
     return false;
   }
 }
@@ -126,7 +138,7 @@ export class HtslibWasm {
 
     const hts = new HtslibWasm();
 
-    // Copy data to WASM memory
+    // Copy data to WASM memory via _malloc + HEAPU8.set
     const dataPtr = Module._malloc(data.length);
     Module.HEAPU8.set(data, dataPtr);
 
@@ -202,11 +214,17 @@ export class HtslibWasm {
     const cigarPtr = Module._bam_cigar(this.b);
     let cigar = '*';
     if (nCigar > 0 && cigarPtr) {
-      const cigarInts = new Uint32Array(Module.HEAPU8.buffer, cigarPtr, nCigar);
+      // Read CIGAR as individual uint32 values to avoid alignment issues
+      // with TypedArray (pointer may not be 4-byte aligned in WASM memory)
       const cigarOps: string[] = [];
       for (let i = 0; i < nCigar; i++) {
-        const op = cigarInts[i] & 0xF;
-        const len = cigarInts[i] >> 4;
+        const off = cigarPtr + i * 4;
+        const c = Module.HEAPU8[off] |
+                  (Module.HEAPU8[off + 1] << 8) |
+                  (Module.HEAPU8[off + 2] << 16) |
+                  (Module.HEAPU8[off + 3] << 24);
+        const op = c & 0xF;
+        const len = c >>> 4;
         const opChar = op < 9 ? 'MIDNSHP=X'[op] : '?';
         cigarOps.push(`${len}${opChar}`);
       }

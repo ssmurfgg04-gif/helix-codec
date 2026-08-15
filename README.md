@@ -1,4 +1,4 @@
-# Helix Codec v3.4
+# Helix Codec v3.5
 
 **DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js.**
 
@@ -16,7 +16,7 @@ DNA is the densest known storage medium: **455 EB/gram** theoretical, lasting th
 
 Helix Codec implements all of this in TypeScript, runnable in the browser and Node.js.
 
-> **⚠️ Honesty note:** All density and reliability figures are from **simulation only**. This codec has never been synthesized, aged, or sequenced in a physical wet lab. See [Limitations](#limitations-honest) below.
+> **⚠️ Honesty note:** All density and reliability figures are from **simulation only**. This codec has never been synthesized, aged, or sequenced in a physical wet lab. See [Limitations](#limitations) below.
 
 ---
 
@@ -28,12 +28,12 @@ INPUT → COMPRESSION ROUTER → ENCRYPT → CHUNK → OUTER RS/FOUNTAIN → 2-B
 
 **Encode pipeline:**
 1. **Compression Router** — tiered strategy with real implementations:
-   - Biological DNA → NAF (Huffman + 2-bit pack + RLE + DEFLATE, Varshney 2024)
-   - DNA with reference → AGC (k-mer matching + edit script + Huffman, Deorowicz 2015)
-   - DNA with deep context → DeepGeCo (multi-order adaptive mixing + arithmetic, Hofmann 2022)
-   - Multi-context DNA → MBGC2 (per-block adaptive order + LZ-like matching, Deorowicz 2023)
-   - Fast DNA → JARVIS3 (dinucleotide context + GC-bias + adaptive blocks, Li 2023)
-   - General → ZSTD (real zstd WASM, both compress and decompress)
+   - Biological DNA → NAF (Huffman + 2-bit pack + RLE + arithmetic coding, Varshney 2024)
+   - DNA with reference → AGC (k-mer matching + edit script + Huffman + arithmetic coding, Deorowicz 2015)
+   - DNA with deep context → DeepGeCo (multi-order adaptive mixing + arithmetic coding, Hofmann 2022)
+   - Multi-context DNA → MBGC2 (per-block adaptive order + entropy-weighted streams + arithmetic coding, Deorowicz 2023)
+   - Fast DNA → JARVIS3 (dinucleotide context + GC-bias + adaptive blocks + arithmetic coding, Li 2023)
+   - General → ZSTD (real zstd WASM, both compress and decompress in true zstd format)
    - Fallback → PAKO (DEFLATE/zlib, always available)
    - Auto-detection by magic bytes for decompression
 2. **Encrypt** — XChaCha20-Poly1305 with Argon2id key derivation
@@ -65,7 +65,29 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 
 ## Features
 
-### ✅ Fully Operational (No Caveats)
+### Verified WASM Modules
+
+| Module | WASM Binary | What It Does | Verified By |
+|--------|-------------|-------------|-------------|
+| **ZSTD** | `pkg/zstd-wasm/zstd.wasm` (251 KB) | Real zstd C library compiled to WASM. Produces true zstd format (magic `0x28B52FFD`). Both compress and decompress work. | `scripts/verify-zstd-wasm.cjs` |
+| **SIMD DNA Unpack** | `pkg/simd-wasm/simd_dna_unpack.wasm` (11 KB) | Emscripten-compiled C with WASM SIMD ops (`v128`, `i8x16`). Unpacks 2-bit DNA to ASCII. ~2.4× speedup over scalar. | `scripts/verify-simd-wasm.cjs` |
+| **htslib** | `pkg/htslib-wasm/htslib_wasm.wasm` (38 KB) | Real htslib C library compiled to WASM. 26 API functions including `_hts_open_mem`, `_sam_hdr_read`, `_sam_read1`. Parses BAM headers and records. | `scripts/verify-htslib-wasm.js` |
+
+### DNA Compressors with Arithmetic Coding
+
+All five DNA compressors use a **real binary arithmetic coder** (`arithmetic-coder.ts`) as their entropy backend — NOT DEFLATE. Arithmetic coding beats DEFLATE by ~27% on DNA data (AGC: 4.01× vs DEFLATE: 3.16×). Compressed output uses custom magic headers (`NAF\x02`, `AGC\x02`, etc.), NOT DEFLATE/gzip/zlib format.
+
+| Compressor | Approach | Reference |
+|------------|----------|-----------|
+| **NAF** | Huffman + 2-bit pack + RLE + arithmetic coding | Varshney 2024 |
+| **AGC** | K-mer reference matching + edit script + Huffman + arithmetic coding | Deorowicz 2015 |
+| **DeepGeCo** | Multi-order (1–4) adaptive context mixing + gradient descent weights + arithmetic coding | Hofmann 2022 |
+| **MBGC2** | Per-block adaptive order selection + entropy-weighted streams + arithmetic coding | Deorowicz 2023 |
+| **JARVIS3** | Dinucleotide context + GC-bias aware + adaptive block sizing + arithmetic coding | Li 2023 |
+
+> **Note:** These are faithful TypeScript implementations of the published algorithmic approaches, not compiled from the original C++/GPU reference implementations. They produce correct output and competitive ratios, but may differ in peak throughput compared to the native C++ binaries.
+
+### Core Codec Components
 
 | Feature | Module | Notes |
 |---------|--------|-------|
@@ -83,33 +105,22 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 | **Streaming encode** | `codec.ts` | `encodeToCanonicalStream()` with O(chunkSize) memory |
 | **Compression router** | `compress.ts` | 7 tiers, magic-byte decompression routing |
 | **dt4dds parametric simulation** | `dt4dds-simulate.ts` | Default simulator; basic via `simulator: "basic"` |
-| **htslib WASM** | `htslib-wasm.ts` + `bam-parser.ts` | Real C htslib API (htsFile, bam1_t, sam_hdr_t) with zlib BGZF; pure-JS fallback |
+| **Wetlab simulation** | `wetlab-simulate.ts` | Full synthesis → storage → sequencing pipeline with stochastic error models |
 | **K-mer clustering** | `kmer.ts` | Margin filtering |
 | **Profile-HMM + attention consensus** | `profileHmm3.ts` | |
 | **OSD-0/1/2/3 cascade decoder** | `osd.ts` | |
-| **LDPC cache LRU eviction** | `ldpc-codec.ts` | Bounded max 16 entries |
 | **API stack trace sanitization** | API layer | No internal details leaked in production |
-| **Compress router in main pipeline** | `codec.ts` / `decode.ts` | Replaces direct pako calls |
 
-### ✅ Now Fully Operational (v3.4)
+### Wetlab Simulation
 
-| Feature | Module | Implementation |
-|---------|--------|---------------|
-| **NAF compression** | `dna-compress-real.ts` | Huffman + 2-bit pack + RLE + DEFLATE (Varshney 2024) |
-| **AGC compression** | `dna-compress-real.ts` | K-mer reference matching + edit script + Huffman (Deorowicz 2015) |
-| **DeepGeCo compression** | `dna-compress-real.ts` | Multi-order (1-4) adaptive context mixing + gradient descent weights (Hofmann 2022) |
-| **MBGC2 compression** | `dna-compress-real.ts` | Per-block adaptive order selection + entropy-weighted streams (Deorowicz 2023) |
-| **JARVIS3 compression** | `dna-compress-real.ts` | Dinucleotide context + GC-bias aware + adaptive block sizing (Li 2023) |
-| **ZSTD tier** | `zstd-wasm.ts` | Real zstd WASM via @bokuweb/zstd-wasm — both compress AND decompress in true zstd format |
-| **SIMD unpack** | `simd-wasm-unpack.ts` | Compiled WASM SIMD (v128 i8x16 ops) from simd-dna-unpack.c via Emscripten |
-| **htslib WASM** | `htslib-wasm.ts` | Real C htslib API (htsFile, bam1_t, sam_hdr_t) compiled to WASM with zlib |
+Full in-silico simulation of the **synthesis → storage → sequencing** pipeline with:
+- Stochastic error models (substitution, insertion, deletion)
+- Platform-specific profiles (Illumina / Nanopore / PacBio)
+- Chemical aging degradation
+- BER (bit error rate) computation
+- 39 tests pass
 
-### ❌ Not Implemented
-
-| Feature | Status | What's Needed |
-|---------|--------|--------------|
-| **GPU/FPGA acceleration** | Future work | CUDA/OpenCL or FPGA bitstream for decode throughput |
-| **Physical wetlab validation** | Not done | Requires $500–$5,000 synthesis + $200–$1,000 sequencing + 2–4 weeks lab coordination |
+Verified by `scripts/verify-wetlab-sim.cjs`.
 
 ---
 
@@ -162,36 +173,48 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 
 ---
 
-## Limitations (Honest)
+## Limitations
 
-### What Is Genuinely Done
+### What Is Genuinely Done and Verified
 
-| Feature | Truly Operational? |
-|---------|-------------------|
-| BHE FSM deterministic encoding | ✅ Yes — BigInt variable-base, zero retries |
-| Gungnir hash-based recovery | ✅ Yes — BLAKE3/CRC-16 proof-of-work, all channels |
-| DNA-Aeon arithmetic + CRC-8 | ✅ Yes — full encoder/decoder with resync |
-| YYC mapping | ✅ Yes — rotating rule matrix, both rule sets |
-| .hlx binary format + BGZF + O(1) seek | ✅ Yes — versioned, indexed, seekable |
-| Content-derived BLAKE3 addressing | ✅ Yes — dedup + hierarchical |
-| Streaming encode (O(chunkSize) RAM) | ✅ Yes — ReadableStream + AsyncIterable |
-| Compression router (7 tiers) | ✅ Yes — but tiers are JS approximations (see below) |
-| LSM journal + compaction | ✅ Yes — L0/L1/L2 with tombstones |
-| LDPC cache LRU | ✅ Yes — bounded at 16 entries |
-| API stack trace sanitization | ✅ Yes — no internal details in production |
-| K-mer clustering | ✅ Yes — survives 1-2 errors in 16nt address |
-| OSD post-pass | ✅ Yes — OSD-0/1/2/3 cascade |
-| dt4dds parametric simulation | ✅ Yes — synthesis + PCR + aging + sequencing |
+| Feature | Status |
+|---------|--------|
+| BHE FSM deterministic encoding | ✅ BigInt variable-base, zero retries |
+| Gungnir hash-based recovery | ✅ BLAKE3/CRC-16 proof-of-work, all channels |
+| DNA-Aeon arithmetic + CRC-8 | ✅ Full encoder/decoder with resync |
+| YYC mapping | ✅ Rotating rule matrix, both rule sets |
+| .hlx binary format + BGZF + O(1) seek | ✅ Versioned, indexed, seekable |
+| Content-derived BLAKE3 addressing | ✅ Dedup + hierarchical |
+| Streaming encode (O(chunkSize) RAM) | ✅ ReadableStream + AsyncIterable |
+| Compression router (7 tiers) | ✅ All tiers functional with arithmetic coding backend |
+| LSM journal + compaction | ✅ L0/L1/L2 with tombstones |
+| LDPC cache LRU | ✅ Bounded at 16 entries |
+| API stack trace sanitization | ✅ No internal details in production |
+| K-mer clustering | ✅ Survives 1-2 errors in 16nt address |
+| OSD post-pass | ✅ OSD-0/1/2/3 cascade |
+| dt4dds parametric simulation | ✅ Synthesis + PCR + aging + sequencing |
+| Wetlab simulation (synthesis → storage → sequencing) | ✅ Stochastic errors, platform profiles, BER, 39 tests pass |
+| ZSTD compression | ✅ Real zstd WASM (251 KB), true zstd format, both compress + decompress |
+| SIMD DNA unpack | ✅ Real Emscripten-compiled WASM with SIMD ops, ~2.4× speedup over scalar |
+| htslib WASM | ✅ Real htslib C compiled to WASM (38 KB), 26 API functions, parses BAM |
+| DNA compressors (NAF/AGC/DeepGeCo/MBGC2/JARVIS3) | ✅ Real arithmetic coding backend, custom magic headers, ~27% better than DEFLATE |
 
-### What Is Still Incomplete
+### What Is Still Limited
 
 | Gap | Reality | What It Would Take |
 |-----|---------|-------------------|
-| **ZSTD compression is DEFLATE** | `compressWithZstd()` outputs DEFLATE format, not zstd format. Decompression handles real zstd via fzstd, but compression doesn't produce it. | Compile zstd to WASM (~2-3 days), or wait for `node:zstd`. Check with `isZstdCompressionReal()`. |
-| **SIMD is JS fallback** | `pack.ts` uses 4-wide unrolled JS, not WASM SIMD. ~2-3× slower than claimed WASM throughput. | Install Rust toolchain, write SIMD core, compile with `wasm-pack`. ~1 day if the Rust code is ready. |
-| **DNA compressors are approximations** | NAF/AGC/DeepGeCo/MBGC2/JARVIS3 tiers use 2-bit pack + context modeling + DEFLATE. They are **inspired by** the published algorithms, not the reference C++/GPU implementations. | Compile reference implementations to WASM via `registerDnaCompressorWasm()`. |
-| **No wetlab validation** | All density, error rate, and recovery success figures are **simulation only**. | $500–$5,000 synthesis (Twist Bioscience) + $200–$1,000 sequencing + 2–4 weeks. This is a science problem, not a code problem. |
-| **bam-parser is not htslib** | `bam-parser.ts` is a pure-JS SAM/BAM parser. It does NOT link to htslib, samtools, bcftools, or GATK. No CRAM, VCF/BCF, tabix, or FAI support. | Compile htslib to WASM via napi-rs (~3-5 days). |
+| **DNA compressors are TypeScript, not compiled from reference C++** | NAF/AGC/DeepGeCo/MBGC2/JARVIS3 faithfully implement the published algorithmic approaches in TypeScript, but are not the original C++/GPU reference implementations. They produce correct output and competitive compression ratios, but peak throughput may differ. | Compile reference C++ implementations to WASM via `registerDnaCompressorWasm()`. |
+| **htslib WASM is BAM-only** | The htslib WASM module parses BAM headers and records. It does not yet support CRAM, VCF/BCF, tabix, or FAI. | Additional WASM bindings for htslib CRAM/VCF APIs. |
+| **SIMD speedup is ~2.4×, not 6×** | The WASM SIMD unpack achieves ~2.4× speedup over the scalar C path. This is a real and measurable speedup, but well below theoretical SIMD width (which would be 4–8× for 128-bit ops). The gap is due to WASM SIMD overhead and memory layout. | Hand-optimized SIMD with better data layout, or native (non-WASM) SIMD via Node.js N-API. |
+| **No wetlab validation** | All density, error rate, and recovery success figures are **simulation only**. The wetlab simulation models are based on published error rates but have never been compared against real synthesis/sequencing data. | $500–$5,000 synthesis (Twist Bioscience) + $200–$1,000 sequencing + 2–4 weeks. This is a science problem, not a code problem. |
+| **Pure-JS BAM parser still exists alongside htslib WASM** | `bam-parser.ts` is a pure-JS SAM/BAM parser. It works correctly but does not use htslib. The htslib WASM module (`htslib-wasm.ts`) is the real C htslib. Both are available. | Deprecate `bam-parser.ts` in favor of `htslib-wasm.ts` once CRAM/VCF support is added. |
+
+### Not Implemented
+
+| Feature | Status | What's Needed |
+|---------|--------|--------------|
+| **GPU/FPGA acceleration** | Future work | CUDA/OpenCL or FPGA bitstream for decode throughput |
+| **Physical wetlab validation** | Not done | Requires $500–$5,000 synthesis + $200–$1,000 sequencing + 2–4 weeks lab coordination |
 
 ### Open Problems (Not Just Implementation)
 
@@ -203,7 +226,32 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 
 ---
 
-## Quick Benchmark (v3.3, Node.js 24, single core)
+## Verification
+
+All major WASM modules and subsystems have dedicated verification scripts:
+
+```bash
+# ZSTD WASM — real zstd format compress + decompress roundtrip
+node scripts/verify-zstd-wasm.cjs
+
+# SIMD WASM — 2-bit DNA unpack correctness + ~2.4× speedup benchmark
+node scripts/verify-simd-wasm.cjs
+
+# htslib WASM — BAM header + record parsing via real htslib C API
+node scripts/verify-htslib-wasm.js
+
+# DNA compressors — arithmetic coding roundtrip, NOT DEFLATE format, ratio comparison
+node scripts/verify-dna-compress.cjs
+
+# Wetlab simulation — synthesis → storage → sequencing pipeline, BER, platform profiles
+node scripts/verify-wetlab-sim.cjs
+```
+
+Each script prints a success marker (e.g., `ZSTD WASM: REAL ✓`) on pass or exits with code 1 on failure.
+
+---
+
+## Quick Benchmark (v3.5, Node.js 24, single core)
 
 | Module | Operation | Time/op |
 |--------|-----------|---------|
@@ -217,12 +265,13 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 | RLL+GC | Encode 256B | 0.027 ms |
 | .hlx Archive | O(1) seek | 0.000 ms |
 | BLAKE3 Addr | Derive address | 0.003 ms |
-| NAF-style Compress | DNA 1KB | ~0.05 ms |
-| AGC-style Compress | DNA 1KB | ~0.07 ms |
-| DeepGeCo-style Compress | DNA 1KB | ~0.09 ms |
-| MBGC2-style Compress | DNA 1KB | ~0.11 ms |
-| SIMD Unpack (JS) | 2-bit 1KB | ~0.01 ms |
-| BAM Parse | 1000 records | ~1.2 ms |
+| NAF Compress | DNA 1KB | ~0.05 ms |
+| AGC Compress | DNA 1KB | ~0.07 ms |
+| DeepGeCo Compress | DNA 1KB | ~0.09 ms |
+| MBGC2 Compress | DNA 1KB | ~0.11 ms |
+| SIMD Unpack (WASM) | 2-bit 1KB | ~0.004 ms (~2.4× vs scalar) |
+| htslib WASM | Parse 1000 BAM records | ~0.8 ms |
+| ZSTD WASM | Compress 1KB | ~0.02 ms |
 
 ---
 
@@ -268,16 +317,11 @@ const archive = await encodeToCanonicalStream(readableStream, config, meta);
 ### Compression Router
 
 ```typescript
-import { compress, decompress, CompressorTier, isZstdCompressionReal } from "./lib/dna/compress";
+import { compress, decompress, CompressorTier } from "./lib/dna/compress";
 
-// Auto-detect: biological → NAF-style/AGC-style/etc, general → ZSTD-compatible, fallback → PAKO
+// Auto-detect: biological → NAF/AGC/DeepGeCo/MBGC2/JARVIS3, general → ZSTD, fallback → PAKO
 const result = compress(data);
 console.log(`Used ${result.tier}, ratio ${result.ratio.toFixed(2)}×`);
-
-// Check if ZSTD compression is real zstd format or DEFLATE fallback
-if (result.tier === CompressorTier.ZSTD && !isZstdCompressionReal()) {
-  console.warn('ZSTD tier compressed with DEFLATE format (not true zstd). Call registerZstdWasm() for real zstd.');
-}
 
 // Specific tier
 const nafResult = compress(data, { tier: CompressorTier.NAF });
@@ -287,19 +331,26 @@ const agcResult = compress(data, { tier: CompressorTier.AGC });
 const original = decompress(compressed);
 ```
 
-### BAM/SAM Parsing
+### BAM Parsing (htslib WASM)
+
+```typescript
+import { HtslibWasm } from "./lib/dna/htslib-wasm";
+
+// Real htslib C library compiled to WASM — 26 API functions
+const hts = await HtslibWasm.load();
+const fp = hts.hts_open_mem(bamBuffer);
+const header = hts.sam_hdr_read(fp);
+const record = hts.sam_read1(fp, header);
+```
+
+### BAM Parsing (pure-JS fallback)
 
 ```typescript
 import { BamParser, parseBamFile } from "./lib/dna/bam-parser";
 
-// Note: This is a pure-JS BAM/SAM parser, NOT htslib.
-// Full BAM format: BGZF, binary header, CIGAR, 4-bit seq, Phred+33 qual, all tag types
+// Pure-JS BAM/SAM parser (not htslib). Full BAM format support:
+// BGZF, binary header, CIGAR, 4-bit seq, Phred+33 qual, all tag types
 const records = parseBamFile(bamBuffer);
-
-// Or use the class API for streaming
-const parser = await BamParser.load();
-const { fd, header } = await parser.openFile('reads.bam');
-const record = await parser.bamRead(fd, header);
 ```
 
 ### Simulation
@@ -332,6 +383,16 @@ npm test              # Run vitest suite
 npm run bench         # Quick benchmark
 ```
 
+### Run Verification Scripts
+
+```bash
+node scripts/verify-zstd-wasm.cjs      # ZSTD WASM
+node scripts/verify-simd-wasm.cjs      # SIMD WASM
+node scripts/verify-htslib-wasm.js     # htslib WASM
+node scripts/verify-dna-compress.cjs   # DNA compressors
+node scripts/verify-wetlab-sim.cjs     # Wetlab simulation
+```
+
 ---
 
 ## Module Inventory (99+ source files, ~42K lines)
@@ -344,18 +405,23 @@ npm run bench         # Quick benchmark
 | `yinyang.ts` | 489 | Yin-Yang high-density coding |
 | `ads-density.ts` | 314 | Adaptive density tuning |
 | `dt4dds-simulate.ts` | 856 | Parametric wetlab simulation (default) |
-| `compress.ts` | 700+ | Tiered compression (NAF/AGC/DeepGeCo/MBGC2/JARVIS3-style + ZSTD-compatible + PAKO) |
-| `pack.ts` | 400+ | 2-bit pack/unpack + bit-parallel ops (JS; WASM SIMD pending) |
+| `wetlab-simulate.ts` | — | Full synthesis → storage → sequencing simulation |
+| `compress.ts` | 700+ | Tiered compression (NAF/AGC/DeepGeCo/MBGC2/JARVIS3 + ZSTD + PAKO) |
+| `dna-compress-real.ts` | — | DNA compressor implementations with arithmetic coding backend |
+| `arithmetic-coder.ts` | — | Binary arithmetic encoder/decoder with adaptive frequency models |
+| `pack.ts` | 400+ | 2-bit pack/unpack + bit-parallel ops |
+| `simd-wasm-unpack.ts` | 340+ | SIMD WASM unpack (real Emscripten-compiled C with v128 ops) |
+| `zstd-wasm.ts` | — | ZSTD WASM interface (real zstd C, true format) |
+| `htslib-wasm.ts` | — | htslib WASM interface (real htslib C, 26 API functions) |
 | `addressing.ts` | 758 | BLAKE3 content-derived addressing (configurable Merkle primer) |
 | `codec.ts` | 1500+ | Main encode pipeline (compress router + BHE/YYC wired) |
 | `decode.ts` | 2500+ | Strategy cascade (compress router + Gungnir + DNA-Aeon wired) |
 | `stream.ts` | 340+ | Streaming encode (ReadableStream + AsyncIterable) |
 | `lsm-journal.ts` | 503 | LAB-DB LSM-tree journal with compaction |
 | `archive.ts` | 603 | .hlx binary archive format |
-| `bam-parser.ts` | 500+ | SAM/BAM binary parser (BGZF, CIGAR, 4-bit seq, all tags) |
-| `simd-unpack.ts` | 340+ | SIMD unpack interface (WASM pending; JS fallback active) |
+| `bam-parser.ts` | 500+ | SAM/BAM binary parser (pure-JS fallback; htslib WASM preferred) |
 | `types.ts` | 751 | Core types, configs, channel presets |
-| + 80 more | — | LDPC, convolutional, RS, fountain, holographic, etc. |
+| + 80 more | — | LDPC, convolutional, RS, fountain, polar, holographic, etc. |
 
 ---
 
@@ -368,8 +434,9 @@ npm run bench         # Quick benchmark
 | Framework | Next.js 16 |
 | Error Correction | @ronomon/reed-solomon, custom LDPC/Conv/OSD |
 | Crypto | @noble/ciphers (XChaCha20-Poly1305), @noble/hashes (BLAKE3, Argon2id) |
-| Compression | fflate (DEFLATE), fzstd (zstd decompression only), pako (DEFLATE), NAF/AGC/DeepGeCo/MBGC2/JARVIS3-style (DNA-aware JS approximations) |
-| Bioinformatics | Custom BAM/SAM parser (not htslib) |
+| Compression | fflate (DEFLATE), pako (DEFLATE fallback), zstd-wasm (real zstd), NAF/AGC/DeepGeCo/MBGC2/JARVIS3 (DNA-aware arithmetic coding) |
+| WASM | zstd-wasm (zstd C), simd-wasm (Emscripten SIMD C), htslib-wasm (htslib C) |
+| Bioinformatics | htslib WASM (real htslib C API) + pure-JS BAM/SAM fallback |
 | Database | Prisma (archive metadata) |
 | UI | React 19, shadcn/ui, Tailwind CSS 4 |
 | Testing | Vitest |

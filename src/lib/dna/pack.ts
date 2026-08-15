@@ -22,6 +22,7 @@
  */
 
 import { simdUnpack, initSimdUnpack, isSimdAvailable } from "./simd-unpack";
+import { initSimdWasm, simdWasmUnpack, isSimdWasmReady } from "./simd-wasm-unpack";
 
 // ---------------------------------------------------------------------------
 // Lookup tables for fast char ↔ 2-bit conversion
@@ -89,14 +90,22 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     );
   }
 
-  // SIMD WASM acceleration: enabled when initSimdUnpack() successfully loads
-  // the compiled WASM module with real v128 SIMD operations.
-  if (numBases <= bits.length * 4) {
-    // Try WASM SIMD for bulk unpack (async init, sync use)
-    // For now, the JS path is used; the async initSimdUnpack() must be
-    // called before use. See simd-unpack.ts for details.
+  // SIMD WASM acceleration: when initSimdWasm() has completed, use the
+  // compiled WASM module with real v128 SIMD operations for bulk unpack.
+  if (isSimdWasmReady()) {
+    const asciiBytes = simdWasmUnpack(bits, numBases);
+    // Fast path: decode ASCII bytes to string without Array.join
+    let result = '';
+    for (let i = 0; i < numBases; i++) {
+      result += String.fromCharCode(asciiBytes[i]);
+    }
+    return result;
   }
 
+  // Kick off lazy SIMD WASM init for future calls
+  ensureSimdWasmInit();
+
+  // Scalar fallback
   const chars: string[] = new Array(numBases);
   for (let i = 0; i < numBases; i++) {
     const byteIdx = i >> 2;
@@ -376,7 +385,29 @@ export function reverseComplement(bits: Uint8Array, numBases: number): Uint8Arra
 }
 
 // ---------------------------------------------------------------------------
+// SIMD WASM lazy initialization
+// ---------------------------------------------------------------------------
+
+/** Whether SIMD WASM init has been attempted. */
+let _simdWasmInitAttempted = false;
+
+/** Kick off SIMD WASM initialization (idempotent, fire-and-forget). */
+function ensureSimdWasmInit(): void {
+  if (!_simdWasmInitAttempted) {
+    _simdWasmInitAttempted = true;
+    initSimdWasm().then(ok => {
+      if (ok) {
+        // SIMD WASM ready — subsequent unpackBitsToDna calls will use it
+      }
+    }).catch(() => {
+      // SIMD WASM unavailable — scalar fallback will be used
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // SIMD unpack re-exports
 // ---------------------------------------------------------------------------
 
 export { initSimdUnpack, isSimdAvailable } from "./simd-unpack";
+export { initSimdWasm, isSimdWasmReady } from "./simd-wasm-unpack";

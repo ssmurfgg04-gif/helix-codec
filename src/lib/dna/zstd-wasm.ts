@@ -2,25 +2,63 @@
  * Real Zstandard (de)compression via WASM.
  *
  * Uses @bokuweb/zstd-wasm which ships a pre-compiled zstd C library
- * (compiled with Emscripten). Provides both ZSTD_compress and ZSTD_decompress
- * — true zstd format, fully compatible with the zstd command-line tool.
+ * (compiled with Emscripten). The `index.node.js` entry point handles
+ * reading the WASM binary and initializing the Emscripten Module.
  *
  * Usage:
  *   import { initZstdWasm, zstdCompress, zstdDecompress } from './zstd-wasm';
  *   await initZstdWasm();
  *   const compressed = zstdCompress(data, 3);
  *   const decompressed = zstdDecompress(compressed);
+ *
+ * The compressed output starts with 0x28 0xB5 0x2F 0xFD — the zstd magic
+ * number — making it fully compatible with the zstd command-line tool.
  */
 
 /** Whether the WASM module has been initialized. */
 let initialized = false;
 
-/** @bokuweb/zstd-wasm module (loaded dynamically). */
-let zstdModule: any = null;
+/** Cached reference to the loaded zstd module compress/decompress. */
+let zstdApi: {
+  compress: (buf: Uint8Array, level?: number) => Uint8Array;
+  decompress: (buf: Uint8Array, opts?: { defaultHeapSize?: number }) => Uint8Array;
+} | null = null;
+
+/**
+ * Load the zstd-wasm index.node.js module.
+ * Tries pkg/ first, then wasm-pkg/ as fallback.
+ */
+function loadZstdModule(): any | null {
+  // Try pkg/zstd-wasm/index.node.js first
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('./pkg/zstd-wasm/index.node.js');
+    if (mod && typeof mod.init === 'function' && typeof mod.compress === 'function') {
+      return mod;
+    }
+  } catch {
+    // Not available from pkg/
+  }
+
+  // Try wasm-pkg/zstd-wasm/index.node.js
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('./wasm-pkg/zstd-wasm/index.node.js');
+    if (mod && typeof mod.init === 'function' && typeof mod.compress === 'function') {
+      return mod;
+    }
+  } catch {
+    // Not available from wasm-pkg/
+  }
+
+  return null;
+}
 
 /**
  * Initialize the zstd WASM module.
  * Must be called once before using zstdCompress/zstdDecompress.
+ *
+ * Tries both `pkg/zstd-wasm/` and `wasm-pkg/zstd-wasm/` directories.
  *
  * @returns true if initialization succeeded
  */
@@ -28,39 +66,28 @@ export async function initZstdWasm(): Promise<boolean> {
   if (initialized) return true;
 
   try {
-    // Dynamic import of the zstd-wasm package
-    // The WASM binary is at ./pkg/zstd-wasm/zstd.wasm
-    const { readFile } = await import('fs/promises');
-    const { resolve } = await import('path');
-    const { createRequire } = await import('module');
+    const mod = loadZstdModule();
 
-    // Use createRequire for CJS interop in ESM context
-    const require = createRequire(import.meta.url ?? __filename);
+    if (!mod) {
+      throw new Error('Could not find zstd-wasm/index.node.js in pkg/ or wasm-pkg/');
+    }
 
-    // Load the JS glue code
-    const zstdPkg = require('./pkg/zstd-wasm/zstd.js');
-    const wasmPath = resolve(__dirname ?? '.', './pkg/zstd-wasm/zstd.wasm');
+    // Call init() — this reads the WASM binary (zstd.wasm) and initializes
+    // the Emscripten Module. After this, compress/decompress work.
+    await mod.init();
 
-    // Read the WASM binary
-    const wasmBuffer = await readFile(wasmPath);
-
-    // Initialize the module
-    zstdModule = {
-      compress: zstdPkg.compress,
-      decompress: zstdPkg.decompress,
-      init: zstdPkg.init,
-      Module: zstdPkg.Module,
+    // Store references to compress and decompress
+    zstdApi = {
+      compress: mod.compress,
+      decompress: mod.decompress,
     };
-
-    // Call init to load the WASM binary into the emscripten Module
-    const { init } = zstdModule;
-    await init();
 
     initialized = true;
     return true;
   } catch (err) {
     console.warn('[zstd-wasm] Failed to initialize zstd WASM:', err);
     initialized = false;
+    zstdApi = null;
     return false;
   }
 }
@@ -70,14 +97,14 @@ export async function initZstdWasm(): Promise<boolean> {
  *
  * @param data Input bytes to compress
  * @param level Compression level (1-22, default 3). Level 3 = default zstd.
- * @returns Compressed bytes in true zstd frame format
+ * @returns Compressed bytes in true zstd frame format (starts with 0x28 0xB5 0x2F 0xFD)
  * @throws Error if WASM not initialized
  */
 export function zstdCompress(data: Uint8Array, level: number = 3): Uint8Array {
-  if (!initialized || !zstdModule) {
+  if (!initialized || !zstdApi) {
     throw new Error('zstd WASM not initialized — call initZstdWasm() first');
   }
-  return zstdModule.compress(Buffer.from(data), level);
+  return zstdApi.compress(data, level);
 }
 
 /**
@@ -88,10 +115,10 @@ export function zstdCompress(data: Uint8Array, level: number = 3): Uint8Array {
  * @throws Error if WASM not initialized or data is not valid zstd
  */
 export function zstdDecompress(data: Uint8Array): Uint8Array {
-  if (!initialized || !zstdModule) {
+  if (!initialized || !zstdApi) {
     throw new Error('zstd WASM not initialized — call initZstdWasm() first');
   }
-  return zstdModule.decompress(Buffer.from(data));
+  return zstdApi.decompress(data);
 }
 
 /** Check if zstd WASM is initialized and available. */

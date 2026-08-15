@@ -34,31 +34,36 @@ const UNPACK_LUT = new Uint8Array([0x41, 0x43, 0x47, 0x54]); // A, C, G, T
  * Initialize the SIMD WASM module.
  * Loads and compiles simd_dna_unpack.wasm with SIMD support.
  *
+ * Uses require() to load the Emscripten-generated JS glue code, which
+ * exports createSimdDnaUnpackModule as a factory function. The glue code
+ * looks for simd_dna_unpack_mod.wasm (which we ensure exists alongside
+ * simd_dna_unpack.wasm).
+ *
  * @returns true if WASM SIMD is available, false if falling back to scalar
  */
 export async function initSimdWasm(): Promise<boolean> {
   if (initialized) return true;
 
   try {
-    const { readFile } = await import('fs/promises');
-    const { resolve } = await import('path');
+    // Load the Emscripten glue code via require — it exports
+    // createSimdDnaUnpackModule as the factory function.
+    const createModule = require('./pkg/simd-wasm/simd_dna_unpack.js');
 
-    // Read the WASM binary
-    const wasmPath = resolve(__dirname ?? '.', './pkg/simd-wasm/simd_dna_unpack.wasm');
-    const wasmBuffer = await readFile(wasmPath);
+    // Instantiate the WASM module. The glue code will locate
+    // simd_dna_unpack_mod.wasm via __dirname (Node.js) or locateFile.
+    Module = await createModule({
+      // Provide locateFile so the glue code can find the WASM binary
+      // relative to this source file, regardless of CWD.
+      locateFile: (filename: string, scriptDir: string) => {
+        // The glue code always looks for simd_dna_unpack_mod.wasm.
+        // In Node.js, scriptDir is __dirname + '/' from the JS glue,
+        // which already points to pkg/simd-wasm/, so just return
+        // scriptDir + filename.
+        return scriptDir + filename;
+      },
+    });
 
-    // Read the JS glue code
-    const jsPath = resolve(__dirname ?? '.', './pkg/simd-wasm/simd_dna_unpack.js');
-    const jsCode = await readFile(jsPath, 'utf-8');
-
-    // Create the factory function
-    const factory = new Function('module', 'require', '__filename', '__dirname',
-      jsCode + '\nreturn createSimdDnaUnpackModule;');
-
-    const createModule = factory({ exports: {} }, require, __filename, __dirname);
-    Module = await createModule({ wasmBinary: new Uint8Array(wasmBuffer) });
-
-    // Initialize lookup table
+    // Initialize the lookup table inside WASM memory
     Module._init_lut();
 
     initialized = true;
@@ -66,6 +71,7 @@ export async function initSimdWasm(): Promise<boolean> {
   } catch (err) {
     console.warn('[simd-wasm] Failed to initialize SIMD WASM:', err);
     initialized = false;
+    Module = null;
     return false;
   }
 }
@@ -98,7 +104,7 @@ export function simdWasmUnpack(packed: Uint8Array, numNucleotides: number): Uint
     // Copy packed data to WASM memory
     Module.HEAPU8.set(packed, inPtr);
 
-    // Call SIMD unpack
+    // Call SIMD interleaved unpack (outputs in sequential order)
     Module._unpack_simd_interleaved(inPtr, outPtr, packed.length);
 
     // Copy result back, trimming to numNucleotides

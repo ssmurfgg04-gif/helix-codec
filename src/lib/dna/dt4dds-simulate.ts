@@ -11,6 +11,9 @@
  * For unit tests, the simple simulator is still available.
  * For research or vendor integration, use this parametric model.
  *
+ * For a higher-level API that operates on raw digital data and computes
+ * end-to-end metrics (BER, recovery rate), see wetlab-simulate.ts.
+ *
  * Key differences from simulate.ts:
  *   - Position-dependent synthesis errors (5'/3' end effects)
  *   - GC-biased PCR amplification (high-GC oligos amplify less)
@@ -21,6 +24,8 @@
  * Reference:
  *   - fml-ethz/dt4dds (Python, Nature Comms & Digital Discovery)
  *   - Lee et al. (2022). "Photon reading..." Nat. Commun. 13:3231.
+ *   - Banal et al. (2026). arXiv:2604.20810 — soft-information decoding
+ *   - Preuss et al. (2026). Nature Sci Rep — measured real-world error rates
  */
 
 import { Oligo } from "./types";
@@ -453,6 +458,13 @@ function pcrCycle(oligo: Oligo, params: PCRParams): Oligo[] {
 /**
  * Step 2: Simulate PCR amplification.
  *
+ * Each oligo undergoes `cycles` rounds of amplification:
+ *   - Per cycle, each molecule has probability `duplicationProb` of being duplicated
+ *   - GC bias reduces amplification efficiency for GC-rich sequences:
+ *     effectiveProb = duplicationProb × (1 - gcBias × |gc - 0.5| / 0.5)
+ *   - Taq polymerase fidelity: substitution errors at rate `substitutionRate` per base
+ *   - Expected copies after c cycles: (1 + p)^c
+ *
  * GC bias: high-GC oligos amplify less → lower coverage.
  * Duplication: each oligo produces ~2^cycles copies, with stochastic variation.
  * Errors: Taq polymerase introduces substitutions.
@@ -558,9 +570,20 @@ function applyAgingDamage(
 /**
  * Step 3: Simulate aging/decay.
  *
- * Depurination: A/G → deletion (breaks backbone)
- * Oxidation: G → substitution (G→T or G→C)
- * Deamination: C → T substitution
+ * Three chemical damage mechanisms modeled:
+ *   - Depurination: A/G → deletion (breaks sugar-phosphate backbone)
+ *     Rate scales linearly with storage time: effectiveRate = rate × days
+ *     Dominant damage mechanism in aqueous storage at neutral pH
+ *   - Oxidation: G → T or G → C substitution
+ *     Caused by reactive oxygen species (ROS)
+ *     More prevalent in aerobic storage conditions
+ *   - Deamination: C → T substitution
+ *     Spontaneous hydrolysis of cytosine's exocyclic amine group
+ *     Creates C→T (or G→A on complement) transitions
+ *     Rate doubles approximately every 10°C (Arrhenius kinetics)
+ *
+ * All rates are per-day, so effective rate = rate × days.
+ * Temperature dependence is NOT modeled (assumes controlled storage at ~4°C).
  *
  * @param oligos Oligos after PCR
  * @param params Aging parameters
@@ -679,13 +702,21 @@ function simulateOneRead(
 /**
  * Step 4: Simulate sequencing.
  *
- * Platform-specific error profiles.
- * Generate reads at given coverage depth.
+ * Platform-specific error profiles:
+ *   - Illumina: substitution-dominant, very low indels (~0.1% per base)
+ *     Phred Q30+ for most bases, Q5-15 at error positions
+ *   - Nanopore (ONT R10.4.1): indel-heavy (~9% total per base)
+ *     Lower quality scores, insertions and deletions dominate
+ *   - PacBio HiFi (CCS-corrected): ~0.1-1% after circular consensus
+ *     Mostly substitutions at low rate, insertion-dominant before CCS
+ *
+ * Each surviving oligo generates `coverage` independent reads.
+ * Reads include per-base Phred quality scores for soft-information decoding.
  * Some oligos may be lost entirely (dropout).
  *
  * @param oligos Oligo pool after aging
  * @param params Sequencing parameters
- * @returns Array of sequencing reads
+ * @returns Array of sequencing reads with Q-scores
  */
 export function simulateSequencing(
   oligos: Oligo[],

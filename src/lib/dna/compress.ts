@@ -37,11 +37,13 @@
  * fully compatible with the zstd command-line tool.
  *
  * Default strategy:
- *   biological → NAF (Huffman + 2-bit + RLE + DEFLATE) → JARVIS3 (dinucleotide + GC-bias) → PAKO
+ *   biological → NAF (arithmetic coding + 2-bit + RLE) → JARVIS3 (dinucleotide + GC-bias + arithmetic) → PAKO
  *   general    → ZSTD (real zstd WASM) → PAKO
  *   already-compressed → passthrough (no compression)
  *
- * Real implementations are used at module load time.
+ * Real implementations are used at module load time when available;
+ * otherwise DEFLATE-based fallbacks are used. Call initRealDnaCompressors()
+ * to lazy-load the real arithmetic-coding implementations asynchronously.
  * WASM zstd is initialized lazily via initZstdWasm().
  *
  * Reference:
@@ -103,6 +105,11 @@ export async function initZstdWasm(): Promise<boolean> {
         decompress: mod.zstdDecompress,
       };
       zstdWasmInitialized = true;
+      // Also register in the legacy zstdCompressWasm/zstdDecompressWasm slots
+      // so that tier routing (zstdCompressWasm check) and isZstdCompressionReal()
+      // correctly reflect that real zstd WASM is available.
+      zstdCompressWasm = mod.zstdCompress;
+      zstdDecompressWasm = mod.zstdDecompress;
     }
     return success;
   } catch {
@@ -111,15 +118,23 @@ export async function initZstdWasm(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// Real DNA compressor import
+// Real DNA compressor import (arithmetic coding-based)
 // ---------------------------------------------------------------------------
 
 let realCompressors: typeof import('./dna-compress-real') | null = null;
+let realCompressorsLoaded = false;
 try {
-  // Lazy-load to avoid circular imports
+  // Eager-load at module time if possible (CJS/bundled ESM)
+  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
   realCompressors = require('./dna-compress-real');
+  realCompressorsLoaded = true;
 } catch {
-  // Will be loaded on first use
+  // Will be loaded via initRealDnaCompressors() or on first use
+}
+
+/** Whether the real arithmetic-coding DNA compressors are loaded. */
+export function isRealDnaCompressorsLoaded(): boolean {
+  return realCompressorsLoaded;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,15 +143,15 @@ try {
 
 /** Compression tier identifiers (ordered by typical compression ratio). */
 export enum CompressorTier {
-  /** NAF: Nucleotide Archive Format (Varshney 2024). Huffman + 2-bit pack + RLE + DEFLATE. */
+  /** NAF: Nucleotide Archive Format (Varshney 2024). 2-bit pack + RLE + arithmetic coding (default). DEFLATE fallback. */
   NAF = 'naf',
-  /** AGC: Assembly Graph Compression (Deorowicz 2015). K-mer reference matching + edit script + Huffman. */
+  /** AGC: Assembly Graph Compression (Deorowicz 2015). Order-1 context model + arithmetic coding (default). DEFLATE fallback. */
   AGC = 'agc',
-  /** DeepGeCo: Deep DNA Sequence Compression (Hofmann 2022). Multi-order adaptive mixing + arithmetic. */
+  /** DeepGeCo: Deep DNA Sequence Compression (Hofmann 2022). Order-2 context model + arithmetic coding (default). DEFLATE fallback. */
   DEEP_GECO = 'deep_geco',
-  /** MBGC2: Multi-context BG Compression (Deorowicz 2023). Per-block adaptive order selection + LZ-like matching. */
+  /** MBGC2: Multi-context BG Compression (Deorowicz 2023). Multi-stream split + arithmetic coding (default). DEFLATE fallback. */
   MBGC2 = 'mbgc2',
-  /** JARVIS3: Fast DNA Compression (Li 2023). Dinucleotide context + GC-bias + adaptive block sizing. */
+  /** JARVIS3: Fast DNA Compression (Li 2023). Dinucleotide context + adaptive blocks + arithmetic coding (default). DEFLATE fallback. */
   JARVIS3 = 'jarvis3',
   /** Zstandard: Real zstd WASM (both compress and decompress). True zstd frame format. */
   ZSTD = 'zstd',
@@ -816,27 +831,26 @@ function rleDecode2byte(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// NAF compressor — 2-bit pack + RLE + DEFLATE (Varshney 2024)
+// NAF compressor — arithmetic coding (default) / DEFLATE fallback (Varshney 2024)
 // ---------------------------------------------------------------------------
 
 /**
  * Compress data using NAF (Nucleotide Archive Format).
  *
- * Strategy:
- *   1. Detect if data is predominantly DNA (ACGT characters)
- *   2. If DNA: extract sequence → 2-bit pack → RLE → pako.deflate
- *   3. If not DNA: fall back to pako.deflate
+ * Default: arithmetic coding (from dna-compress-real.ts) — encodes symbols
+ * with fractional bits for optimal compression ratio.
+ * Fallback: DEFLATE-based 2-bit pack + RLE + pako.deflate.
  *
- * Output format for DNA:
- *   [NAF_MAGIC(4)] [flags(1)] [skeleton_len(4)] [skeleton...] [compressed_2bit_rle...]
- *
- * flags bit 0: 1 = DNA was detected, 0 = fallback to plain DEFLATE
+ * Arithmetic-coded output uses magic NAF\x02; DEFLATE fallback uses NAF\x01.
  *
  * @param data Input bytes
  * @param level Compression level (default: 6)
  * @returns Compressed bytes
  */
 export function compressWithNAF(data: Uint8Array, level: number = 6): Uint8Array {
+  if (realCompressors) {
+    try { return realCompressors.compressWithNAF(data, level); } catch {}
+  }
   if (!isDnaSequence(data)) {
     // Not DNA — wrap with magic + flag 0 + plain DEFLATE
     const compressed = compressWithPako(data, level);
@@ -869,11 +883,21 @@ export function compressWithNAF(data: Uint8Array, level: number = 6): Uint8Array
 /**
  * Decompress NAF-compressed data.
  *
+ * Detects arithmetic-coded (NAF\x02) vs DEFLATE (NAF\x01) format automatically.
+ *
  * @param data NAF-compressed bytes
  * @returns Decompressed bytes
  */
 export function decompressWithNAF(data: Uint8Array): Uint8Array {
-  // Verify magic
+  // Check for arithmetic-coded format (NAF\x02)
+  if (data.length >= 4 && data[0] === 0x4E && data[1] === 0x41 &&
+      data[2] === 0x46 && data[3] === 0x02) {
+    if (realCompressors) {
+      try { return realCompressors.decompressWithNAF(data); } catch {}
+    }
+    throw new Error('NAF arithmetic-coded data but real compressors not available');
+  }
+  // Verify DEFLATE-format magic
   if (data.length < 5 ||
       data[0] !== NAF_MAGIC[0] || data[1] !== NAF_MAGIC[1] ||
       data[2] !== NAF_MAGIC[2] || data[3] !== NAF_MAGIC[3]) {
@@ -905,27 +929,26 @@ export function decompressWithNAF(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// JARVIS3 compressor — 2-bit pack + DEFLATE level 1 (Li 2023)
+// JARVIS3 compressor — arithmetic coding (default) / DEFLATE fallback (Li 2023)
 // ---------------------------------------------------------------------------
 
 /**
  * Compress data using JARVIS3 (fast DNA compression).
  *
- * Strategy:
- *   1. Detect if data is predominantly DNA (ACGT characters)
- *   2. If DNA: extract sequence → 2-bit pack → pako.deflate level 1 (fast)
- *   3. If not DNA: fall back to pako.deflate level 1
+ * Default: arithmetic coding (from dna-compress-real.ts) — dinucleotide
+ * context + adaptive block sizing + arithmetic coding.
+ * Fallback: DEFLATE-based 2-bit pack + pako.deflate level 1.
  *
- * Output format for DNA:
- *   [JARVIS3_MAGIC(4)] [flags(1)] [skeleton_len(4)] [skeleton...] [compressed_2bit...]
- *
- * flags bit 0: 1 = DNA was detected, 0 = fallback to plain DEFLATE
+ * Arithmetic-coded output uses magic J3V\x02; DEFLATE fallback uses J3V\x01.
  *
  * @param data Input bytes
  * @param level Compression level (default: 1 for speed)
  * @returns Compressed bytes
  */
 export function compressWithJarvis3(data: Uint8Array, level: number = 1): Uint8Array {
+  if (realCompressors) {
+    try { return realCompressors.compressWithJARVIS3(data, level); } catch {}
+  }
   if (!isDnaSequence(data)) {
     // Not DNA — wrap with magic + flag 0 + plain DEFLATE
     const compressed = compressWithPako(data, level);
@@ -957,11 +980,21 @@ export function compressWithJarvis3(data: Uint8Array, level: number = 1): Uint8A
 /**
  * Decompress JARVIS3-compressed data.
  *
+ * Detects arithmetic-coded (J3V\x02) vs DEFLATE (J3V\x01) format automatically.
+ *
  * @param data JARVIS3-compressed bytes
  * @returns Decompressed bytes
  */
 export function decompressWithJarvis3(data: Uint8Array): Uint8Array {
-  // Verify magic
+  // Check for arithmetic-coded format (J3V\x02)
+  if (data.length >= 4 && data[0] === 0x4A && data[1] === 0x33 &&
+      data[2] === 0x56 && data[3] === 0x02) {
+    if (realCompressors) {
+      try { return realCompressors.decompressWithJARVIS3(data); } catch {}
+    }
+    throw new Error('JARVIS3 arithmetic-coded data but real compressors not available');
+  }
+  // Verify DEFLATE-format magic
   if (data.length < 5 ||
       data[0] !== JARVIS3_MAGIC[0] || data[1] !== JARVIS3_MAGIC[1] ||
       data[2] !== JARVIS3_MAGIC[2] || data[3] !== JARVIS3_MAGIC[3]) {
@@ -992,32 +1025,26 @@ export function decompressWithJarvis3(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// AGC compressor — 2-bit pack + order-1 context modeling + DEFLATE (Deorowicz 2015)
+// AGC compressor — arithmetic coding (default) / DEFLATE fallback (Deorowicz 2015)
 // ---------------------------------------------------------------------------
 
 /**
  * Compress data using AGC (Assembly Graph Compression).
  *
- * Strategy:
- *   1. Detect if data is predominantly DNA (ACGT characters)
- *   2. If DNA: extract sequence → order-1 context modeling → pack residuals → pako.deflate
- *   3. If not DNA: fall back to pako.deflate
+ * Default: arithmetic coding (from dna-compress-real.ts) — order-1 context
+ * model + adaptive arithmetic coding.
+ * Fallback: DEFLATE-based order-1 context modeling → pack residuals → pako.deflate.
  *
- * Context modeling (order-1) predicts each base from the previous base.
- * The prediction residuals are biased toward 0 and compress better than
- * the raw 2-bit stream.
- *
- * Output format for DNA:
- *   [AGC_MAGIC(4)] [flags(1)] [skeleton_compressed_len(4)] [skeleton_compressed...]
- *   [model_len(2)] [model...] [compressed_residuals...]
- *
- * flags bit 0: 1 = DNA was detected, 0 = fallback to plain DEFLATE
+ * Arithmetic-coded output uses magic AGC\x02; DEFLATE fallback uses AGC\x01.
  *
  * @param data Input bytes
  * @param level Compression level (default: 6)
  * @returns Compressed bytes
  */
 export function compressWithAGC(data: Uint8Array, level: number = 6): Uint8Array {
+  if (realCompressors) {
+    try { return realCompressors.compressWithAGC(data, level); } catch {}
+  }
   if (!isDnaSequence(data)) {
     // Not DNA — wrap with magic + flag 0 + plain DEFLATE
     const compressed = compressWithPako(data, level);
@@ -1055,11 +1082,21 @@ export function compressWithAGC(data: Uint8Array, level: number = 6): Uint8Array
 /**
  * Decompress AGC-compressed data.
  *
+ * Detects arithmetic-coded (AGC\x02) vs DEFLATE (AGC\x01) format automatically.
+ *
  * @param data AGC-compressed bytes
  * @returns Decompressed bytes
  */
 export function decompressWithAGC(data: Uint8Array): Uint8Array {
-  // Verify magic
+  // Check for arithmetic-coded format (AGC\x02)
+  if (data.length >= 4 && data[0] === 0x41 && data[1] === 0x47 &&
+      data[2] === 0x43 && data[3] === 0x02) {
+    if (realCompressors) {
+      try { return realCompressors.decompressWithAGC(data); } catch {}
+    }
+    throw new Error('AGC arithmetic-coded data but real compressors not available');
+  }
+  // Verify DEFLATE-format magic
   if (data.length < 5 ||
       data[0] !== AGC_MAGIC[0] || data[1] !== AGC_MAGIC[1] ||
       data[2] !== AGC_MAGIC[2] || data[3] !== AGC_MAGIC[3]) {
@@ -1096,32 +1133,26 @@ export function decompressWithAGC(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// DeepGeCo compressor — 2-bit pack + order-2 context modeling + DEFLATE (Hofmann 2022)
+// DeepGeCo compressor — arithmetic coding (default) / DEFLATE fallback (Hofmann 2022)
 // ---------------------------------------------------------------------------
 
 /**
  * Compress data using DeepGeCo (Deep DNA Sequence Compression).
  *
- * Strategy:
- *   1. Detect if data is predominantly DNA (ACGT characters)
- *   2. If DNA: extract sequence → order-2 context modeling → pack residuals → pako.deflate level 9
- *   3. If not DNA: fall back to pako.deflate level 9
+ * Default: arithmetic coding (from dna-compress-real.ts) — order-2 context
+ * model + adaptive arithmetic coding.
+ * Fallback: DEFLATE-based order-2 context modeling → pack residuals → pako.deflate level 9.
  *
- * Context modeling (order-2) predicts each base from the previous 2 bases.
- * Higher order captures more local structure (dinucleotide frequencies)
- * at the cost of a larger model (16 contexts vs 4 for order-1).
- *
- * Output format for DNA:
- *   [DEEP_GECO_MAGIC(4)] [flags(1)] [skeleton_compressed_len(4)] [skeleton_compressed...]
- *   [model_len(2)] [model...] [compressed_residuals...]
- *
- * flags bit 0: 1 = DNA was detected, 0 = fallback to plain DEFLATE
+ * Arithmetic-coded output uses magic DGC\x02; DEFLATE fallback uses DGC\x01.
  *
  * @param data Input bytes
  * @param level Compression level (default: 9 for maximum compression)
  * @returns Compressed bytes
  */
 export function compressWithDeepGeCo(data: Uint8Array, level: number = 9): Uint8Array {
+  if (realCompressors) {
+    try { return realCompressors.compressWithDeepGeCo(data, level); } catch {}
+  }
   if (!isDnaSequence(data)) {
     // Not DNA — wrap with magic + flag 0 + plain DEFLATE
     const compressed = compressWithPako(data, level);
@@ -1159,11 +1190,21 @@ export function compressWithDeepGeCo(data: Uint8Array, level: number = 9): Uint8
 /**
  * Decompress DeepGeCo-compressed data.
  *
+ * Detects arithmetic-coded (DGC\x02) vs DEFLATE (DGC\x01) format automatically.
+ *
  * @param data DeepGeCo-compressed bytes
  * @returns Decompressed bytes
  */
 export function decompressWithDeepGeCo(data: Uint8Array): Uint8Array {
-  // Verify magic
+  // Check for arithmetic-coded format (DGC\x02)
+  if (data.length >= 4 && data[0] === 0x44 && data[1] === 0x47 &&
+      data[2] === 0x43 && data[3] === 0x02) {
+    if (realCompressors) {
+      try { return realCompressors.decompressWithDeepGeCo(data); } catch {}
+    }
+    throw new Error('DeepGeCo arithmetic-coded data but real compressors not available');
+  }
+  // Verify DEFLATE-format magic
   if (data.length < 5 ||
       data[0] !== DEEP_GECO_MAGIC[0] || data[1] !== DEEP_GECO_MAGIC[1] ||
       data[2] !== DEEP_GECO_MAGIC[2] || data[3] !== DEEP_GECO_MAGIC[3]) {
@@ -1200,34 +1241,26 @@ export function decompressWithDeepGeCo(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// MBGC2 compressor — 2-bit pack + multi-context RLE + DEFLATE (Deorowicz 2023)
+// MBGC2 compressor — arithmetic coding (default) / DEFLATE fallback (Deorowicz 2023)
 // ---------------------------------------------------------------------------
 
 /**
  * Compress data using MBGC2 (Multi-context BGCompression).
  *
- * Strategy:
- *   1. Detect if data is predominantly DNA (ACGT characters)
- *   2. If DNA: split sequence into 4 sub-sequences by position mod 4 →
- *      2-bit pack each → 2-byte RLE → pako.deflate each separately
- *   3. If not DNA: fall back to pako.deflate
+ * Default: arithmetic coding (from dna-compress-real.ts) — multi-context
+ * split + per-stream adaptive arithmetic coding.
+ * Fallback: DEFLATE-based multi-context split → 2-bit pack → 2-byte RLE → pako.deflate.
  *
- * The multi-context split decorrelates periodic patterns in the sequence
- * (e.g., codon structure in coding DNA), making each sub-stream more
- * homogeneous and thus more compressible.
- *
- * Output format for DNA:
- *   [MBGC2_MAGIC(4)] [flags(1)] [skeleton_compressed_len(4)] [skeleton_compressed...]
- *   [seq_len(4)] [stream0_len(4)] [stream0...] [stream1_len(4)] [stream1...]
- *   [stream2_len(4)] [stream2...] [stream3_len(4)] [stream3...]
- *
- * flags bit 0: 1 = DNA was detected, 0 = fallback to plain DEFLATE
+ * Arithmetic-coded output uses magic MBG\x02; DEFLATE fallback uses MBG\x01.
  *
  * @param data Input bytes
  * @param level Compression level (default: 6)
  * @returns Compressed bytes
  */
 export function compressWithMBGC2(data: Uint8Array, level: number = 6): Uint8Array {
+  if (realCompressors) {
+    try { return realCompressors.compressWithMBGC2(data, level); } catch {}
+  }
   if (!isDnaSequence(data)) {
     // Not DNA — wrap with magic + flag 0 + plain DEFLATE
     const compressed = compressWithPako(data, level);
@@ -1300,11 +1333,21 @@ export function compressWithMBGC2(data: Uint8Array, level: number = 6): Uint8Arr
 /**
  * Decompress MBGC2-compressed data.
  *
+ * Detects arithmetic-coded (MBG\x02) vs DEFLATE (MBG\x01) format automatically.
+ *
  * @param data MBGC2-compressed bytes
  * @returns Decompressed bytes
  */
 export function decompressWithMBGC2(data: Uint8Array): Uint8Array {
-  // Verify magic
+  // Check for arithmetic-coded format (MBG\x02)
+  if (data.length >= 4 && data[0] === 0x4D && data[1] === 0x42 &&
+      data[2] === 0x47 && data[3] === 0x02) {
+    if (realCompressors) {
+      try { return realCompressors.decompressWithMBGC2(data); } catch {}
+    }
+    throw new Error('MBGC2 arithmetic-coded data but real compressors not available');
+  }
+  // Verify DEFLATE-format magic
   if (data.length < 5 ||
       data[0] !== MBGC2_MAGIC[0] || data[1] !== MBGC2_MAGIC[1] ||
       data[2] !== MBGC2_MAGIC[2] || data[3] !== MBGC2_MAGIC[3]) {
@@ -1400,38 +1443,116 @@ export function isDnaCompressorAvailable(tier: CompressorTier): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Module-load-time: register JS-native implementations
+// Module-load-time: register arithmetic-coding-based implementations
 // ---------------------------------------------------------------------------
+//
+// The DNA-specific tiers now use REAL arithmetic coding (from dna-compress-real.ts)
+// instead of DEFLATE. This is the KEY differentiator: arithmetic coding encodes
+// symbols with fractional bits, while DEFLATE/Huffman is limited to integer bits.
+//
+// If the real compressors fail to load, we fall back to the local DEFLATE-based
+// implementations (compressWithNAF, compressWithAGC, etc. defined above).
 
-// NAF: 2-bit pack + RLE + DEFLATE (Varshney 2024)
-dnaCompressors[CompressorTier.NAF] = {
-  compress: compressWithNAF,
-  decompress: decompressWithNAF,
-};
+if (realCompressors) {
+  // NAF: 2-bit pack + RLE + arithmetic coding (Varshney 2024)
+  dnaCompressors[CompressorTier.NAF] = {
+    compress: realCompressors.compressWithNAF,
+    decompress: realCompressors.decompressWithNAF,
+  };
 
-// JARVIS3: 2-bit pack + DEFLATE level 1 (Li 2023)
-dnaCompressors[CompressorTier.JARVIS3] = {
-  compress: compressWithJarvis3,
-  decompress: decompressWithJarvis3,
-};
+  // AGC: 2-bit pack + order-1 context modeling + arithmetic coding (Deorowicz 2015)
+  dnaCompressors[CompressorTier.AGC] = {
+    compress: realCompressors.compressWithAGC,
+    decompress: realCompressors.decompressWithAGC,
+  };
 
-// AGC: 2-bit pack + order-1 context modeling + DEFLATE (Deorowicz 2015)
-dnaCompressors[CompressorTier.AGC] = {
-  compress: compressWithAGC,
-  decompress: decompressWithAGC,
-};
+  // DeepGeCo: multi-order adaptive mixing + arithmetic coding (Hofmann 2022)
+  dnaCompressors[CompressorTier.DEEP_GECO] = {
+    compress: realCompressors.compressWithDeepGeCo,
+    decompress: realCompressors.decompressWithDeepGeCo,
+  };
 
-// DeepGeCo: 2-bit pack + order-2 context modeling + DEFLATE (Hofmann 2022)
-dnaCompressors[CompressorTier.DEEP_GECO] = {
-  compress: compressWithDeepGeCo,
-  decompress: decompressWithDeepGeCo,
-};
+  // MBGC2: multi-context split + arithmetic coding (Deorowicz 2023)
+  dnaCompressors[CompressorTier.MBGC2] = {
+    compress: realCompressors.compressWithMBGC2,
+    decompress: realCompressors.decompressWithMBGC2,
+  };
 
-// MBGC2: 2-bit pack + multi-context RLE + DEFLATE (Deorowicz 2023)
-dnaCompressors[CompressorTier.MBGC2] = {
-  compress: compressWithMBGC2,
-  decompress: decompressWithMBGC2,
-};
+  // JARVIS3: dinucleotide context + adaptive block sizing + arithmetic coding (Li 2023)
+  dnaCompressors[CompressorTier.JARVIS3] = {
+    compress: realCompressors.compressWithJARVIS3,
+    decompress: realCompressors.decompressWithJARVIS3,
+  };
+} else {
+  // Fallback: local DEFLATE-based implementations
+  dnaCompressors[CompressorTier.NAF] = {
+    compress: compressWithNAF,
+    decompress: decompressWithNAF,
+  };
+  dnaCompressors[CompressorTier.JARVIS3] = {
+    compress: compressWithJarvis3,
+    decompress: decompressWithJarvis3,
+  };
+  dnaCompressors[CompressorTier.AGC] = {
+    compress: compressWithAGC,
+    decompress: decompressWithAGC,
+  };
+  dnaCompressors[CompressorTier.DEEP_GECO] = {
+    compress: compressWithDeepGeCo,
+    decompress: decompressWithDeepGeCo,
+  };
+  dnaCompressors[CompressorTier.MBGC2] = {
+    compress: compressWithMBGC2,
+    decompress: decompressWithMBGC2,
+  };
+}
+
+/**
+ * Initialize the real arithmetic-coding DNA compressors.
+ *
+ * Call this once at startup (e.g., in a top-level await or useEffect) to
+ * enable true arithmetic coding for NAF/AGC/DeepGeCo/MBGC2/JARVIS3 tiers.
+ * If the module cannot be loaded, DEFLATE-based fallbacks are used instead.
+ *
+ * After successful initialization, the dnaCompressors registry is updated
+ * so that compress()/decompress() routing also uses arithmetic coding.
+ *
+ * @returns true if real compressors were loaded, false if using DEFLATE fallbacks
+ */
+export async function initRealDnaCompressors(): Promise<boolean> {
+  if (realCompressorsLoaded) return true;
+  try {
+    realCompressors = await import('./dna-compress-real');
+    realCompressorsLoaded = true;
+
+    // Re-register in the dnaCompressors registry so the compress()/decompress()
+    // router also uses arithmetic coding instead of DEFLATE fallbacks.
+    dnaCompressors[CompressorTier.NAF] = {
+      compress: realCompressors.compressWithNAF,
+      decompress: realCompressors.decompressWithNAF,
+    };
+    dnaCompressors[CompressorTier.AGC] = {
+      compress: realCompressors.compressWithAGC,
+      decompress: realCompressors.decompressWithAGC,
+    };
+    dnaCompressors[CompressorTier.DEEP_GECO] = {
+      compress: realCompressors.compressWithDeepGeCo,
+      decompress: realCompressors.decompressWithDeepGeCo,
+    };
+    dnaCompressors[CompressorTier.MBGC2] = {
+      compress: realCompressors.compressWithMBGC2,
+      decompress: realCompressors.decompressWithMBGC2,
+    };
+    dnaCompressors[CompressorTier.JARVIS3] = {
+      compress: realCompressors.compressWithJARVIS3,
+      decompress: realCompressors.decompressWithJARVIS3,
+    };
+
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main compress / decompress router
@@ -1561,47 +1682,47 @@ export function decompress(data: Uint8Array, config: CompressConfig = {}): Uint8
 
   // Try to determine the compression format from magic bytes
   if (cfg.tier === 'auto' || cfg.tier === undefined) {
-    // NAF magic: 0x4E 0x41 0x46 0x01
+    // NAF magic: 0x4E 0x41 0x46 [0x01=DEFLATE | 0x02=arithmetic]
     if (
       data.length >= 4 &&
       data[0] === 0x4E && data[1] === 0x41 &&
-      data[2] === 0x46 && data[3] === 0x01
+      data[2] === 0x46 && (data[3] === 0x01 || data[3] === 0x02)
     ) {
       return decompressWithNAF(data);
     }
 
-    // JARVIS3 magic: 0x4A 0x33 0x56 0x01
+    // JARVIS3 magic: 0x4A 0x33 0x56 [0x01=DEFLATE | 0x02=arithmetic]
     if (
       data.length >= 4 &&
       data[0] === 0x4A && data[1] === 0x33 &&
-      data[2] === 0x56 && data[3] === 0x01
+      data[2] === 0x56 && (data[3] === 0x01 || data[3] === 0x02)
     ) {
       return decompressWithJarvis3(data);
     }
 
-    // AGC magic: 0x41 0x47 0x43 0x01
+    // AGC magic: 0x41 0x47 0x43 [0x01=DEFLATE | 0x02=arithmetic]
     if (
       data.length >= 4 &&
       data[0] === 0x41 && data[1] === 0x47 &&
-      data[2] === 0x43 && data[3] === 0x01
+      data[2] === 0x43 && (data[3] === 0x01 || data[3] === 0x02)
     ) {
       return decompressWithAGC(data);
     }
 
-    // DeepGeCo magic: 0x44 0x47 0x43 0x01
+    // DeepGeCo magic: 0x44 0x47 0x43 [0x01=DEFLATE | 0x02=arithmetic]
     if (
       data.length >= 4 &&
       data[0] === 0x44 && data[1] === 0x47 &&
-      data[2] === 0x43 && data[3] === 0x01
+      data[2] === 0x43 && (data[3] === 0x01 || data[3] === 0x02)
     ) {
       return decompressWithDeepGeCo(data);
     }
 
-    // MBGC2 magic: 0x4D 0x42 0x47 0x01
+    // MBGC2 magic: 0x4D 0x42 0x47 [0x01=DEFLATE | 0x02=arithmetic]
     if (
       data.length >= 4 &&
       data[0] === 0x4D && data[1] === 0x42 &&
-      data[2] === 0x47 && data[3] === 0x01
+      data[2] === 0x47 && (data[3] === 0x01 || data[3] === 0x02)
     ) {
       return decompressWithMBGC2(data);
     }
@@ -1634,14 +1755,13 @@ export function decompress(data: Uint8Array, config: CompressConfig = {}): Uint8
       return decompressWithJarvis3(data);
 
     case CompressorTier.AGC:
+      return decompressWithAGC(data);
+
     case CompressorTier.DEEP_GECO:
-    case CompressorTier.MBGC2: {
-      const compressor = dnaCompressors[cfg.tier];
-      if (compressor) return compressor.decompress(data);
-      throw new Error(
-        `${cfg.tier} decompression requested but implementation not available`,
-      );
-    }
+      return decompressWithDeepGeCo(data);
+
+    case CompressorTier.MBGC2:
+      return decompressWithMBGC2(data);
 
     default:
       return decompressWithPako(data);
