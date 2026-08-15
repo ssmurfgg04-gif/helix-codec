@@ -22,7 +22,7 @@
  *   10. Verify SHA-256 hash matches metadata.
  */
 
-import { inflate } from "pako";
+import { decompress as decompressRouter, CompressorTier } from "./compress";
 import { ReedSolomon } from "./reedsolomon";
 import { ReedSolomon216 } from "./reedsolomon216";
 import { LDPCInnerCode, getCachedLDPCInner } from "./ldpc-codec";
@@ -31,6 +31,7 @@ import { dnaToBytes, bytesToDna, xorWithSeed, gcContent, maxHomopolymerRun, unwh
 import { goldmanDnaToBytes } from "./goldman";
 import { constrainedDnaToBytes, constrainedDnaToBytesWithErasure, splitConstrainedDnaToBytesWithErasure } from "./constrained-mapping";
 import { arithmeticDnaToBytesCrc } from "./markov-arithmetic";
+import { dnaAeonDecode, dnaAeonEncode, DNAEeonConfig, DEFAULT_DNA_AEON_CONFIG } from "./dna-aeon";
 // SRT mode: decoder uses standard dnaToBytes (LDPC corrects injected errors)
 // No separate SRT decode function needed — it's identical to direct mapping.
 import { softInfoConsensus, dnaErasureToByteErasure, capErasures, DEFAULT_SOFT_INFO_CONFIG, SoftInfoConfig, qScoresToBitLLRs } from "./softinfo";
@@ -505,10 +506,13 @@ export async function decodeReads(
   // v53: also use auto layout for arithmetic mode (applies -3 capacity fix)
   const useConvInner = !!metadata.useConvolutionalInner;
   const useArithmetic = (metadata.mappingMode ?? "constrained") === "arithmetic";
+  const useDnaAeon = (metadata.mappingMode ?? "constrained") === "dnaAeon";
+  // DNA-Aeon uses the same v2 layout as arithmetic (address outside the arithmetic stream)
+  const useArithmeticOrAeon = useArithmetic || useDnaAeon;
   if (process.env.HELIX_DEBUG) {
-    console.error(`[v62 decodeReads] mappingMode=${metadata.mappingMode}, useArithmetic=${useArithmetic}, innerCode=${metadata.innerCode}`);
+    console.error(`[v62 decodeReads] mappingMode=${metadata.mappingMode}, useArithmetic=${useArithmetic}, useDnaAeon=${useDnaAeon}, innerCode=${metadata.innerCode}`);
   }
-  const layout = (useConvInner || useArithmetic)
+  const layout = (useConvInner || useArithmeticOrAeon)
     ? computeLayoutAuto(cfg)
     : computeLayout(cfg);
 
@@ -516,7 +520,7 @@ export async function decodeReads(
   // v62: For arithmetic-v2, the LDPC codeword does NOT include the address.
   //   Normal mode:    innerK = addressBytes + payloadBytes, innerN = innerK + parity
   //   Arithmetic-v2:  innerK = payloadBytes (NO address),   innerN = innerK + parity
-  const useArithmeticV2 = (metadata.mappingMode ?? "constrained") === "arithmetic";
+  const useArithmeticV2 = (metadata.mappingMode ?? "constrained") === "arithmetic" || useDnaAeon;
   const innerK = useArithmeticV2
     ? layout.payloadBytes
     : layout.addressBytes + layout.payloadBytes;
@@ -559,13 +563,13 @@ export async function decodeReads(
   // or "auto" (hard → bp fallback). Default: "auto".
   const ldpcDecoderMode = metadata.ldpcDecoder ?? "auto";
 
-  // DNA mapping mode (direct 2-bit, Goldman, constrained, SRT, or arithmetic)
+  // DNA mapping mode (direct 2-bit, Goldman, constrained, SRT, arithmetic, or dnaAeon)
   const useGoldman = (metadata.mappingMode ?? "constrained") === "goldman";
   const useConstrained = (metadata.mappingMode ?? "constrained") === "constrained";
   const useSrt = (metadata.mappingMode ?? "constrained") === "srt";
   const useBHE = (metadata.mappingMode ?? "constrained") === "bhe";
   const useYYC = (metadata.mappingMode ?? "constrained") === "yinyang";
-  // useArithmetic already declared above (v53 layout fix)
+  // useArithmetic and useDnaAeon already declared above (v53 layout fix)
   const goldmanMode = metadata.goldmanMode ?? "fast";
 
   // Expected DNA length depends on mapping mode:
@@ -606,7 +610,7 @@ export async function decodeReads(
   const channelForClustering = metadata.channel ?? cfg.channel ?? "illumina";
   const useKmerClustering =
     channelForClustering === "nanopore" || channelForClustering === "pacbio" ||
-    useArithmetic ||
+    useArithmetic || useDnaAeon ||
     (metadata as any).__forceKmer;
   let clusters: Map<number, SequencingRead[]>;
   let discarded: number;
@@ -678,7 +682,7 @@ export async function decodeReads(
   // cannot be deinterleaved. Those oligos will be handled as erasures by the
   // per-oligo decode loop and recovered via outer RS.
   const interleaveDepth = metadata.interleaveDepth ?? 0;
-  if (interleaveDepth > 1 && metadata.oligoCount >= interleaveDepth && !useGoldman && !useConstrained && !useArithmetic) {
+  if (interleaveDepth > 1 && metadata.oligoCount >= interleaveDepth && !useGoldman && !useConstrained && !useArithmeticOrAeon) {
     const addressBytesCount = layout.addressBytes;
     const interleaveRegionLen = layout.totalInnerBytes - addressBytesCount;
 
@@ -804,6 +808,7 @@ export async function decodeReads(
 
   for (let oligoIdx = 0; oligoIdx < metadata.oligoCount; oligoIdx++) {
     let clusterReads = clusters.get(oligoIdx) ?? [];
+    let foundValidRead = false;
     if (clusterReads.length === 0) {
       erasedIndices.push(oligoIdx);
       perOligo.push({
@@ -875,50 +880,44 @@ export async function decodeReads(
       }
     }
 
-    // STRATEGY 0.5: Gungnir hash-based single-read recovery (nanopore low-coverage)
+    // STRATEGY 0.5: Gungnir hash-based single-read recovery (low-coverage)
     // When coverage is 1 (single read) or when all STRATEGY 1 per-read attempts fail,
     // Gungnir uses proof-of-work hash matching to correct errors in a single read.
     // This is the key innovation for reducing nanopore sequencing cost 10-25×.
-    // Only used when channel is nanopore and coverage is low (≤3 reads).
+    // Used for noisy channels (nanopore/pacbio) with ≤3 reads, and illumina with ≤2 reads.
     if (
       clusterReads.length <= 3 &&
-      (channel === "nanopore" || channel === "pacbio") &&
-      metadata.mappingMode !== "goldman"
+      metadata.mappingMode !== "goldman" &&
+      (channel === "nanopore" || channel === "pacbio" || channel === "illumina")
     ) {
       try {
-        const { gungnirDecode, computeFragmentHash, DEFAULT_GUNGNIR_CONFIG } = await import('./gungnir');
+        const { gungnirDecodeSingleRead, computeDnaHash, DEFAULT_GUNGNIR_CONFIG } = await import('./gungnir');
         for (const read of clusterReads) {
           let dna = read.sequence;
           if (dna.length > expectedDnaLen) dna = dna.slice(0, expectedDnaLen);
           else if (dna.length < expectedDnaLen) dna = dna + "A".repeat(expectedDnaLen - dna.length);
 
-          // Compute expected hash from the read (using CRC-16 as lightweight hash)
-          const expectedHash = computeFragmentHash(dna);
-          const gungnirResult = gungnirDecode(dna, expectedHash, DEFAULT_GUNGNIR_CONFIG);
+          // Compute expected hash from the read
+          const expectedHash = computeDnaHash(dna);
+          const correctedDna = gungnirDecodeSingleRead(dna, expectedHash, expectedDnaLen, DEFAULT_GUNGNIR_CONFIG);
 
-          if (gungnirResult.correctedDna) {
-            const correctedDna = gungnirResult.correctedDna;
+          if (correctedDna !== null) {
             // Decode the corrected DNA to bytes
-            let correctedBytes: Uint8Array;
-            if (metadata.mappingMode === "constrained" || metadata.mappingMode === "srt" || metadata.mappingMode === "bhe" || metadata.mappingMode === "yinyang") {
-              correctedBytes = dnaToBytes(correctedDna);
-            } else {
-              correctedBytes = dnaToBytes(correctedDna);
-            }
+            const correctedBytes = dnaToBytes(correctedDna);
 
             // Try inner code decode
             if (useLDPC && innerLdpc && correctedBytes.length >= innerN) {
               const decoded = innerLdpc.decode(correctedBytes.slice(0, innerN));
               if (decoded) {
-                const whitenedAddr = decoded.slice(0, layout.addressBytes);
+                const whitenedAddr = decoded.data.slice(0, layout.addressBytes);
                 const addr = unwhitenAddress(whitenedAddr);
                 const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
                 if (decodedIndex === oligoIdx) {
-                  let payload = decoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+                  let payload = decoded.data.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
                   payloads.set(oligoIdx, payload);
                   perOligo.push({
                     index: oligoIdx, readCount: clusterReads.length, consensusLength: correctedDna.length,
-                    crcPassed: true, innerRS: { corrected: gungnirResult.errorsCorrected, success: true },
+                    crcPassed: true, innerRS: { corrected: decoded.corrected, success: true },
                     seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
                     strategy: 'gungnir',
                   });
@@ -960,11 +959,11 @@ export async function decodeReads(
           if (consBytes.length >= innerN) {
             const decoded = innerLdpc.decode(consBytes.slice(0, innerN));
             if (decoded) {
-              const whitenedAddr = decoded.slice(0, layout.addressBytes);
+              const whitenedAddr = decoded.data.slice(0, layout.addressBytes);
               const addr = unwhitenAddress(whitenedAddr);
               const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
               if (decodedIndex === oligoIdx) {
-                let payload = decoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+                let payload = decoded.data.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
                 payloads.set(oligoIdx, payload);
                 perOligo.push({
                   index: oligoIdx, readCount: clusterReads.length, consensusLength: softCons.length,
@@ -985,7 +984,7 @@ export async function decodeReads(
 
     // STRATEGY 1: Try decoding each read individually (no consensus!)
     // Optimized: break on first valid read, skip consensus strategies
-    let foundValidRead = false;
+    foundValidRead = false;
     const s1t0 = Date.now();
     for (let readIdx = 0; readIdx < clusterReads.length; readIdx++) {
       const read = clusterReads[readIdx];
@@ -1032,13 +1031,20 @@ export async function decodeReads(
         //
         // Per-block CRC failures mark the last byte of each block as erased,
         // which LDPC corrects via erasure decoding.
+        //
+        // DNA-Aeon fallback: if markov-arithmetic fails, try dnaAeonDecode
+        // which uses CRC-8 sync markers for indel-tolerant resync.
+        const addressNt = 16; // 4 bytes × 4 nt/byte
+        const arithBlockSize = cfg.arithmeticBlockSize ?? 80;
+        // v62: For arithmetic-v2, innerN = payloadBytes + innerParityBytes (NO address)
+        const innerNArith = layout.payloadBytes + layout.innerParityBytes;
+        // Extract the arithmetic stream (skip address)
+        const arithmeticDna = dna.slice(addressNt);
+        const addressDna = dna.slice(0, addressNt);
+        const addressBytes = dnaToBytes(addressDna);
+
+        let arithSuccess = false;
         try {
-          const addressNt = 16; // 4 bytes × 4 nt/byte
-          const arithBlockSize = cfg.arithmeticBlockSize ?? 80;
-          // v62: For arithmetic-v2, innerN = payloadBytes + innerParityBytes (NO address)
-          const innerNArith = layout.payloadBytes + layout.innerParityBytes;
-          // Extract the arithmetic stream (skip address)
-          const arithmeticDna = dna.slice(addressNt);
           const result = arithmeticDnaToBytesCrc(
             arithmeticDna,
             cfg.constraints?.maxHomopolymer ?? 3,
@@ -1047,9 +1053,6 @@ export async function decodeReads(
           );
 
           // Build innerBlock: [address(4)] + [LDPC codeword (payload+parity)]
-          // The address comes from the first 16 nt of the DNA (direct decode)
-          const addressDna = dna.slice(0, addressNt);
-          const addressBytes = dnaToBytes(addressDna);
           // v62: For arithmetic-v2, innerBlock = address + LDPC codeword
           // so the rest of the pipeline (which extracts address from innerBlock)
           // works unchanged.
@@ -1062,6 +1065,78 @@ export async function decodeReads(
             const bitErasures = new Array(innerNArith * 8).fill(false);
             for (let byteIdx = 0; byteIdx < Math.min(result.erasures.length, innerNArith); byteIdx++) {
               if (result.erasures[byteIdx]) {
+                for (let bit = 0; bit < 8; bit++) {
+                  bitErasures[byteIdx * 8 + bit] = true;
+                }
+              }
+            }
+            constrainedErasures = bitErasures;
+          }
+          arithSuccess = true;
+        } catch {
+          // markov-arithmetic failed — try DNA-Aeon as fallback
+        }
+
+        if (!arithSuccess) {
+          // DNA-Aeon fallback: uses CRC-8 sync markers for indel tolerance
+          try {
+            const aeonResult = dnaAeonDecode(
+              arithmeticDna,
+              innerNArith,
+              DEFAULT_DNA_AEON_CONFIG,
+            );
+            innerBlock = new Uint8Array(layout.addressBytes + innerNArith);
+            innerBlock.set(addressBytes, 0);
+            innerBlock.set(aeonResult.payload, layout.addressBytes);
+            // Map erasure segments to bit-level erasures for LDPC
+            if (aeonResult.erasureSegments.length > 0) {
+              const bitErasures = new Array(innerNArith * 8).fill(false);
+              for (const seg of aeonResult.erasureSegments) {
+                const byteStart = seg * DEFAULT_DNA_AEON_CONFIG.syncInterval;
+                const byteEnd = Math.min(byteStart + DEFAULT_DNA_AEON_CONFIG.syncInterval, innerNArith);
+                for (let byteIdx = byteStart; byteIdx < byteEnd; byteIdx++) {
+                  for (let bit = 0; bit < 8; bit++) {
+                    bitErasures[byteIdx * 8 + bit] = true;
+                  }
+                }
+              }
+              constrainedErasures = bitErasures;
+            }
+          } catch { continue; }
+        }
+      } else if (useDnaAeon) {
+        // DNA-Aeon primary decode: uses CRC-8 sync markers for indel tolerance.
+        //
+        // Layout matches arithmetic-v2:
+        //   [Address (16 nt direct DNA)] [DNA-Aeon stream (payload+parity)]
+        //
+        // The DNA-Aeon decoder walks windows, verifies CRC markers, and
+        // resyncs on failures using a stack algorithm — enabling native
+        // correction of insertions, deletions, and substitutions.
+        try {
+          const addressNt = 16; // 4 bytes × 4 nt/byte
+          const innerNArith = layout.payloadBytes + layout.innerParityBytes;
+          const aeonDna = dna.slice(addressNt);
+          const addressDna = dna.slice(0, addressNt);
+          const addressBytes = dnaToBytes(addressDna);
+
+          const aeonResult = dnaAeonDecode(
+            aeonDna,
+            innerNArith,
+            DEFAULT_DNA_AEON_CONFIG,
+          );
+
+          // Build innerBlock: [address(4)] + [LDPC codeword (payload+parity)]
+          innerBlock = new Uint8Array(layout.addressBytes + innerNArith);
+          innerBlock.set(addressBytes, 0);
+          innerBlock.set(aeonResult.payload, layout.addressBytes);
+          // Map erasure segments to bit-level erasures for LDPC
+          if (aeonResult.erasureSegments.length > 0) {
+            const bitErasures = new Array(innerNArith * 8).fill(false);
+            for (const seg of aeonResult.erasureSegments) {
+              const byteStart = seg * DEFAULT_DNA_AEON_CONFIG.syncInterval;
+              const byteEnd = Math.min(byteStart + DEFAULT_DNA_AEON_CONFIG.syncInterval, innerNArith);
+              for (let byteIdx = byteStart; byteIdx < byteEnd; byteIdx++) {
                 for (let bit = 0; bit < 8; bit++) {
                   bitErasures[byteIdx * 8 + bit] = true;
                 }
@@ -1190,7 +1265,7 @@ export async function decodeReads(
       // This allows the BP decoder to correct erasures efficiently.
       // v57: also fire for useArithmetic — per-block CRC failures in
       // arithmetic mode produce byte-level erasures that LDPC must correct.
-      const useErasures = useConstrained || useArithmetic;
+      const useErasures = useConstrained || useArithmetic || useDnaAeon;
       if (useErasures && constrainedErasures && qScoresForInner) {
         // Each base = 2 bits. Erasure info is per-bit.
         // We can't directly set per-bit Q-scores (they're per-base), so we
@@ -1262,8 +1337,8 @@ export async function decodeReads(
               decodedData = r.data;
               corrected = r.corrected;
             }
-          } else if ((useConstrained || useSrt || useArithmetic)) {
-            // For constrained/SRT/arithmetic mode without erasures, use BP
+          } else if ((useConstrained || useSrt || useArithmetic || useDnaAeon)) {
+            // For constrained/SRT/arithmetic/dnaAeon mode without erasures, use BP
             const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
             decodedData = r.data;
             corrected = r.corrected;
@@ -1420,8 +1495,8 @@ export async function decodeReads(
         });
         foundValidRead = true;
         break;
-      } else if (useLDPC && (useConstrained || useSrt || useArithmetic)) {
-        // Constrained mode: skip CRC (CRC bytes have erasures).
+      } else if (useLDPC && (useConstrained || useSrt || useArithmetic || useDnaAeon)) {
+        // Constrained/dnaAeon mode: skip CRC (CRC bytes have erasures).
         // Rely on LDPC syndrome check (already passed if we got here).
         // Re-encode to get canonical form and verify address.
         const reEncoded = innerLdpc!.encode(decodedData);
@@ -1463,8 +1538,8 @@ export async function decodeReads(
         });
         foundValidRead = true;
         break;
-      } else if (useLDPC && useArithmetic) {
-        // v57: Arithmetic mode — encoder DROPPED CRC-16 to make room for
+      } else if (useLDPC && useArithmeticOrAeon) {
+        // v57: Arithmetic/DNA-Aeon mode — encoder DROPPED CRC-16 to make room for
         // per-block CRC-8 sync markers (see codec.ts bytesToArithmeticDnaCrc).
         // The crcBytes extracted from innerBlock.slice(innerN) are NOT real
         // CRC bytes — they're whatever the arithmetic decoder produced after
@@ -1472,7 +1547,7 @@ export async function decodeReads(
         //
         // So we MUST NOT verify CRC-16 here. Instead, rely on:
         //   - LDPC syndrome check (passed if we got here)
-        //   - Per-block CRC-8 (already verified by arithmeticDnaToBytesCrc)
+        //   - Per-block CRC-8 (already verified by arithmeticDnaToBytesCrc / dnaAeonDecode)
         //   - Address verification (decodedIndex must match oligoIdx)
         const reEncoded = innerLdpc!.encode(decodedData);
         const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
@@ -2056,7 +2131,7 @@ export async function decodeReads(
   let data: Uint8Array;
   if (metadata.compression === "deflate") {
     try {
-      data = inflate(totalPayload);
+      data = decompressRouter(totalPayload);
     } catch {
       // Inflate failed — return raw payload as best effort
       data = totalPayload;
@@ -2191,7 +2266,7 @@ export async function decodeReads(
         let retryData: Uint8Array;
         if (metadata.compression === "deflate") {
           try {
-            retryData = inflate(retryTotalPayload);
+            retryData = decompressRouter(retryTotalPayload);
           } catch {
             // Inflate failed — skip
             retryData = null as any;
@@ -2320,7 +2395,7 @@ export async function decodeReads(
         let retryData: Uint8Array;
         if (metadata.compression === "deflate") {
           try {
-            retryData = inflate(retryTotalPayload);
+            retryData = decompressRouter(retryTotalPayload);
           } catch {
             continue;
           }

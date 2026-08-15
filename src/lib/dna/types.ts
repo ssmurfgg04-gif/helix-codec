@@ -45,7 +45,7 @@ export interface CodecMetadata {
   /** LDPC decoder mode ("hard", "osd", "bp", or "auto"). */
   ldpcDecoder?: "hard" | "osd" | "bp" | "auto";
   /** DNA mapping mode. */
-  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang";
+  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon";
   /** Goldman trit packing mode ("fast" or "dense"). Only used when mappingMode="goldman". */
   goldmanMode?: "fast" | "dense";
   /** Outer RS config (across oligos). */
@@ -145,7 +145,7 @@ export interface CodecConfig {
    * Default: "constrained" (since v23.0). Best of both worlds: full 2.0 bits/nt
    * density AND homopolymer-free without screening.
    */
-  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang";
+  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon";
   /**
    * Goldman trit packing mode (only used when mappingMode === "goldman"):
    *   - "fast"  — 1 byte → 6 trits (3^6=729>256). Density 1.333 bits/nt. Simple.
@@ -289,6 +289,19 @@ export interface CodecConfig {
    * Default: false (preserves backward compatibility).
    */
   useRecipeGeneration?: boolean;
+
+  /**
+   * Simulator backend for wet-lab error modeling.
+   *   - "basic"  — Simple uniform per-position error model (simulate.ts).
+   *                 Fast, good for unit tests and quick sanity checks.
+   *   - "dt4dds" — Parametric wet-lab pipeline (dt4dds-simulate.ts).
+   *                 Models synthesis bias, PCR amplification, aging/decay,
+   *                 and platform-specific sequencing errors. Research-grade.
+   *                 Based on fml-ethz/dt4dds (Lee et al. 2022, Nat. Commun.).
+   *
+   * Default: "dt4dds" (since v3.0) — more realistic error modeling.
+   */
+  simulator?: "basic" | "dt4dds";
 }
 
 export const DEFAULT_CONFIG: CodecConfig = {
@@ -314,6 +327,7 @@ export const DEFAULT_CONFIG: CodecConfig = {
   useConvolutionalInner: false, // v52+: HEDGES-style conv inner code (Nanopore only)
   addressMode: 'sequential', // v3.0: content-derived addressing available
   useRecipeGeneration: false, // v3.0: recipe-based generation for structured data
+  simulator: "dt4dds", // v3.0: parametric wet-lab pipeline (dt4dds) as default
 };
 
 /**
@@ -350,6 +364,7 @@ export const NANOPORE_CONFIG: CodecConfig = {
   lowCoverageTrigger: 3, // HMM fusion at lower coverage
   useConvolutionalInner: true, // K=9 conv inner for indel tolerance
   addressMode: 'content-derived', // self-verifying addresses for nanopore
+  simulator: "dt4dds", // dt4dds handles indel-heavy channels natively
 };
 
 /**
@@ -376,6 +391,7 @@ export const PACBIO_CONFIG: CodecConfig = {
   lowCoverageTrigger: 3,
   useConvolutionalInner: true,
   addressMode: 'content-derived',
+  simulator: "dt4dds", // dt4dds handles indel-heavy channels natively
 };
 
 /**
@@ -407,9 +423,17 @@ export function resolveConfig(cfg: Partial<CodecConfig>): CodecConfig {
   switch (channel) {
     case 'nanopore':
       base = NANOPORE_CONFIG;
+      // BHE deterministic encoding is preferred for noisy channels
+      // (no seed-retry, guaranteed constraint satisfaction)
+      if (cfg.mappingMode === undefined) {
+        base = { ...base, mappingMode: "bhe" };
+      }
       break;
     case 'pacbio':
       base = PACBIO_CONFIG;
+      if (cfg.mappingMode === undefined) {
+        base = { ...base, mappingMode: "bhe" };
+      }
       break;
     default:
       base = DEFAULT_CONFIG;
@@ -517,7 +541,7 @@ export function computeLayout(cfg: CodecConfig): OligoLayout {
   // 2.0 difference matters less than the 1 vs 4 byte overhead). The encoder
   // would then produce MORE bytes than computeLayout expected, causing the
   // decoder to read garbage → hash FAIL.
-  if (cfg.mappingMode === "arithmetic") {
+  if (cfg.mappingMode === "arithmetic" || cfg.mappingMode === "dnaAeon") {
     const innerDnaLenArith = totalInnerBytes * 4;
     const ARITH_CAPACITY_RATE_LAYOUT = 1.95;
     const defaultBlockSize = cfg.arithmeticBlockSize ?? Math.floor(innerDnaLenArith / 2);
@@ -734,14 +758,14 @@ export function computeLayoutArithmeticV2(cfg: CodecConfig): OligoLayout {
 
 /**
  * v52: Compute the byte layout, dispatching to conv-aware variant if needed.
- * v62: Also dispatch to arithmetic-v2 layout when mappingMode === "arithmetic".
+ * v62: Also dispatch to arithmetic-v2 layout when mappingMode === "arithmetic" or "dnaAeon".
  */
 export function computeLayoutAuto(cfg: CodecConfig): OligoLayout {
   if (cfg.useConvolutionalInner) {
     return computeLayoutConv(cfg);
   }
-  // v62: arithmetic mode uses the v2 layout (address outside arithmetic stream)
-  if ((cfg.mappingMode ?? "constrained") === "arithmetic") {
+  // v62: arithmetic/dnaAeon mode uses the v2 layout (address outside arithmetic stream)
+  if ((cfg.mappingMode ?? "constrained") === "arithmetic" || cfg.mappingMode === "dnaAeon") {
     return computeLayoutArithmeticV2(cfg);
   }
   return computeLayout(cfg);

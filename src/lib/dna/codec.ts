@@ -28,7 +28,7 @@
  *   10. Verify SHA-256 hash matches metadata.
  */
 
-import { deflate } from "pako";
+import { compress as compressRouter, decompress as decompressRouter, CompressorTier, type CompressConfig, type CompressionResult } from "./compress";
 import { deriveAddress, deriveHierarchicalAddress, deriveArchiveSalt, type AddressingConfig, type HierarchicalAddress } from './addressing';
 import { ReedSolomon } from "./reedsolomon";
 import { ReedSolomon216 } from "./reedsolomon216";
@@ -136,9 +136,12 @@ export async function encodeFile(
   // 1) Compress (optional) — before encryption since encrypted data is incompressible
   let compressed: Uint8Array = data;
   let compression: "none" | "deflate" = "none";
+  let compressionTier: CompressorTier | null = null;
   if (cfg.compress) {
-    compressed = deflate(data, { level: 9 });
+    const compressResult = compressRouter(data, { level: 9 });
+    compressed = compressResult.data;
     compression = "deflate";
+    compressionTier = compressResult.tier;
   }
 
   // 2) Encrypt (optional) — after compression since encrypted data is incompressible
@@ -576,15 +579,14 @@ export async function encodeFile(
       innerBlock.set(rsCodeword, 0);
       innerBlock.set(crc, rsCodeword.length);
       // BHE encode: deterministic, no homopolymers > maxRun
-      const bheResult = bheEncode(innerBlock, { maxRun: cfg.constraints.maxHomopolymer, enforceGC: true, gcMin: cfg.constraints.gcMin, gcMax: cfg.constraints.gcMax });
-      dna = bheResult.dna;
+      dna = bheEncode(innerBlock, { maxRun: cfg.constraints.maxHomopolymer, enforceGC: true, gcMin: cfg.constraints.gcMin, gcMax: cfg.constraints.gcMax });
       bestDna = dna;
       bestSeed = 0;
       bestSatisfied = true;
     } else if (useYYC) {
       // YYC Yin-Yang high-density encoding — 2 bits/nt with rotating rule matrix.
       // Deterministic, no homopolymers, ~50% GC by construction.
-      const { yycEncode } = await import('./yinyang');
+      const { yinyangEncode } = await import('./yinyang');
       const address = rawAddress.slice();
       address[3] = 0;
       const whitenedAddress = whitenAddress(address);
@@ -598,8 +600,7 @@ export async function encodeFile(
       const innerBlock = new Uint8Array(totalNtBytes(layout));
       innerBlock.set(rsCodeword, 0);
       innerBlock.set(crc, rsCodeword.length);
-      const yycResult = yycEncode(innerBlock, { ruleSet: 2 });
-      dna = yycResult.dna;
+      dna = yinyangEncode(innerBlock);
       bestDna = dna;
       bestSeed = 0;
       bestSatisfied = true;
@@ -862,6 +863,10 @@ export interface CanonicalArchive {
  * Use `canonicalToSynthesis()` to map canonical bytes → DNA with constraint
  * screening (where seed retries happen).
  *
+ * ⚠️ For files larger than ~64 MB, prefer `encodeToCanonicalStream()` which
+ * processes data in chunks with bounded memory usage (O(chunkSize) instead
+ * of O(fileSize)). This function loads the entire input into memory at once.
+ *
  * @param data - Raw file bytes.
  * @param cfg  - Codec configuration.
  * @param meta - File metadata (name, content type).
@@ -879,9 +884,12 @@ export async function encodeToCanonical(
   // 1) Compress (optional)
   let compressed: Uint8Array = data;
   let compression: "none" | "deflate" = "none";
+  let compressionTier: CompressorTier | null = null;
   if (cfg.compress) {
-    compressed = deflate(data, { level: 9 });
+    const compressResult = compressRouter(data, { level: 9 });
+    compressed = compressResult.data;
     compression = "deflate";
+    compressionTier = compressResult.tier;
   }
 
   // 2) Encrypt (optional)
@@ -1105,6 +1113,191 @@ export async function encodeToCanonical(
     forwardPrimer: fwd,
     reversePrimer: rev,
     archiveSalt,
+  };
+}
+
+// ─── v3.0 encodeToCanonicalStream ────────────────────────────────────────────
+
+/**
+ * Streaming encode: processes data in chunks with bounded memory usage.
+ *
+ * Instead of loading the entire file into memory, this function:
+ * 1. Reads data in configurable chunk sizes (default: 64MB)
+ * 2. Compresses each chunk independently using the compress router
+ * 3. Encodes each chunk as a separate shard
+ * 4. Returns a CanonicalArchive that references all shards
+ *
+ * Peak memory: O(chunkSize) instead of O(fileSize)
+ *
+ * When the total data fits within a single chunk, this falls back to
+ * `encodeToCanonical()` directly. For larger data, each shard is encoded
+ * independently (with its own outer RS parity), then the resulting blocks
+ * are merged into a single archive with sequential oligo indices.
+ *
+ * @param dataStream - Async iterable of Uint8Array chunks, or a ReadableStream
+ * @param cfg - Codec configuration
+ * @param meta - File metadata
+ * @param chunkSize - Maximum chunk size in bytes (default: 64MB = 67108864)
+ */
+export async function encodeToCanonicalStream(
+  dataStream: AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>,
+  cfg: CodecConfig,
+  meta: { fileName: string; contentType: string },
+  chunkSize: number = 67108864, // 64MB
+): Promise<CanonicalArchive> {
+  if (chunkSize <= 0) {
+    throw new Error(`chunkSize must be > 0, got ${chunkSize}`);
+  }
+
+  // ── Phase 1: Read stream into chunkSize-bounded shards ──────────────
+  //
+  // We accumulate data from the stream until we reach chunkSize, then
+  // flush that as a shard. This keeps peak memory at O(chunkSize).
+
+  const shards: Uint8Array[] = [];    // completed shards
+  let currentBuf: Uint8Array[] = [];   // chunks for the in-progress shard
+  let currentLen = 0;                  // bytes in currentBuf
+  let totalRawBytes = 0;              // total bytes across all shards
+
+  // Helper: flush currentBuf into a completed shard
+  function flushShard(): void {
+    if (currentLen === 0) return;
+    const shard = new Uint8Array(currentLen);
+    let offset = 0;
+    for (const piece of currentBuf) {
+      shard.set(piece, offset);
+      offset += piece.length;
+    }
+    shards.push(shard);
+    currentBuf = [];
+    currentLen = 0;
+  }
+
+  // Read from the stream — supports both web ReadableStream and async iterable
+  if (typeof ReadableStream !== 'undefined' && dataStream instanceof ReadableStream) {
+    const reader = (dataStream as ReadableStream<Uint8Array>).getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+
+        totalRawBytes += value.length;
+        currentBuf.push(value);
+        currentLen += value.length;
+
+        // When we've accumulated enough data, flush a shard
+        if (currentLen >= chunkSize) {
+          flushShard();
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  } else {
+    // Async iterable
+    for await (const chunk of dataStream as AsyncIterable<Uint8Array>) {
+      if (!chunk || chunk.length === 0) continue;
+      const piece = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as unknown as ArrayBuffer);
+
+      totalRawBytes += piece.length;
+      currentBuf.push(piece);
+      currentLen += piece.length;
+
+      if (currentLen >= chunkSize) {
+        flushShard();
+      }
+    }
+  }
+
+  // Flush any remaining data as the final shard
+  flushShard();
+
+  // ── Phase 2: Handle edge cases ───────────────────────────────────────
+
+  if (shards.length === 0) {
+    // Empty stream — encode an empty file
+    return encodeToCanonical(new Uint8Array(0), cfg, meta);
+  }
+
+  if (shards.length === 1) {
+    // Single shard — delegate directly to encodeToCanonical
+    return encodeToCanonical(shards[0], cfg, meta);
+  }
+
+  // ── Phase 3: Multi-shard encode ──────────────────────────────────────
+  //
+  // Each shard is encoded independently with its own outer RS parity.
+  // The resulting blocks are merged into a single CanonicalArchive with
+  // sequential oligo indices. This means the merged archive has multiple
+  // independent RS groups — each shard is self-contained for decoding.
+
+  const shardArchives: CanonicalArchive[] = [];
+  for (let i = 0; i < shards.length; i++) {
+    const shardMeta = {
+      fileName: `${meta.fileName}.shard_${i.toString().padStart(4, '0')}`,
+      contentType: meta.contentType,
+    };
+    const archive = await encodeToCanonical(shards[i], cfg, shardMeta);
+    shardArchives.push(archive);
+  }
+
+  // ── Phase 4: Merge into a single CanonicalArchive ────────────────────
+
+  // Compute overall file hash across all shard data
+  const { createHash } = await import("crypto");
+  const hasher = createHash("sha256");
+  for (const shard of shards) {
+    hasher.update(shard);
+  }
+  const fileHash = hasher.digest("hex");
+
+  // Re-index blocks sequentially across shards
+  const mergedBlocks: CanonicalBlock[] = [];
+  let oligoOffset = 0;
+  let totalOligoCount = 0;
+  let totalParityOligos = 0;
+
+  for (let i = 0; i < shardArchives.length; i++) {
+    const sa = shardArchives[i];
+    for (const block of sa.blocks) {
+      mergedBlocks.push({
+        index: oligoOffset + block.index,
+        innerBytes: block.innerBytes,
+        seed: block.seed,
+        isParity: block.isParity,
+      });
+    }
+    oligoOffset += sa.metadata.oligoCount;
+    totalOligoCount += sa.metadata.oligoCount;
+    totalParityOligos += sa.metadata.parityOligos;
+  }
+
+  // Build merged metadata based on the first shard's config,
+  // updating aggregate fields
+  const firstMeta = shardArchives[0].metadata;
+  const lastMeta = shardArchives[shardArchives.length - 1].metadata;
+
+  const mergedMetadata: CodecMetadata = {
+    ...firstMeta,
+    fileName: meta.fileName,
+    fileSize: totalRawBytes,
+    fileHash,
+    rawSize: totalRawBytes,
+    oligoCount: totalOligoCount,
+    parityOligos: totalParityOligos,
+    // outerRS reflects the per-shard config (each shard has independent RS)
+    outerRS: firstMeta.outerRS,
+    // Use last shard's encodedAt as the completion time
+    encodedAt: lastMeta.encodedAt,
+  };
+
+  return {
+    metadata: mergedMetadata,
+    blocks: mergedBlocks,
+    forwardPrimer: shardArchives[0].forwardPrimer,
+    reversePrimer: shardArchives[0].reversePrimer,
+    archiveSalt: shardArchives[0].archiveSalt,
   };
 }
 

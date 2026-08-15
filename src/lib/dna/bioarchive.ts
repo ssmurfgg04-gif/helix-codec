@@ -306,7 +306,7 @@ export async function toBioArchive(
   // Derive primer length from the actual primer sequences (not hardcoded).
   // This ensures the Merkle tree slices correctly when non-default primers
   // (e.g., longer barcoded primers) are used.
-  const primerLen = encoded.forwardPrimer.length || encoded.reversePrimer.length || 20;
+  const primerLen = encoded.forwardPrimer.length || encoded.reversePrimer.length || config?.primerLength || 20;
   // Derive actual oligo length from the first oligo (if any), falling back
   // to a computed default.
   const oligoLength = encoded.oligos.length > 0

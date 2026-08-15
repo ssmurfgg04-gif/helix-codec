@@ -1617,17 +1617,18 @@ export function makeLDPCInner(parityBytes: number, payloadBytes: number, address
  * Uses Map's insertion-order guarantee: first key is the oldest entry.
  * On cache hit, the entry is deleted and re-inserted to move it to the end.
  */
-const MAX_CACHE_SIZE = 32;
-const _ldpcCache = new Map<string, LDPCInnerCode>();
+const MAX_CACHE_SIZE = 16;
+const _ldpcCache = new Map<string, { ldpc: LDPCInnerCode; lastAccess: number }>();
 
 export function getCachedLDPCInner(n: number, k: number): LDPCInnerCode {
   const key = `${n}:${k}`;
   const cached = _ldpcCache.get(key);
   if (cached) {
+    cached.lastAccess = Date.now();
     // Move to end (most recently used) by re-inserting
     _ldpcCache.delete(key);
     _ldpcCache.set(key, cached);
-    return cached;
+    return cached.ldpc;
   }
   // Evict oldest (first key in Map iteration order) if at capacity
   if (_ldpcCache.size >= MAX_CACHE_SIZE) {
@@ -1635,6 +1636,6 @@ export function getCachedLDPCInner(n: number, k: number): LDPCInnerCode {
     _ldpcCache.delete(oldest);
   }
   const inst = new LDPCInnerCode({ n, k });
-  _ldpcCache.set(key, inst);
+  _ldpcCache.set(key, { ldpc: inst, lastAccess: Date.now() });
   return inst;
 }

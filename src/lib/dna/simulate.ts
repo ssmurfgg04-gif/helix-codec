@@ -27,6 +27,14 @@
  */
 
 import { Oligo } from "./types";
+import {
+  simulateWetlab,
+  WetlabConfig,
+  WetlabResult,
+  ILLUMINA_WETLAB,
+  NANOPORE_WETLAB,
+  PACBIO_WETLAB,
+} from "./dt4dds-simulate";
 
 export interface MutationConfig {
   /** Per-position substitution rate (0..1). */
@@ -41,6 +49,13 @@ export interface MutationConfig {
   dropoutRate: number;
   /** Random seed for reproducibility (0 = non-deterministic). */
   seed: number;
+  /**
+   * Simulator backend:
+   *   - "basic"  — Simple uniform per-position model (this file)
+   *   - "dt4dds" — Parametric wet-lab pipeline (dt4dds-simulate.ts)
+   * Default: "dt4dds" (since v3.0)
+   */
+  simulator?: "basic" | "dt4dds";
 }
 
 export const PRESET_ILLUMINA: MutationConfig = {
@@ -108,6 +123,7 @@ export const PRESET_CLEAN: MutationConfig = {
   coverage: 1,
   dropoutRate: 0,
   seed: 0,
+  simulator: "basic", // Clean preset uses basic for fast, deterministic test paths
 };
 
 /** A single noisy read of an oligo. */
@@ -307,13 +323,141 @@ function simulateRead(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Bridge: MutationConfig → WetlabConfig (dt4dds)
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a simple MutationConfig to a WetlabConfig for the dt4dds pipeline.
+ *
+ * Maps the flat error rates to the full parametric model:
+ *   - Synthesis: uses substitution/insertion/deletion rates with position-dependent scaling
+ *   - PCR: defaults (15 cycles, 0.85 duplication, 0.0001 sub rate, 0.1 GC bias)
+ *   - Aging: no aging by default (days = 0)
+ *   - Sequencing: uses coverage/dropout + platform-appropriate error rates
+ *
+ * The channel is inferred from the error profile:
+ *   - deletionRate > 0.02 → nanopore
+ *   - insertionRate > 0.02 → pacbio
+ *   - otherwise → illumina
+ */
+export function mutationConfigToWetlabConfig(cfg: MutationConfig): WetlabConfig {
+  // Infer platform from error profile
+  let platform: "illumina" | "nanopore" | "pacbio";
+  let base: WetlabConfig;
+  if (cfg.deletionRate > 0.02 || cfg.insertionRate > 0.03) {
+    platform = "nanopore";
+    base = NANOPORE_WETLAB;
+  } else if (cfg.insertionRate > 0.02) {
+    platform = "pacbio";
+    base = PACBIO_WETLAB;
+  } else {
+    platform = "illumina";
+    base = ILLUMINA_WETLAB;
+  }
+
+  // Override synthesis rates from MutationConfig
+  base = structuredClone(base);
+  base.synthesis.substitutionRate = cfg.substitutionRate;
+  base.synthesis.insertionRate = cfg.insertionRate;
+  base.synthesis.deletionRate = cfg.deletionRate;
+
+  // Override sequencing rates + coverage + dropout from MutationConfig
+  base.sequencing.platform = platform;
+  base.sequencing.substitutionRate = cfg.substitutionRate;
+  base.sequencing.insertionRate = cfg.insertionRate;
+  base.sequencing.deletionRate = cfg.deletionRate;
+  base.sequencing.coverage = cfg.coverage;
+  base.sequencing.dropoutRate = cfg.dropoutRate;
+
+  return base;
+}
+
+/**
+ * Convert a WetlabResult from dt4dds into a SimulationResult for downstream consumers.
+ */
+export function wetlabResultToSimulationResult(
+  result: WetlabResult,
+  simulationTimeMs: number,
+): SimulationResult {
+  const { reads, stats } = result;
+  const droppedOligos: number[] = [];
+
+  // Identify dropped oligos (those in the original set with no reads)
+  const readIndices = new Set(reads.map((r) => r.oligoIndex));
+  // We don't have the original oligo list here, so we derive dropped from stats
+  // The dt4dds pipeline already handles dropout; we leave droppedOligos empty
+  // since the reads already exclude dropped oligos.
+
+  // Compute per-oligo stats
+  const byIndex = new Map<number, SequencingRead[]>();
+  for (const read of reads) {
+    const arr = byIndex.get(read.oligoIndex) ?? [];
+    arr.push(read);
+    byIndex.set(read.oligoIndex, arr);
+  }
+
+  const perOligoStats: SimulationResult["perOligoStats"] = [];
+  const entries = Array.from(byIndex.entries());
+  for (const [index, oligoReads] of entries) {
+    const avgSubs = oligoReads.reduce((s, r) => s + r.substitutions, 0) / oligoReads.length;
+    const avgIns = oligoReads.reduce((s, r) => s + r.insertions, 0) / oligoReads.length;
+    const avgDels = oligoReads.reduce((s, r) => s + r.deletions, 0) / oligoReads.length;
+    perOligoStats.push({
+      index,
+      avgSubstitutions: avgSubs,
+      avgInsertions: avgIns,
+      avgDeletions: avgDels,
+      readCount: oligoReads.length,
+    });
+  }
+
+  const totalReads = reads.length;
+  const avgReadLength =
+    totalReads === 0 ? 0 : reads.reduce((s, r) => s + r.sequence.length, 0) / totalReads;
+  const totalErrors = reads.reduce(
+    (s, r) => s + r.substitutions + r.insertions + r.deletions,
+    0,
+  );
+
+  return {
+    reads,
+    droppedOligos,
+    perOligoStats,
+    totalReads,
+    avgReadLength,
+    totalErrors,
+    simulationTimeMs,
+  };
+}
+
+/**
+ * Simulate full sequencing of an encoded file using the dt4dds parametric pipeline.
+ */
+export function simulateDt4dds(
+  oligos: Oligo[],
+  cfg: MutationConfig,
+): SimulationResult {
+  const t0 = Date.now();
+  const wetlabCfg = mutationConfigToWetlabConfig(cfg);
+  const result = simulateWetlab(oligos, wetlabCfg, cfg.seed);
+  return wetlabResultToSimulationResult(result, Date.now() - t0);
+}
+
 /**
  * Simulate full sequencing of an encoded file.
+ *
+ * Delegates to the dt4dds parametric pipeline by default (since v3.0).
+ * Set `cfg.simulator = "basic"` to use the simple uniform model.
  */
 export function simulate(
   oligos: Oligo[],
   cfg: MutationConfig,
 ): SimulationResult {
+  const useDt4dds = cfg.simulator !== "basic"; // default is dt4dds
+  if (useDt4dds) {
+    return simulateDt4dds(oligos, cfg);
+  }
   const t0 = Date.now();
   const rng = new Rng(cfg.seed || Math.floor(Math.random() * 0xffffffff));
   const reads: SequencingRead[] = [];
@@ -367,7 +511,7 @@ export function simulate(
     totalErrors,
     simulationTimeMs: Date.now() - t0,
   };
-}
+} // end basic simulator path
 
 /**
  * Compare two DNA strings position-by-position, returning a diff for visualization.

@@ -236,10 +236,9 @@ export async function POST(req: NextRequest) {
     }
   } catch (error) {
     console.error("DNA API error:", error);
-    const message = process.env.NODE_ENV === 'development' && error instanceof Error
-      ? error.message : 'Internal error';
+    // Never leak internal error details or stack traces to the client
     return NextResponse.json(
-      { ok: false, error: message },
+      { ok: false, error: 'Internal server error' },
       { status: 500 },
     );
   }

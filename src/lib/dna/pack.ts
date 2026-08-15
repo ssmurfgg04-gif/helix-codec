@@ -21,6 +21,8 @@
  *     Matching" (bit-parallel approximate matching).
  */
 
+import { simdUnpack, initSimdUnpack, isSimdAvailable } from "./simd-unpack";
+
 // ---------------------------------------------------------------------------
 // Lookup tables for fast char ↔ 2-bit conversion
 // ---------------------------------------------------------------------------
@@ -85,6 +87,17 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     throw new Error(
       `numBases (${numBases}) exceeds packed capacity (${bits.length * 4})`,
     );
+  }
+
+  // Try SIMD path first if available
+  if (isSimdAvailable()) {
+    const asciiBytes = simdUnpack(bits, numBases);
+    // Convert ASCII bytes to string
+    let result = '';
+    for (let i = 0; i < asciiBytes.length; i++) {
+      result += String.fromCharCode(asciiBytes[i]);
+    }
+    return result;
   }
 
   const chars: string[] = new Array(numBases);
@@ -364,3 +377,9 @@ export function reverseComplement(bits: Uint8Array, numBases: number): Uint8Arra
 
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// SIMD unpack re-exports
+// ---------------------------------------------------------------------------
+
+export { initSimdUnpack, isSimdAvailable } from "./simd-unpack";

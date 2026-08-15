@@ -82,13 +82,11 @@ export const DEFAULT_SOFT_INFO_DECODE_CONFIG: SoftInfoDecodeConfig = {
 // ---------------------------------------------------------------------------
 
 /**
-/ **
- * Convert Ph)Convert a Phred Q-score to error probability.
+ * Convert a Phred Q-score to error probability.
  * Q = -10 * log10(P_error)  →  P_error = 10^(-Q/10)
  *
- * Phred+332 Phred+33 encoding: Q = ASCII(code) - 33
+ * Phred+33 encoding: Q = ASCII(code) - 33
  */
-" */
 export function qScoreToErrorProb(qScore: number): number {
   return Math.pow(10, -qScore / 10);
 }
