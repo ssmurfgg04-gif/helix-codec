@@ -1,4 +1,4 @@
-# Helix Codec v3.1
+# Helix Codec v3.2
 
 **Production DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js, optimized via Rust/WASM.**
 
@@ -74,6 +74,8 @@ Reads → cluster → Gungnir (low coverage) → HMM-Viterbi → conv-Viterbi �
 | **Profile-HMM + attention consensus** | `profileHmm3.ts` | ✅ Operational | |
 | **OSD-0/1/2/3 cascade decoder** | `osd.ts` | ✅ Operational | |
 | **K-mer clustering** | `kmer.ts` | ✅ Operational | Margin filtering |
+| **DNA-MGC+ multi-gain correction** | `mgc-plus.ts` | ✅ Operational | STRATEGY 0.6, wired into decode |
+| **Soft-info decoder (Q-score LLRs)** | `soft-info-decode.ts` | ✅ Operational | Approaches ~1.95 bits/nt |
 
 ---
 
@@ -96,6 +98,7 @@ Reads → cluster → Gungnir (low coverage) → HMM-Viterbi → conv-Viterbi �
 | Strategy | When | Module |
 |----------|------|--------|
 | Gungnir (single-read recovery) | Nanopore/PacBio, ≤3 reads | `gungnir.ts` |
+| DNA-MGC+ (multi-gain correction) | Nanopore/PacBio, 2-5 reads | `mgc-plus.ts` + `soft-info-decode.ts` |
 | HMM-primary (low coverage) | Nanopore/PacBio, 2-3 reads | `profileHmm3.ts` |
 | Per-read LDPC decode | All channels, any coverage | `ldpc-codec.ts` |
 | Fast weighted consensus | ≥2 reads, Illumina | `soft-consensus.ts` |
@@ -129,8 +132,7 @@ Reads → cluster → Gungnir (low coverage) → HMM-Viterbi → conv-Viterbi �
 | LDPC correction capacity limited | ~3% per-read failure rate at 4B parity | Outer RS erasure recovery covers failures | Mitigated |
 | Encryption is optional, not default | Users may forget to enable | API warns when encoding without password | By design |
 | No GPU/FPGA acceleration | Decode throughput limited by CPU | SIMD bit-parallel + WASM provide 2-6× over naive JS | Available |
-| DNA-MGC+ not yet integrated | Gungnir is best available single-read codec | DNA-MGC+ outperforms on DT4DDS (2026) | Planned |
-| Soft-info decoding not implemented | Density ceiling at ~1.82 bits/nt | Banal-Schilling 2026 approach for >0.99 | Research |
+| Soft-info limited to LLR combining | Full iterative BP not yet wired | Soft LLRs + Q-score consensus operational | Improving |
 
 ---
 

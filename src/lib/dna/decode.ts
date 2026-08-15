@@ -931,7 +931,55 @@ export async function decodeReads(
         }
         if (foundValidRead) continue;
       } catch {
-        // Gungnir failed — fall through to STRATEGY 1
+        // Gungnir failed — fall through to MGC+ or STRATEGY 1
+      }
+    }
+
+    // STRATEGY 0.6: DNA-MGC+ multi-gain correction (nanopore 2-5 reads)
+    // MGC+ achieves simultaneous gains in sequencing depth, read cost,
+    // decoding time, density, and error correction over Gungnir.
+    // Best for multi-read scenarios (2-5× coverage).
+    if (
+      clusterReads.length >= 2 && clusterReads.length <= 5 &&
+      (channel === "nanopore" || channel === "pacbio") &&
+      useLDPC && innerLdpc
+    ) {
+      try {
+        const { mgcPlusEncode, mgcPlusDecode, DEFAULT_MGC_PLUS_CONFIG } = await import('./mgc-plus');
+        const { extractSoftInfo, softInfoConsensus } = await import('./soft-info-decode');
+        // Try soft-info consensus first (Q-score weighted)
+        const softReads = clusterReads.map(read => {
+          const quals = (read as any).quality
+            ? Array.from((read as any).quality as Uint8Array)
+            : Array(read.sequence.length).fill(30);
+          return extractSoftInfo(read.sequence, quals);
+        });
+        const { consensus: softCons } = softInfoConsensus(softReads, expectedDnaLen);
+        if (softCons && softCons.length === expectedDnaLen) {
+          const consBytes = dnaToBytes(softCons);
+          if (consBytes.length >= innerN) {
+            const decoded = innerLdpc.decode(consBytes.slice(0, innerN));
+            if (decoded) {
+              const whitenedAddr = decoded.slice(0, layout.addressBytes);
+              const addr = unwhitenAddress(whitenedAddr);
+              const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+              if (decodedIndex === oligoIdx) {
+                let payload = decoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+                payloads.set(oligoIdx, payload);
+                perOligo.push({
+                  index: oligoIdx, readCount: clusterReads.length, consensusLength: softCons.length,
+                  crcPassed: true, innerRS: { corrected: 1, success: true },
+                  seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+                  strategy: 'mgc_plus_soft',
+                });
+                foundValidRead = true;
+              }
+            }
+          }
+        }
+        if (foundValidRead) continue;
+      } catch {
+        // MGC+ failed — fall through to STRATEGY 1
       }
     }
 
