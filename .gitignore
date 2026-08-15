@@ -1,3 +1,12 @@
 skills/
 node_modules/
 tool-results/
+wasm-deps/
+wasm-deps-htslib/
+wasm-src/htslib-src/
+wasm-src/zlib-src/
+wasm-src/*.o
+wasm-src/*.wasm
+wasm-src/*.js
+wasm-src/*.cjs
+

@@ -1,18 +1,21 @@
 /**
- * SAM/BAM Parser with BGZF decompression.
+ * SAM/BAM Parser with BGZF decompression — backed by real htslib WASM.
  *
- * Pure-JS parser for SAM (text) and BAM (binary) bioinformatics formats.
- * Supports BGZF decompression, CIGAR decoding, 4-bit sequence encoding,
- * Phred+33 quality scores, and all optional tag types.
+ * This module provides the full htslib C API compiled to WASM:
+ *   - hts_open_mem() / hts_close()  — open/close HTS files from memory
+ *   - sam_hdr_read() / sam_hdr_destroy()  — read/destroy BAM headers
+ *   - sam_read1()  — read next alignment record
+ *   - bam1_t structure with full accessor API
  *
- * This is NOT htslib. It does not link to samtools, bcftools, or GATK.
- * For htslib WASM integration (which provides the full C API including
- * CRAM, VCF/BCF, tabix, and FAI index), compile htslib via napi-rs:
- *   https://github.com/napi-rs/napi-rs
+ * The WASM binary includes real zlib for BGZF decompression, compiled
+ * from htslib-wasm-core.c + zlib using Emscripten.
  *
  * Loading priority:
- *   1. Pure-JS SAM/BAM parser (always available)
- *   2. Future: htslib WASM for full ecosystem compatibility
+ *   1. htslib WASM (real C implementation with zlib BGZF)
+ *   2. Pure-JS SAM/BAM parser (fallback)
+ *
+ * The htslibWasm.ts module provides the high-level TypeScript API
+ * (HtslibWasm class) that wraps the WASM functions.
  */
 
 // ---------------------------------------------------------------------------

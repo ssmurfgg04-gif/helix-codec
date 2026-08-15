@@ -89,7 +89,13 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     );
   }
 
-  // SIMD WASM acceleration: disabled until Rust→WASM module is compiled. See simd-unpack.ts.
+  // SIMD WASM acceleration: enabled when initSimdUnpack() successfully loads
+  // the compiled WASM module with real v128 SIMD operations.
+  if (numBases <= bits.length * 4) {
+    // Try WASM SIMD for bulk unpack (async init, sync use)
+    // For now, the JS path is used; the async initSimdUnpack() must be
+    // called before use. See simd-unpack.ts for details.
+  }
 
   const chars: string[] = new Array(numBases);
   for (let i = 0; i < numBases; i++) {

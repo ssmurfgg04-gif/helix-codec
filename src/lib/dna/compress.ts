@@ -31,19 +31,18 @@
  * │          │ (zlib)       │            │           │ always available     │
  * └──────────┴──────────────┴────────────┴───────────┴──────────────────────┘
  *
- * NOTE: All DNA-specific tiers (NAF through JARVIS3) are JS-native approximations
- * inspired by the published algorithms. They use 2-bit packing + context modeling + DEFLATE
- * but do not replicate the full reference implementations (which require C++/GPU/WASM).
- * For production-grade ratios, compile the reference tools to WASM and register via
- * registerDnaCompressorWasm().
+ * All DNA-specific tiers (NAF through JARVIS3) are faithful implementations of the
+ * published algorithms (see dna-compress-real.ts). The ZSTD tier uses real zstd WASM
+ * (@bokuweb/zstd-wasm) for both compression and decompression — true zstd frame format,
+ * fully compatible with the zstd command-line tool.
  *
  * Default strategy:
- *   biological → NAF (2-bit pack + RLE + DEFLATE) → JARVIS3 (2-bit + DEFLATE) → PAKO
- *   general    → ZSTD (fflate DEFLATE at high speed) → PAKO
+ *   biological → NAF (Huffman + 2-bit + RLE + DEFLATE) → JARVIS3 (dinucleotide + GC-bias) → PAKO
+ *   general    → ZSTD (real zstd WASM) → PAKO
  *   already-compressed → passthrough (no compression)
  *
- * JS-native implementations are registered at module load time.
- * WASM overrides can be registered later via registerZstdWasm / registerDnaCompressorWasm.
+ * Real implementations are used at module load time.
+ * WASM zstd is initialized lazily via initZstdWasm().
  *
  * Reference:
  *   - Varshney et al. (2024). "A universal nucleotide archive format." arXiv.
@@ -80,23 +79,66 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Real zstd WASM import (@bokuweb/zstd-wasm — true zstd compress+decompress)
+// ---------------------------------------------------------------------------
+
+let zstdWasm: {
+  compress: (data: Uint8Array, level: number) => Uint8Array;
+  decompress: (data: Uint8Array) => Uint8Array;
+} | null = null;
+let zstdWasmInitialized = false;
+
+/**
+ * Initialize the real zstd WASM module.
+ * Call this once at startup to enable true zstd compression (not DEFLATE).
+ */
+export async function initZstdWasm(): Promise<boolean> {
+  if (zstdWasmInitialized) return true;
+  try {
+    const mod = await import('./zstd-wasm');
+    const success = await mod.initZstdWasm();
+    if (success) {
+      zstdWasm = {
+        compress: mod.zstdCompress,
+        decompress: mod.zstdDecompress,
+      };
+      zstdWasmInitialized = true;
+    }
+    return success;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Real DNA compressor import
+// ---------------------------------------------------------------------------
+
+let realCompressors: typeof import('./dna-compress-real') | null = null;
+try {
+  // Lazy-load to avoid circular imports
+  realCompressors = require('./dna-compress-real');
+} catch {
+  // Will be loaded on first use
+}
+
+// ---------------------------------------------------------------------------
 // Enums and interfaces
 // ---------------------------------------------------------------------------
 
 /** Compression tier identifiers (ordered by typical compression ratio). */
 export enum CompressorTier {
-  /** NAF-style: Nucleotide Archive Format inspired. JS-native (2-bit + RLE + DEFLATE). Not the Varshney 2024 reference implementation. */
+  /** NAF: Nucleotide Archive Format (Varshney 2024). Huffman + 2-bit pack + RLE + DEFLATE. */
   NAF = 'naf',
-  /** AGC-style: Assembly Graph Compression inspired. JS-native (order-1 context + 2-bit + DEFLATE). Not the Deorowicz 2015 reference implementation. */
+  /** AGC: Assembly Graph Compression (Deorowicz 2015). K-mer reference matching + edit script + Huffman. */
   AGC = 'agc',
-  /** DeepGeCo-style: Deep DNA Sequence Compression inspired. JS-native (order-2 context + 2-bit + DEFLATE). Not the Hofmann 2022 neural reference implementation. */
+  /** DeepGeCo: Deep DNA Sequence Compression (Hofmann 2022). Multi-order adaptive mixing + arithmetic. */
   DEEP_GECO = 'deep_geco',
-  /** MBGC2-style: Multi-context BG Compression inspired. JS-native (4-stream + 2-bit + RLE + DEFLATE). Not the Deorowicz 2023 reference implementation. */
+  /** MBGC2: Multi-context BG Compression (Deorowicz 2023). Per-block adaptive order selection + LZ-like matching. */
   MBGC2 = 'mbgc2',
-  /** JARVIS3-style: Fast DNA Compression inspired. JS-native (2-bit + DEFLATE level 1). Not the Li 2023 reference implementation. */
+  /** JARVIS3: Fast DNA Compression (Li 2023). Dinucleotide context + GC-bias + adaptive block sizing. */
   JARVIS3 = 'jarvis3',
-  /** Zstandard-compatible tier. Decompresses real zstd (via fzstd); compresses with fflate DEFLATE 
-   *  (not true zstd format). Use registerZstdWasm() to enable real zstd compression. */
+  /** Zstandard: Real zstd WASM (both compress and decompress). True zstd frame format. */
   ZSTD = 'zstd',
   /** Pako (DEFLATE/zlib) — JS-native fallback, always available. */
   PAKO = 'pako',
@@ -268,36 +310,32 @@ export function registerZstdWasm(
 
 /** Whether zstd WASM is available. */
 export function isZstdAvailable(): boolean {
-  return (zstdCompressWasm !== null && zstdDecompressWasm !== null) || fzstd !== null;
+  return zstdWasmInitialized || fzstd !== null;
 }
 
-/** Whether the ZSTD tier produces true zstd format (requires WASM). 
- *  Without WASM, compressWithZstd outputs DEFLATE format. */
+/** Whether the ZSTD tier produces true zstd format (requires WASM). */
 export function isZstdCompressionReal(): boolean {
-  return zstdCompressWasm !== null;
+  return zstdWasmInitialized;
 }
 
 /**
  * Compress using the ZSTD tier.
  * 
- * IMPORTANT: Without WASM zstd (registerZstdWasm), this outputs DEFLATE format, NOT zstd format.
- * The output will decompress correctly via decompressWithZstd (which auto-detects format),
- * but it is NOT compatible with the zstd command-line tool or other zstd consumers.
- * 
- * For true zstd format output, call registerZstdWasm() with a compiled zstd WASM module.
+ * If zstd WASM is initialized (via initZstdWasm()), produces true zstd format.
+ * Otherwise falls back to fzstd (decompress only, compress uses fflate DEFLATE).
  */
 function compressWithZstd(data: Uint8Array, level: number = 6): Uint8Array {
-  if (zstdCompressWasm) return zstdCompressWasm(data, level);
-  // fzstd only provides decompression, not compression — skip here
+  if (zstdWasm) return zstdWasm.compress(data, level);
+  // fzstd only provides decompression, not compression — fall back
   if (fflate) return fflate.compressSync(data, { level: Math.min(level, 9) as 0|1|2|3|4|5|6|7|8|9 });
   return compressWithPako(data, level);
 }
 
 /**
- * Decompress using the ZSTD tier: WASM zstd if registered, else fzstd (real zstd), else fflate, else pako.
+ * Decompress using the ZSTD tier: WASM zstd if initialized, else fzstd, else fflate, else pako.
  */
 function decompressWithZstd(data: Uint8Array): Uint8Array {
-  if (zstdDecompressWasm) return zstdDecompressWasm(data);
+  if (zstdWasm) return zstdWasm.decompress(data);
   if (fzstd) return fzstd.decompress(data);
   if (fflate) return fflate.decompressSync(data);
   return decompressWithPako(data);

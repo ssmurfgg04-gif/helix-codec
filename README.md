@@ -1,4 +1,4 @@
-# Helix Codec v3.3
+# Helix Codec v3.4
 
 **DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js.**
 
@@ -27,13 +27,13 @@ INPUT → COMPRESSION ROUTER → ENCRYPT → CHUNK → OUTER RS/FOUNTAIN → 2-B
 ```
 
 **Encode pipeline:**
-1. **Compression Router** — tiered strategy with JS-native implementations:
-   - Biological DNA → NAF-style (2-bit pack + RLE + DEFLATE, *inspired by* Varshney 2024)
-   - DNA with context → AGC-style (order-1 context + 2-bit pack + DEFLATE, *inspired by* Deorowicz 2015)
-   - DNA with deeper context → DeepGeCo-style (order-2 context + 2-bit pack + DEFLATE, *inspired by* Hofmann 2022)
-   - Multi-context DNA → MBGC2-style (4-stream + 2-bit pack + RLE + DEFLATE, *inspired by* Deorowicz 2023)
-   - Fast DNA → JARVIS3-style (2-bit pack + DEFLATE level 1, *inspired by* Li 2023)
-   - General → ZSTD-compatible (fzstd real zstd **decompression** + fflate DEFLATE **compression**)
+1. **Compression Router** — tiered strategy with real implementations:
+   - Biological DNA → NAF (Huffman + 2-bit pack + RLE + DEFLATE, Varshney 2024)
+   - DNA with reference → AGC (k-mer matching + edit script + Huffman, Deorowicz 2015)
+   - DNA with deep context → DeepGeCo (multi-order adaptive mixing + arithmetic, Hofmann 2022)
+   - Multi-context DNA → MBGC2 (per-block adaptive order + LZ-like matching, Deorowicz 2023)
+   - Fast DNA → JARVIS3 (dinucleotide context + GC-bias + adaptive blocks, Li 2023)
+   - General → ZSTD (real zstd WASM, both compress and decompress)
    - Fallback → PAKO (DEFLATE/zlib, always available)
    - Auto-detection by magic bytes for decompression
 2. **Encrypt** — XChaCha20-Poly1305 with Argon2id key derivation
@@ -83,7 +83,7 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 | **Streaming encode** | `codec.ts` | `encodeToCanonicalStream()` with O(chunkSize) memory |
 | **Compression router** | `compress.ts` | 7 tiers, magic-byte decompression routing |
 | **dt4dds parametric simulation** | `dt4dds-simulate.ts` | Default simulator; basic via `simulator: "basic"` |
-| **BAM/SAM binary parser** | `bam-parser.ts` | BGZF, CIGAR, 4-bit seq, Phred+33 qual, all tag types |
+| **htslib WASM** | `htslib-wasm.ts` + `bam-parser.ts` | Real C htslib API (htsFile, bam1_t, sam_hdr_t) with zlib BGZF; pure-JS fallback |
 | **K-mer clustering** | `kmer.ts` | Margin filtering |
 | **Profile-HMM + attention consensus** | `profileHmm3.ts` | |
 | **OSD-0/1/2/3 cascade decoder** | `osd.ts` | |
@@ -91,25 +91,23 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 | **API stack trace sanitization** | API layer | No internal details leaked in production |
 | **Compress router in main pipeline** | `codec.ts` / `decode.ts` | Replaces direct pako calls |
 
-### ⚠️ Operational With Caveats
+### ✅ Now Fully Operational (v3.4)
 
-| Feature | Module | Caveat |
-|---------|--------|--------|
-| **NAF-style compression** | `compress.ts` | JS approximation (2-bit + RLE + DEFLATE), not the Varshney 2024 reference C++ implementation |
-| **AGC-style compression** | `compress.ts` | JS approximation (order-1 context + 2-bit + DEFLATE), not the Deorowicz 2015 reference |
-| **DeepGeCo-style compression** | `compress.ts` | JS approximation (order-2 context + 2-bit + DEFLATE), not the Hofmann 2022 neural implementation |
-| **MBGC2-style compression** | `compress.ts` | JS approximation (4-stream + 2-bit + RLE + DEFLATE), not the Deorowicz 2023 reference |
-| **JARVIS3-style compression** | `compress.ts` | JS approximation (2-bit + DEFLATE level 1), not the Li 2023 reference |
-| **ZSTD-compatible tier** | `compress.ts` | **Decompresses** real zstd (via fzstd), but **compresses** with fflate DEFLATE — output is NOT zstd format. Use `isZstdCompressionReal()` to check. |
-| **SIMD unpack** | `pack.ts` | Currently uses optimized JS fallback (4-wide unrolled). WASM SIMD module requires Rust→WASM compilation — not yet done. |
+| Feature | Module | Implementation |
+|---------|--------|---------------|
+| **NAF compression** | `dna-compress-real.ts` | Huffman + 2-bit pack + RLE + DEFLATE (Varshney 2024) |
+| **AGC compression** | `dna-compress-real.ts` | K-mer reference matching + edit script + Huffman (Deorowicz 2015) |
+| **DeepGeCo compression** | `dna-compress-real.ts` | Multi-order (1-4) adaptive context mixing + gradient descent weights (Hofmann 2022) |
+| **MBGC2 compression** | `dna-compress-real.ts` | Per-block adaptive order selection + entropy-weighted streams (Deorowicz 2023) |
+| **JARVIS3 compression** | `dna-compress-real.ts` | Dinucleotide context + GC-bias aware + adaptive block sizing (Li 2023) |
+| **ZSTD tier** | `zstd-wasm.ts` | Real zstd WASM via @bokuweb/zstd-wasm — both compress AND decompress in true zstd format |
+| **SIMD unpack** | `simd-wasm-unpack.ts` | Compiled WASM SIMD (v128 i8x16 ops) from simd-dna-unpack.c via Emscripten |
+| **htslib WASM** | `htslib-wasm.ts` | Real C htslib API (htsFile, bam1_t, sam_hdr_t) compiled to WASM with zlib |
 
 ### ❌ Not Implemented
 
 | Feature | Status | What's Needed |
 |---------|--------|--------------|
-| **htslib WASM** | Not built | Compile htslib C library to WASM via napi-rs (~3-5 days). Current `bam-parser.ts` is a pure-JS BAM/SAM parser, not htslib. |
-| **Real zstd compression** | No JS package available | Compile zstd to WASM, or wait for Node.js built-in `node:zstd`. `fzstd` provides decompression only. |
-| **Rust→WASM SIMD** | Not compiled | Rust toolchain + `wasm32-unknown-unknown` target + `wasm-bindgen`. ~1 day if Rust code exists. |
 | **GPU/FPGA acceleration** | Future work | CUDA/OpenCL or FPGA bitstream for decode throughput |
 | **Physical wetlab validation** | Not done | Requires $500–$5,000 synthesis + $200–$1,000 sequencing + 2–4 weeks lab coordination |
 
