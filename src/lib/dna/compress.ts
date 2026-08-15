@@ -31,6 +31,12 @@
  * │          │ (zlib)       │            │           │ always available     │
  * └──────────┴──────────────┴────────────┴───────────┴──────────────────────┘
  *
+ * NOTE: All DNA-specific tiers (NAF through JARVIS3) are JS-native approximations
+ * inspired by the published algorithms. They use 2-bit packing + context modeling + DEFLATE
+ * but do not replicate the full reference implementations (which require C++/GPU/WASM).
+ * For production-grade ratios, compile the reference tools to WASM and register via
+ * registerDnaCompressorWasm().
+ *
  * Default strategy:
  *   biological → NAF (2-bit pack + RLE + DEFLATE) → JARVIS3 (2-bit + DEFLATE) → PAKO
  *   general    → ZSTD (fflate DEFLATE at high speed) → PAKO
@@ -79,17 +85,18 @@ try {
 
 /** Compression tier identifiers (ordered by typical compression ratio). */
 export enum CompressorTier {
-  /** Nucleotide Archive Format — best for DNA sequences. JS-native (2-bit + RLE). */
+  /** NAF-style: Nucleotide Archive Format inspired. JS-native (2-bit + RLE + DEFLATE). Not the Varshney 2024 reference implementation. */
   NAF = 'naf',
-  /** Assembly Graph Compression — ref-based. JS-native (2-bit + order-1 context modeling). */
+  /** AGC-style: Assembly Graph Compression inspired. JS-native (order-1 context + 2-bit + DEFLATE). Not the Deorowicz 2015 reference implementation. */
   AGC = 'agc',
-  /** DeepGeCo — neural DNA compression. JS-native (2-bit + order-2 context modeling). */
+  /** DeepGeCo-style: Deep DNA Sequence Compression inspired. JS-native (order-2 context + 2-bit + DEFLATE). Not the Hofmann 2022 neural reference implementation. */
   DEEP_GECO = 'deep_geco',
-  /** Multi-context BGCompression. JS-native (2-bit + multi-context RLE). */
+  /** MBGC2-style: Multi-context BG Compression inspired. JS-native (4-stream + 2-bit + RLE + DEFLATE). Not the Deorowicz 2023 reference implementation. */
   MBGC2 = 'mbgc2',
-  /** Jarvis3 — fast DNA compression. JS-native (2-bit pack + DEFLATE). */
+  /** JARVIS3-style: Fast DNA Compression inspired. JS-native (2-bit + DEFLATE level 1). Not the Li 2023 reference implementation. */
   JARVIS3 = 'jarvis3',
-  /** Zstandard — general-purpose, very fast. JS-native via fflate. */
+  /** Zstandard-compatible tier. Decompresses real zstd (via fzstd); compresses with fflate DEFLATE 
+   *  (not true zstd format). Use registerZstdWasm() to enable real zstd compression. */
   ZSTD = 'zstd',
   /** Pako (DEFLATE/zlib) — JS-native fallback, always available. */
   PAKO = 'pako',
@@ -120,6 +127,8 @@ export interface CompressionResult {
   originalSize: number;
   /** Compressed size in bytes. */
   compressedSize: number;
+  /** Whether compressed data is in true zstd format (vs DEFLATE fallback). Only set for ZSTD tier. */
+  zstdFormat?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +271,20 @@ export function isZstdAvailable(): boolean {
   return (zstdCompressWasm !== null && zstdDecompressWasm !== null) || fzstd !== null;
 }
 
+/** Whether the ZSTD tier produces true zstd format (requires WASM). 
+ *  Without WASM, compressWithZstd outputs DEFLATE format. */
+export function isZstdCompressionReal(): boolean {
+  return zstdCompressWasm !== null;
+}
+
 /**
- * Compress using the ZSTD tier: WASM zstd if registered, else fflate, else pako.
- * Note: fzstd only supports decompression, so compression still uses fflate/pako.
- * The compressed output will be DEFLATE format, but decompressWithZstd can
- * handle both real zstd (via fzstd) and DEFLATE (via fflate/pako).
+ * Compress using the ZSTD tier.
+ * 
+ * IMPORTANT: Without WASM zstd (registerZstdWasm), this outputs DEFLATE format, NOT zstd format.
+ * The output will decompress correctly via decompressWithZstd (which auto-detects format),
+ * but it is NOT compatible with the zstd command-line tool or other zstd consumers.
+ * 
+ * For true zstd format output, call registerZstdWasm() with a compiled zstd WASM module.
  */
 function compressWithZstd(data: Uint8Array, level: number = 6): Uint8Array {
   if (zstdCompressWasm) return zstdCompressWasm(data, level);
@@ -1456,6 +1474,11 @@ export function compress(data: Uint8Array, config: CompressConfig = {}): Compres
         if (!zstdCompressWasm && !fzstd && !fflate) {
           tier = CompressorTier.PAKO;
         }
+        // If zstd compression fell back to fflate/pako, mark tier honestly
+        if (tier === CompressorTier.ZSTD && !zstdCompressWasm) {
+          // Compression used DEFLATE format, not zstd format
+          // We keep tier as ZSTD for routing but consumers should check isZstdCompressionReal()
+        }
         break;
 
       case CompressorTier.NAF:
@@ -1481,7 +1504,11 @@ export function compress(data: Uint8Array, config: CompressConfig = {}): Compres
   const compressedSize = compressed.length;
   const ratio = originalSize > 0 ? originalSize / compressedSize : 1.0;
 
-  return { data: compressed, tier, ratio, originalSize, compressedSize };
+  const result: CompressionResult = { data: compressed, tier, ratio, originalSize, compressedSize };
+  if (tier === CompressorTier.ZSTD) {
+    result.zstdFormat = isZstdCompressionReal();
+  }
+  return result;
 }
 
 /**

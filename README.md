@@ -1,6 +1,6 @@
-# Helix Codec v3.2
+# Helix Codec v3.3
 
-**Production DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js, optimized via Rust/WASM.**
+**DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js.**
 
 ---
 
@@ -14,7 +14,9 @@ DNA is the densest known storage medium: **455 EB/gram** theoretical, lasting th
 - **Mutation simulation** with realistic, measured error rates
 - **Recovery pipeline** (clustering, consensus, erasure decoding)
 
-Helix Codec implements all of this in TypeScript with Rust/WASM acceleration, runnable in the browser and Node.js.
+Helix Codec implements all of this in TypeScript, runnable in the browser and Node.js.
+
+> **⚠️ Honesty note:** All density and reliability figures are from **simulation only**. This codec has never been synthesized, aged, or sequenced in a physical wet lab. See [Limitations](#limitations-honest) below.
 
 ---
 
@@ -25,13 +27,13 @@ INPUT → COMPRESSION ROUTER → ENCRYPT → CHUNK → OUTER RS/FOUNTAIN → 2-B
 ```
 
 **Encode pipeline:**
-1. **Compression Router** — full tiered strategy with JS-native implementations for all tiers:
-   - Biological DNA → NAF (2-bit pack + RLE + DEFLATE, Varshney 2024)
-   - DNA with context structure → AGC (order-1 context model + 2-bit pack + DEFLATE, Deorowicz 2015)
-   - DNA with deeper context → DeepGeCo (order-2 context model + 2-bit pack + DEFLATE, Hofmann 2022)
-   - DNA with multi-context → MBGC2 (4-stream multi-context + 2-bit pack + RLE + DEFLATE, Deorowicz 2023)
-   - Fast DNA → JARVIS3 (2-bit pack + DEFLATE level 1, Li 2023)
-   - General → ZSTD (fzstd real zstd decompression + fflate DEFLATE compression)
+1. **Compression Router** — tiered strategy with JS-native implementations:
+   - Biological DNA → NAF-style (2-bit pack + RLE + DEFLATE, *inspired by* Varshney 2024)
+   - DNA with context → AGC-style (order-1 context + 2-bit pack + DEFLATE, *inspired by* Deorowicz 2015)
+   - DNA with deeper context → DeepGeCo-style (order-2 context + 2-bit pack + DEFLATE, *inspired by* Hofmann 2022)
+   - Multi-context DNA → MBGC2-style (4-stream + 2-bit pack + RLE + DEFLATE, *inspired by* Deorowicz 2023)
+   - Fast DNA → JARVIS3-style (2-bit pack + DEFLATE level 1, *inspired by* Li 2023)
+   - General → ZSTD-compatible (fzstd real zstd **decompression** + fflate DEFLATE **compression**)
    - Fallback → PAKO (DEFLATE/zlib, always available)
    - Auto-detection by magic bytes for decompression
 2. **Encrypt** — XChaCha20-Poly1305 with Argon2id key derivation
@@ -61,45 +63,55 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 
 ---
 
-## Features — All Operational
+## Features
 
-| Feature | Module | Status | Notes |
-|---------|--------|--------|-------|
-| **Reed-Solomon** GF(2^8) & GF(2^16) | `reedsolomon.ts` / `reedsolomon216.ts` | ✅ Operational | |
-| **LDPC inner code** (PEG, BP + OSD-2) | `ldpc-codec.ts` | ✅ Operational | LRU cache (max 16 entries, bounded) |
-| **Convolutional inner code** (K=9 NASA) | `convolutional.ts` | ✅ Operational | Indel-tolerant Viterbi |
-| **CRC-8/16 sync markers** | `crcmarker.ts` | ✅ Operational | DNA-Aeon pattern |
-| **Holographic DNA sharding** | `holographic.ts` | ✅ Operational | |
-| **BLAKE3 content-addressing** | `addressing.ts` | ✅ Operational | Dedup + hierarchical |
-| **.hlx binary archive** | `archive.ts` | ✅ Operational | O(1) seek, BGZF blocks |
-| **BHE FSM deterministic encoding** | `bhe-encode.ts` | ✅ Operational | Zero retries, BigInt; default for nanopore/pacbio |
-| **Gungnir hash-based recovery** | `gungnir.ts` | ✅ Operational | All channels (illumina + nanopore + pacbio) at low coverage |
-| **DNA-Aeon arithmetic coding** | `dna-aeon.ts` | ✅ Operational | CRC-8 resync; primary for dnaAeon mode, fallback for arithmetic mode |
-| **YYC Yin-Yang coding** | `yinyang.ts` | ✅ Operational | Rule set 1 & 2 |
-| **dt4dds parametric simulation** | `dt4dds-simulate.ts` | ✅ Operational | Default simulator (synthesis + PCR + aging + seq); basic via `simulator: "basic"` |
-| **ADS density tuning** | `ads-density.ts` | ✅ Operational | Channel-adaptive config |
-| **NAF DNA compression** | `compress.ts` | ✅ Operational | 2-bit pack + RLE + DEFLATE (Varshney 2024) |
-| **AGC DNA compression** | `compress.ts` | ✅ Operational | Order-1 context + 2-bit pack + DEFLATE (Deorowicz 2015) |
-| **DeepGeCo DNA compression** | `compress.ts` | ✅ Operational | Order-2 context + 2-bit pack + DEFLATE (Hofmann 2022) |
-| **MBGC2 DNA compression** | `compress.ts` | ✅ Operational | 4-stream multi-context + 2-bit pack + RLE + DEFLATE (Deorowicz 2023) |
-| **JARVIS3 fast DNA compression** | `compress.ts` | ✅ Operational | 2-bit pack + DEFLATE level 1 (Li 2023) |
-| **ZSTD compression** | `compress.ts` | ✅ Operational | fzstd real zstd decompression + fflate DEFLATE compression |
-| **PAKO compression** | `compress.ts` | ✅ Operational | DEFLATE/zlib fallback (always available) |
-| **Compression router** | `compress.ts` | ✅ Operational | Auto-detects biological/general; magic-byte decompression routing |
-| **Compress router in main pipeline** | `codec.ts` / `decode.ts` | ✅ Operational | Replaces direct pako calls; full router for encode + decode |
-| **SIMD unpack (WASM i8x16)** | `pack.ts` | ✅ Operational | WASM SIMD 128-bit accelerated 2-bit→base; optimized JS fallback |
-| **Streaming encode** | `stream.ts` | ✅ Operational | `encodeToCanonicalStream()` with O(chunkSize) memory, ReadableStream + AsyncIterable |
-| **BAM binary parser** | `htslib-wasm.ts` | ✅ Operational | BGZF, binary header, CIGAR, 4-bit seq, Phred+33 qual, all tag types, batch API |
-| **LAB-DB LSM journal** | `lsm-journal.ts` | ✅ Operational | Compact + tombstone eviction |
-| **XChaCha20-Poly1305 encryption** | `encryption.ts` | ✅ Operational | Argon2id key derivation |
-| **Profile-HMM + attention consensus** | `profileHmm3.ts` | ✅ Operational | |
-| **OSD-0/1/2/3 cascade decoder** | `osd.ts` | ✅ Operational | |
-| **K-mer clustering** | `kmer.ts` | ✅ Operational | Margin filtering |
-| **DNA-MGC+ multi-gain correction** | `mgc-plus.ts` | ✅ Operational | STRATEGY 0.6, wired into decode |
-| **Soft-info decoder (Q-score LLRs)** | `soft-info-decode.ts` | ✅ Operational | Approaches ~1.95 bits/nt |
-| **LDPC cache LRU eviction** | `ldpc-codec.ts` | ✅ Operational | Bounded max 16 entries, prevents unbounded memory |
-| **API stack trace sanitization** | API layer | ✅ Operational | No internal details leaked to clients in production |
-| **Configurable Merkle primer length** | `addressing.ts` | ✅ Operational | No longer hardcoded to 20 |
+### ✅ Fully Operational (No Caveats)
+
+| Feature | Module | Notes |
+|---------|--------|-------|
+| **Reed-Solomon** GF(2^8) & GF(2^16) | `reedsolomon.ts` / `reedsolomon216.ts` | |
+| **LDPC inner code** (PEG, BP + OSD-2) | `ldpc-codec.ts` | LRU cache (max 16 entries, bounded) |
+| **Convolutional inner code** (K=9 NASA) | `convolutional.ts` | Indel-tolerant Viterbi |
+| **BHE FSM deterministic encoding** | `bhe-encode.ts` | Zero retries, BigInt; default for nanopore/pacbio |
+| **Gungnir hash-based recovery** | `gungnir.ts` | All channels (illumina + nanopore + pacbio) at low coverage |
+| **DNA-Aeon arithmetic coding** | `dna-aeon.ts` | CRC-8 resync; primary for dnaAeon mode, fallback for arithmetic |
+| **YYC Yin-Yang coding** | `yinyang.ts` | Rule set 1 & 2 |
+| **.hlx binary archive** | `archive.ts` | O(1) seek, BGZF blocks |
+| **BLAKE3 content-addressing** | `addressing.ts` | Dedup + hierarchical; configurable primer length |
+| **LAB-DB LSM journal** | `lsm-journal.ts` | Compact + tombstone eviction |
+| **XChaCha20-Poly1305 encryption** | `encryption.ts` | Argon2id key derivation |
+| **Streaming encode** | `codec.ts` | `encodeToCanonicalStream()` with O(chunkSize) memory |
+| **Compression router** | `compress.ts` | 7 tiers, magic-byte decompression routing |
+| **dt4dds parametric simulation** | `dt4dds-simulate.ts` | Default simulator; basic via `simulator: "basic"` |
+| **BAM/SAM binary parser** | `bam-parser.ts` | BGZF, CIGAR, 4-bit seq, Phred+33 qual, all tag types |
+| **K-mer clustering** | `kmer.ts` | Margin filtering |
+| **Profile-HMM + attention consensus** | `profileHmm3.ts` | |
+| **OSD-0/1/2/3 cascade decoder** | `osd.ts` | |
+| **LDPC cache LRU eviction** | `ldpc-codec.ts` | Bounded max 16 entries |
+| **API stack trace sanitization** | API layer | No internal details leaked in production |
+| **Compress router in main pipeline** | `codec.ts` / `decode.ts` | Replaces direct pako calls |
+
+### ⚠️ Operational With Caveats
+
+| Feature | Module | Caveat |
+|---------|--------|--------|
+| **NAF-style compression** | `compress.ts` | JS approximation (2-bit + RLE + DEFLATE), not the Varshney 2024 reference C++ implementation |
+| **AGC-style compression** | `compress.ts` | JS approximation (order-1 context + 2-bit + DEFLATE), not the Deorowicz 2015 reference |
+| **DeepGeCo-style compression** | `compress.ts` | JS approximation (order-2 context + 2-bit + DEFLATE), not the Hofmann 2022 neural implementation |
+| **MBGC2-style compression** | `compress.ts` | JS approximation (4-stream + 2-bit + RLE + DEFLATE), not the Deorowicz 2023 reference |
+| **JARVIS3-style compression** | `compress.ts` | JS approximation (2-bit + DEFLATE level 1), not the Li 2023 reference |
+| **ZSTD-compatible tier** | `compress.ts` | **Decompresses** real zstd (via fzstd), but **compresses** with fflate DEFLATE — output is NOT zstd format. Use `isZstdCompressionReal()` to check. |
+| **SIMD unpack** | `pack.ts` | Currently uses optimized JS fallback (4-wide unrolled). WASM SIMD module requires Rust→WASM compilation — not yet done. |
+
+### ❌ Not Implemented
+
+| Feature | Status | What's Needed |
+|---------|--------|--------------|
+| **htslib WASM** | Not built | Compile htslib C library to WASM via napi-rs (~3-5 days). Current `bam-parser.ts` is a pure-JS BAM/SAM parser, not htslib. |
+| **Real zstd compression** | No JS package available | Compile zstd to WASM, or wait for Node.js built-in `node:zstd`. `fzstd` provides decompression only. |
+| **Rust→WASM SIMD** | Not compiled | Rust toolchain + `wasm32-unknown-unknown` target + `wasm-bindgen`. ~1 day if Rust code exists. |
+| **GPU/FPGA acceleration** | Future work | CUDA/OpenCL or FPGA bitstream for decode throughput |
+| **Physical wetlab validation** | Not done | Requires $500–$5,000 synthesis + $200–$1,000 sequencing + 2–4 weeks lab coordination |
 
 ---
 
@@ -148,66 +160,70 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 
 > Nanopore and PacBio presets now default to **BHE deterministic encoding** (no seed retries). Override with `mappingMode: "constrained"` or any other mode.
 >
-> All density figures are approximate and from in-simulation testing.
+> ⚠️ **All density figures are from simulation.** No physical synthesis/sequencing validation has been performed.
 
 ---
 
 ## Limitations (Honest)
 
-### Resolved (Previously Stubbed or Missing)
+### What Is Genuinely Done
 
-| Former Limitation | Resolution |
-|-------------------|------------|
-| Compression stubs (NAF/JARVIS3 only) | ✅ Real JS-native implementations for all 7 tiers (NAF, AGC, DeepGeCo, MBGC2, JARVIS3, ZSTD, PAKO) |
-| No streaming encode | ✅ `encodeToCanonicalStream()` with O(chunkSize) bounded memory |
-| htslib WASM not implemented | ✅ Pure-JS BAM/SAM binary parser with BGZF support in `htslib-wasm.ts` |
-| SIMD unpack not found | ✅ WASM SIMD 128-bit (i8x16) accelerated 2-bit→base in `pack.ts`, with optimized JS fallback |
-| Gungnir not in decode cascade | ✅ Wired as STRATEGY 0.5 for **all channels** (illumina + nanopore + pacbio) |
-| BHE not default for noisy channels | ✅ Default mapping for nanopore/pacbio presets (deterministic, zero retries) |
-| dt4dds not integrated | ✅ Default simulator; basic simulator available via `simulator: "basic"` |
-| LDPC unbounded cache | ✅ LRU eviction, max 16 entries — bounded memory |
-| Stack trace leak in API | ✅ Sanitized in production — no internal error details exposed to clients |
-| Merkle primer length hardcoded | ✅ Configurable (was hardcoded to 20) |
-| Compress router not in main pipeline | ✅ `codec.ts` and `decode.ts` use compress router instead of direct pako calls |
-| DNA-Aeon not in decode cascade | ✅ Primary for `dnaAeon` mode; fallback for `arithmetic` mode on Markov failure |
+| Feature | Truly Operational? |
+|---------|-------------------|
+| BHE FSM deterministic encoding | ✅ Yes — BigInt variable-base, zero retries |
+| Gungnir hash-based recovery | ✅ Yes — BLAKE3/CRC-16 proof-of-work, all channels |
+| DNA-Aeon arithmetic + CRC-8 | ✅ Yes — full encoder/decoder with resync |
+| YYC mapping | ✅ Yes — rotating rule matrix, both rule sets |
+| .hlx binary format + BGZF + O(1) seek | ✅ Yes — versioned, indexed, seekable |
+| Content-derived BLAKE3 addressing | ✅ Yes — dedup + hierarchical |
+| Streaming encode (O(chunkSize) RAM) | ✅ Yes — ReadableStream + AsyncIterable |
+| Compression router (7 tiers) | ✅ Yes — but tiers are JS approximations (see below) |
+| LSM journal + compaction | ✅ Yes — L0/L1/L2 with tombstones |
+| LDPC cache LRU | ✅ Yes — bounded at 16 entries |
+| API stack trace sanitization | ✅ Yes — no internal details in production |
+| K-mer clustering | ✅ Yes — survives 1-2 errors in 16nt address |
+| OSD post-pass | ✅ Yes — OSD-0/1/2/3 cascade |
+| dt4dds parametric simulation | ✅ Yes — synthesis + PCR + aging + sequencing |
 
-### Current Limitations
+### What Is Still Incomplete
 
-| Limitation | Impact | Mitigation | Status |
-|------------|--------|------------|--------|
-| AGC/DeepGeCo/MBGC2 are JS-native approximations | Not full reference implementations; WASM would be faster | Correct output, slower than native C/WASM | Future: WASM ports |
-| SIMD unpack uses JS fallback | Rust→WASM SIMD module not yet compiled | Optimized JS fallback is functional, ~2-3× slower than WASM SIMD | Future: Rust WASM build |
-| fzstd is decompression only | Compressed ZSTD output uses fflate DEFLATE format instead | Fully compatible decompression round-trip | Acceptable |
-| No GPU/FPGA acceleration | Decode throughput limited by CPU | SIMD bit-parallel + WASM provide 2-6× over naive JS | Future work |
-| No physical wetlab validation | All metrics are simulation-only | dt4dds parametric models are peer-validated | Ongoing |
-| Nanopore 12.3% IDS recovery is partial | ~50–70% at real-2024 error rates | K=9 Viterbi + OSD cascade + higher parity | Open problem |
-| WASM decode requires load-time init | ~200ms cold start | Lazy init on first decode call | Acceptable |
-| LDPC correction capacity limited | ~3% per-read failure rate at 4B parity | Outer RS erasure recovery covers failures | Mitigated |
-| Encryption is optional, not default | Users may forget to enable | API warns when encoding without password | By design |
-| Soft-info limited to LLR combining | Full iterative BP not yet wired | Soft LLRs + Q-score consensus operational | Improving |
+| Gap | Reality | What It Would Take |
+|-----|---------|-------------------|
+| **ZSTD compression is DEFLATE** | `compressWithZstd()` outputs DEFLATE format, not zstd format. Decompression handles real zstd via fzstd, but compression doesn't produce it. | Compile zstd to WASM (~2-3 days), or wait for `node:zstd`. Check with `isZstdCompressionReal()`. |
+| **SIMD is JS fallback** | `pack.ts` uses 4-wide unrolled JS, not WASM SIMD. ~2-3× slower than claimed WASM throughput. | Install Rust toolchain, write SIMD core, compile with `wasm-pack`. ~1 day if the Rust code is ready. |
+| **DNA compressors are approximations** | NAF/AGC/DeepGeCo/MBGC2/JARVIS3 tiers use 2-bit pack + context modeling + DEFLATE. They are **inspired by** the published algorithms, not the reference C++/GPU implementations. | Compile reference implementations to WASM via `registerDnaCompressorWasm()`. |
+| **No wetlab validation** | All density, error rate, and recovery success figures are **simulation only**. | $500–$5,000 synthesis (Twist Bioscience) + $200–$1,000 sequencing + 2–4 weeks. This is a science problem, not a code problem. |
+| **bam-parser is not htslib** | `bam-parser.ts` is a pure-JS SAM/BAM parser. It does NOT link to htslib, samtools, bcftools, or GATK. No CRAM, VCF/BCF, tabix, or FAI support. | Compile htslib to WASM via napi-rs (~3-5 days). |
+
+### Open Problems (Not Just Implementation)
+
+| Problem | Status |
+|---------|--------|
+| Nanopore 12.3% IDS recovery | Partial — ~50-70% at real-2024 error rates. K=9 Viterbi + OSD cascade + higher parity helps. |
+| LDPC correction capacity | ~3% per-read failure rate at 4B parity. Outer RS erasure recovery covers failures. |
+| Encryption not default | Users may forget to enable. API warns when encoding without password. |
 
 ---
 
-## Quick Benchmark (v3.2, Node.js 24, single core)
+## Quick Benchmark (v3.3, Node.js 24, single core)
 
 | Module | Operation | Time/op |
 |--------|-----------|---------|
-| P0 BHE FSM | Encode 256B | 0.074 ms |
-| P1 Gungnir | Encode 200nt | 0.012 ms |
-| P1 Gungnir | Decode (0 errors) | 0.005 ms |
-| P1 Gungnir | Decode (1 error) | 0.371 ms |
-| P3 DNA-Aeon | Encode 128B | 0.055 ms |
-| P4 dt4dds | Synthesis 200nt | 0.017 ms |
-| P6 YYC | Encode 128B | 0.012 ms |
+| BHE FSM | Encode 256B | 0.074 ms |
+| Gungnir | Encode 200nt | 0.012 ms |
+| Gungnir | Decode (0 errors) | 0.005 ms |
+| Gungnir | Decode (1 error) | 0.371 ms |
+| DNA-Aeon | Encode 128B | 0.055 ms |
+| dt4dds | Synthesis 200nt | 0.017 ms |
+| YYC | Encode 128B | 0.012 ms |
 | RLL+GC | Encode 256B | 0.027 ms |
 | .hlx Archive | O(1) seek | 0.000 ms |
 | BLAKE3 Addr | Derive address | 0.003 ms |
-| NAF Compress | DNA 1KB | ~0.05 ms |
-| AGC Compress | DNA 1KB | ~0.07 ms |
-| DeepGeCo Compress | DNA 1KB | ~0.09 ms |
-| MBGC2 Compress | DNA 1KB | ~0.11 ms |
-| SIMD Unpack (WASM) | 2-bit 1KB | ~0.005 ms |
-| SIMD Unpack (JS fallback) | 2-bit 1KB | ~0.01 ms |
+| NAF-style Compress | DNA 1KB | ~0.05 ms |
+| AGC-style Compress | DNA 1KB | ~0.07 ms |
+| DeepGeCo-style Compress | DNA 1KB | ~0.09 ms |
+| MBGC2-style Compress | DNA 1KB | ~0.11 ms |
+| SIMD Unpack (JS) | 2-bit 1KB | ~0.01 ms |
 | BAM Parse | 1000 records | ~1.2 ms |
 
 ---
@@ -243,63 +259,61 @@ const config = { ...V51_DEFAULT_CONFIG, mappingMode: "dnaAeon" };
 ### Streaming Encode
 
 ```typescript
-import { encodeToCanonicalStream } from "./lib/dna/stream";
+import { encodeToCanonicalStream } from "./lib/dna/codec";
 
 // O(chunkSize) memory — processes data in chunks
-const stream = encodeToCanonicalStream(data, config, { chunkSize: 65536 });
-for await (const chunk of stream) {
-  console.log(`Chunk ${chunk.chunkIndex}: ${chunk.length} bytes → ${chunk.encoded.oligos.length} oligos`);
-}
+const archive = await encodeToCanonicalStream(readableStream, config, meta);
 
-// Also supports ReadableStream and AsyncIterable sources
+// Also supports AsyncIterable sources
 ```
 
 ### Compression Router
 
 ```typescript
-import { compress, decompress, CompressorTier } from "./lib/dna/compress";
+import { compress, decompress, CompressorTier, isZstdCompressionReal } from "./lib/dna/compress";
 
-// Auto-detect: biological → NAF/AGC/DeepGeCo/MBGC2, fast → JARVIS3, general → ZSTD, fallback → PAKO
+// Auto-detect: biological → NAF-style/AGC-style/etc, general → ZSTD-compatible, fallback → PAKO
 const result = compress(data);
 console.log(`Used ${result.tier}, ratio ${result.ratio.toFixed(2)}×`);
+
+// Check if ZSTD compression is real zstd format or DEFLATE fallback
+if (result.tier === CompressorTier.ZSTD && !isZstdCompressionReal()) {
+  console.warn('ZSTD tier compressed with DEFLATE format (not true zstd). Call registerZstdWasm() for real zstd.');
+}
 
 // Specific tier
 const nafResult = compress(data, { tier: CompressorTier.NAF });
 const agcResult = compress(data, { tier: CompressorTier.AGC });
-const deepGeCoResult = compress(data, { tier: CompressorTier.DEEPGECO });
-const mbgc2Result = compress(data, { tier: CompressorTier.MBGC2 });
 
 // Decompression auto-detects format by magic bytes
 const original = decompress(compressed);
 ```
 
-### BAM Parsing
+### BAM/SAM Parsing
 
 ```typescript
-import { parseBam, readBamRecords } from "./lib/dna/htslib-wasm";
+import { BamParser, parseBamFile } from "./lib/dna/bam-parser";
 
-// Full BAM format support: BGZF, binary header, CIGAR, 4-bit seq, Phred+33 qual, all tag types
-const bam = parseBam(buffer);
-const records = readBamRecords(bam, { start: 0, end: 1000 }); // batch reading
+// Note: This is a pure-JS BAM/SAM parser, NOT htslib.
+// Full BAM format: BGZF, binary header, CIGAR, 4-bit seq, Phred+33 qual, all tag types
+const records = parseBamFile(bamBuffer);
+
+// Or use the class API for streaming
+const parser = await BamParser.load();
+const { fd, header } = await parser.openFile('reads.bam');
+const record = await parser.bamRead(fd, header);
 ```
 
 ### Simulation
 
 ```typescript
-import { simulatePipeline } from "./lib/dna/dt4dds-simulate";
+import { simulate } from "./lib/dna/simulate";
 
 // dt4dds is the default simulator (parametric wetlab: synthesis bias, PCR, aging, sequencing)
-const result = simulatePipeline(oligos, { synthesis: {...}, pcr: {...}, sequencing: {...} });
+const result = simulate(oligos, config);
 
 // Basic simulator available via config override
 const config = { ...V51_DEFAULT_CONFIG, simulator: "basic" };
-```
-
-### Benchmark
-
-```bash
-npm run bench        # Quick benchmark (all P0-P6 modules)
-npm run bench:full   # Full benchmark suite
 ```
 
 ---
@@ -326,23 +340,22 @@ npm run bench         # Quick benchmark
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `bhe-encode.ts` | 711 | P0: BHE FSM deterministic encoding |
-| `gungnir.ts` | 724 | P1: Hash-based single-read recovery (all channels) |
-| `dna-aeon.ts` | 785 | P3: Arithmetic coding + CRC sync markers |
-| `yinyang.ts` | 489 | P6: Yin-Yang high-density coding |
-| `ads-density.ts` | 314 | P5: Adaptive density tuning |
-| `dt4dds-simulate.ts` | 856 | P4: Parametric wetlab simulation (default) |
-| `constraints.ts` | 560 | RLL + GC rotating codebooks |
-| `compress.ts` | 700+ | Full tiered compression (NAF/AGC/DeepGeCo/MBGC2/JARVIS3/ZSTD/PAKO) with magic-byte routing |
-| `pack.ts` | 400+ | WASM SIMD 128-bit 2-bit→base unpack + optimized JS fallback |
+| `bhe-encode.ts` | 711 | BHE FSM deterministic encoding |
+| `gungnir.ts` | 724 | Hash-based single-read recovery (all channels) |
+| `dna-aeon.ts` | 785 | Arithmetic coding + CRC sync markers |
+| `yinyang.ts` | 489 | Yin-Yang high-density coding |
+| `ads-density.ts` | 314 | Adaptive density tuning |
+| `dt4dds-simulate.ts` | 856 | Parametric wetlab simulation (default) |
+| `compress.ts` | 700+ | Tiered compression (NAF/AGC/DeepGeCo/MBGC2/JARVIS3-style + ZSTD-compatible + PAKO) |
+| `pack.ts` | 400+ | 2-bit pack/unpack + bit-parallel ops (JS; WASM SIMD pending) |
 | `addressing.ts` | 758 | BLAKE3 content-derived addressing (configurable Merkle primer) |
-| `stream.ts` | 340+ | Streaming encode (encodeToCanonicalStream, ReadableStream + AsyncIterable) |
-| `lsm-journal.ts` | 503 | LAB-DB LSM-tree journal with compaction |
-| `archive.ts` | 603 | .hlx binary archive format |
-| `htslib-wasm.ts` | 500+ | BAM/SAM binary parser (BGZF, CIGAR, 4-bit seq, Phred+33, all tags) |
 | `codec.ts` | 1500+ | Main encode pipeline (compress router + BHE/YYC wired) |
 | `decode.ts` | 2500+ | Strategy cascade (compress router + Gungnir + DNA-Aeon wired) |
-| `simd-unpack.ts` | 340+ | Bit-parallel 2-bit unpack (Uint32Array) |
+| `stream.ts` | 340+ | Streaming encode (ReadableStream + AsyncIterable) |
+| `lsm-journal.ts` | 503 | LAB-DB LSM-tree journal with compaction |
+| `archive.ts` | 603 | .hlx binary archive format |
+| `bam-parser.ts` | 500+ | SAM/BAM binary parser (BGZF, CIGAR, 4-bit seq, all tags) |
+| `simd-unpack.ts` | 340+ | SIMD unpack interface (WASM pending; JS fallback active) |
 | `types.ts` | 751 | Core types, configs, channel presets |
 | + 80 more | — | LDPC, convolutional, RS, fountain, holographic, etc. |
 
@@ -352,13 +365,13 @@ npm run bench         # Quick benchmark
 
 | Layer | Technology |
 |-------|-----------|
-| Language | TypeScript 5, Rust |
+| Language | TypeScript 5 |
 | Runtime | Node.js / Bun, Browser (WASM) |
 | Framework | Next.js 16 |
 | Error Correction | @ronomon/reed-solomon, custom LDPC/Conv/OSD |
 | Crypto | @noble/ciphers (XChaCha20-Poly1305), @noble/hashes (BLAKE3, Argon2id) |
-| Compression | fflate (ZSTD-tier DEFLATE), fzstd (zstd decompression), pako (DEFLATE), NAF/AGC/DeepGeCo/MBGC2/JARVIS3 (DNA-aware) |
-| Bioinformatics | Custom BAM/SAM parser (BGZF, CIGAR, tags) |
+| Compression | fflate (DEFLATE), fzstd (zstd decompression only), pako (DEFLATE), NAF/AGC/DeepGeCo/MBGC2/JARVIS3-style (DNA-aware JS approximations) |
+| Bioinformatics | Custom BAM/SAM parser (not htslib) |
 | Database | Prisma (archive metadata) |
 | UI | React 19, shadcn/ui, Tailwind CSS 4 |
 | Testing | Vitest |

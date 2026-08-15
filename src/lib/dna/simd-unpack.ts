@@ -1,16 +1,18 @@
 /**
  * SIMD-accelerated DNA unpacking.
- * 
- * Uses WASM SIMD 128-bit (i8x16) operations for parallel 2-bit → base decoding.
- * Falls back to scalar JS when WASM SIMD is not available.
- * 
- * WASM SIMD operations used:
+ *
+ * WASM SIMD module not yet compiled. Currently uses optimized JS scalar
+ * fallback (4-wide unrolled). WASM SIMD acceleration requires compiling
+ * a Rust/C core to .wasm — see https://github.com/aspect-build/rules_wasm
+ * for tooling.
+ *
+ * When the WASM module is compiled, the following SIMD operations will be used:
  *   - v128.load: Load 16 bytes at once
  *   - i8x16.shuffle: Parallel lookup table (2-bit → ASCII base)
  *   - i8x16.and: Mask extraction
  *   - i8x16.shr: Bit shifting
- * 
- * Throughput: ~4 GB/s on V8 with WASM SIMD (vs ~1.5 GB/s scalar JS)
+ *
+ * Expected throughput with WASM SIMD: ~4 GB/s on V8 (vs ~1.5 GB/s scalar JS)
  */
 
 /** Whether WASM SIMD is available and initialized. */
@@ -18,6 +20,9 @@ let simdAvailable = false;
 
 /** Cached WASM module instance for SIMD unpack. */
 let simdInstance: WebAssembly.Instance | null = null;
+
+/** Set to true when Rust→WASM SIMD module is compiled. */
+export const SIMD_WASM_AVAILABLE = false; // Set to true when Rust→WASM SIMD module is compiled
 
 /**
  * Initialize WASM SIMD unpack module.
@@ -27,8 +32,11 @@ let simdInstance: WebAssembly.Instance | null = null;
  */
 export async function initSimdUnpack(): Promise<boolean> {
   // Check if WASM SIMD is supported
-  if (typeof WebAssembly === 'undefined') return false;
-  
+  if (typeof WebAssembly === 'undefined') {
+    console.warn('[simd-unpack] WebAssembly not available — using JS scalar fallback');
+    return false;
+  }
+
   try {
     // Test SIMD support with a minimal module
     const testModule = new Uint8Array([
@@ -41,7 +49,7 @@ export async function initSimdUnpack(): Promise<boolean> {
       0x0B,       // end
     ]);
     await WebAssembly.instantiate(testModule);
-    
+
     // Build the SIMD unpack WASM module inline
     // This module unpacks 16 bytes of 2-bit packed DNA data at once
     // using v128 operations for parallel processing
@@ -51,6 +59,10 @@ export async function initSimdUnpack(): Promise<boolean> {
     simdAvailable = true;
     return true;
   } catch {
+    console.warn(
+      '[simd-unpack] WASM SIMD module not available — using JS scalar fallback. ' +
+      'Compile Rust/C→WASM SIMD module and set SIMD_WASM_AVAILABLE=true to enable.'
+    );
     simdAvailable = false;
     return false;
   }
@@ -176,7 +188,7 @@ export function simdUnpackBatch(
   return packedArrays.map(({ data, numNuc }) => simdUnpack(data, numNuc));
 }
 
-/** Check if SIMD unpack is available. */
+/** Check if SIMD unpack is available. Always false until WASM module is compiled. */
 export function isSimdAvailable(): boolean {
-  return simdAvailable;
+  return SIMD_WASM_AVAILABLE;
 }

@@ -1,17 +1,18 @@
 /**
- * htslib WASM Binding Skeleton.
+ * SAM/BAM Parser with BGZF decompression.
  *
- * Compiles htslib to WASM via emnapi + napi-rs.
- * The loader tries native .node first, falls back to .wasm automatically.
- * Same codebase, zero platform-specific builds.
+ * Pure-JS parser for SAM (text) and BAM (binary) bioinformatics formats.
+ * Supports BGZF decompression, CIGAR decoding, 4-bit sequence encoding,
+ * Phred+33 quality scores, and all optional tag types.
  *
- * napi-rs auto-generates TypeScript definitions from the C API.
- * htslib handles SIMD unpack internally (SSE/AVX/NEON → WASM SIMD 128-bit).
+ * This is NOT htslib. It does not link to samtools, bcftools, or GATK.
+ * For htslib WASM integration (which provides the full C API including
+ * CRAM, VCF/BCF, tabix, and FAI index), compile htslib via napi-rs:
+ *   https://github.com/napi-rs/napi-rs
  *
- * Effort: 3-5 days (packaging existing library, not writing one).
- *
- * For now, this is a skeleton that provides the TypeScript interface
- * and falls back to pure-JS parsing when WASM is not available.
+ * Loading priority:
+ *   1. Pure-JS SAM/BAM parser (always available)
+ *   2. Future: htslib WASM for full ecosystem compatibility
  */
 
 // ---------------------------------------------------------------------------
@@ -46,8 +47,8 @@ export interface SamRecord {
   optional: string[];
 }
 
-/** Configuration for htslib WASM loading. */
-export interface HtslibConfig {
+/** Configuration for SAM/BAM parser loading. */
+export interface BamParserConfig {
   /** Path to the native .node addon (default: auto-detect). */
   nativePath?: string;
   /** Path to the .wasm binary (default: auto-detect). */
@@ -63,7 +64,7 @@ export interface HtslibConfig {
 // ---------------------------------------------------------------------------
 
 /** Whether the WASM binary was successfully loaded. */
-export let HTSLIB_WASM_AVAILABLE = false;
+export let BAM_PARSER_AVAILABLE = false;
 
 // ---------------------------------------------------------------------------
 // Pure-JS SAM parser (fallback)
@@ -474,11 +475,11 @@ export function parseBamFile(data: Uint8Array): SamRecord[] {
 }
 
 // ---------------------------------------------------------------------------
-// HtslibWasm
+// BamParser
 // ---------------------------------------------------------------------------
 
 /**
- * htslib WASM binding with automatic fallback to pure-JS parsing.
+ * SAM/BAM parser with automatic fallback to pure-JS parsing.
  *
  * Loading priority:
  *   1. Native .node addon (napi-rs) — fastest, uses OS-level SIMD.
@@ -486,19 +487,19 @@ export function parseBamFile(data: Uint8Array): SamRecord[] {
  *   3. Pure-JS fallback — no SIMD, parses SAM text directly.
  *
  * Usage:
- *   const hts = await HtslibWasm.load();
- *   const { fd, header } = await hts.openFile('reads.sam');
- *   const record = await hts.samRead(fd, header);
- *   await hts.closeFile(fd);
+ *   const parser = await BamParser.load();
+ *   const { fd, header } = await parser.openFile('reads.sam');
+ *   const record = await parser.samRead(fd, header);
+ *   await parser.closeFile(fd);
  */
-export class HtslibWasm {
-  private config: HtslibConfig;
+export class BamParser {
+  private config: BamParserConfig;
   private mode: 'native' | 'wasm' | 'js';
   private fileBuffers: Map<number, { lines: string[]; lineIndex: number; headerLines: string[] }>;
   private bamBuffers: Map<number, { data: Uint8Array; header: BamHeader; offset: number }>;
   private nextFd: number;
 
-  private constructor(config: HtslibConfig, mode: 'native' | 'wasm' | 'js') {
+  private constructor(config: BamParserConfig, mode: 'native' | 'wasm' | 'js') {
     this.config = config;
     this.mode = mode;
     this.fileBuffers = new Map();
@@ -507,13 +508,13 @@ export class HtslibWasm {
   }
 
   /**
-   * Load htslib: try native .node, then .wasm, then pure-JS fallback.
+   * Load parser: try native .node, then .wasm, then pure-JS fallback.
    *
    * @param config Optional configuration for loading.
-   * @returns An initialized HtslibWasm instance.
+   * @returns An initialized BamParser instance.
    */
-  static async load(config?: HtslibConfig): Promise<HtslibWasm> {
-    const cfg: HtslibConfig = {
+  static async load(config?: BamParserConfig): Promise<BamParser> {
+    const cfg: BamParserConfig = {
       enableSimd: true,
       batchSize: 4096,
       ...config,
@@ -524,8 +525,8 @@ export class HtslibWasm {
       try {
         // Dynamic import of native addon.
         await import(/* @vite-ignore */ cfg.nativePath);
-        HTSLIB_WASM_AVAILABLE = true;
-        return new HtslibWasm(cfg, 'native');
+        BAM_PARSER_AVAILABLE = true;
+        return new BamParser(cfg, 'native');
       } catch {
         // Fall through to WASM.
       }
@@ -544,8 +545,8 @@ export class HtslibWasm {
           if (cfg.enableSimd) {
             try {
               await WebAssembly.instantiate(wasmModule);
-              HTSLIB_WASM_AVAILABLE = true;
-              return new HtslibWasm(cfg, 'wasm');
+              BAM_PARSER_AVAILABLE = true;
+              return new BamParser(cfg, 'wasm');
             } catch {
               // SIMD not supported, fall through.
             }
@@ -557,8 +558,8 @@ export class HtslibWasm {
     }
 
     // Strategy 3: Pure-JS fallback.
-    HTSLIB_WASM_AVAILABLE = false;
-    return new HtslibWasm(cfg, 'js');
+    BAM_PARSER_AVAILABLE = false;
+    return new BamParser(cfg, 'js');
   }
 
   /**

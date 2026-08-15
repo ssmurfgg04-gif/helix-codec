@@ -89,16 +89,7 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     );
   }
 
-  // Try SIMD path first if available
-  if (isSimdAvailable()) {
-    const asciiBytes = simdUnpack(bits, numBases);
-    // Convert ASCII bytes to string
-    let result = '';
-    for (let i = 0; i < asciiBytes.length; i++) {
-      result += String.fromCharCode(asciiBytes[i]);
-    }
-    return result;
-  }
+  // SIMD WASM acceleration: disabled until Rust→WASM module is compiled. See simd-unpack.ts.
 
   const chars: string[] = new Array(numBases);
   for (let i = 0; i < numBases; i++) {
