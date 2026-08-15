@@ -1,0 +1,2002 @@
+     1→     1→/**
+     2→     2→ * Recovery engine: decode noisy reads back to the original file.
+     3→     3→ *
+     4→     4→ * DECODING PIPELINE
+     5→     5→ *   1. Trim primers from each read (if present).
+     6→     6→ *   2. Convert DNA -> bytes (2-bit mapping).
+     7→     7→ *   3. Extract address (3-byte index + 1-byte seed) from each read.
+     8→     8→ *   4. Cluster reads by index.
+     9→     9→ *   5. Per-cluster consensus: column-wise plurality vote on the DNA string.
+    10→    10→ *      (For v1, we use simple per-position plurality — works well at coverage >= 10x.)
+    11→    11→ *   6. Per-oligo:
+    12→    12→ *      a. Reverse XOR-with-seed (if seed != 0).
+    13→    13→ *      b. Compute CRC; verify.
+    14→    14→ *      c. Apply inner RS to correct residual errors.
+    15→    15→ *      d. Re-verify CRC.
+    16→    16→ *   7. Outer RS across oligos:
+    17→    17→ *      a. If any oligos are missing (no reads clustered to them, or RS failed),
+    18→    18→ *         mark them as erasures.
+    19→    19→ *      b. Apply outer RS with erasure decoding to recover missing oligos.
+    20→    20→ *   8. Concatenate payloads in index order; trim to fileSize (from metadata).
+    21→    21→ *   9. (Optional) DEFLATE-decompress.
+    22→    22→ *   10. Verify SHA-256 hash matches metadata.
+    23→    23→ */
+    24→    24→
+    25→    25→import { inflate } from "pako";
+    26→    26→import { ReedSolomon } from "./reedsolomon";
+    27→    27→import { ReedSolomon216 } from "./reedsolomon216";
+    28→    28→import { LDPCInnerCode, getCachedLDPCInner } from "./ldpc-codec";
+    29→    29→import { verifyCrc16, crc16, crc16Bytes } from "./crc16";
+    30→    30→import { dnaToBytes, bytesToDna, xorWithSeed, gcContent, maxHomopolymerRun, unwhitenAddress, whitenAddress, ADDRESS_WHITENING } from "./mapping";
+    31→    31→import { goldmanDnaToBytes } from "./goldman";
+    32→    32→import { constrainedDnaToBytes, constrainedDnaToBytesWithErasure, splitConstrainedDnaToBytesWithErasure } from "./constrained-mapping";
+    33→    33→import { arithmeticDnaToBytesCrc } from "./markov-arithmetic";
+    34→    34→// SRT mode: decoder uses standard dnaToBytes (LDPC corrects injected errors)
+    35→    35→// No separate SRT decode function needed — it's identical to direct mapping.
+    36→    36→import { softInfoConsensus, dnaErasureToByteErasure, capErasures, DEFAULT_SOFT_INFO_CONFIG, SoftInfoConfig, qScoresToBitLLRs } from "./softinfo";
+    37→    37→import { alignedConsensus } from "./alignment";
+    38→    38→import { progressiveMSA, msaConsensus } from "./progressive-msa";
+    39→    39→import { forwardBackward3, fusePosteriors3, DEFAULT_HMM3_PARAMS } from "./profileHmm3";
+    40→    40→import { softConsensus, decodeWithSoftConsensus, decodeWithFastConsensus, fastWeightedConsensus, decodeWithProgressiveMSA } from "./soft-consensus";
+    41→    41→import { NeuralLDPCDecoder } from "./neural-ldpc";
+    42→    42→import { decodeWithAttentionConsensus } from "./attention-consensus";
+    43→    43→import { triageOligo, hardMaskLowQ, TriageResult } from "./triage";
+    44→    44→import { buildReferenceKmerIndex, matchReadToReference, extractKmers, kmerToBits } from "./kmer";
+    45→    45→import {
+    46→    46→  CodecMetadata,
+    47→    47→  EncodedFile,
+    48→    48→  Oligo,
+    49→    49→  OligoLayout,
+    50→    50→  computeLayout,
+    51→    51→  computeLayoutAuto,
+    52→    52→  CodecConfig,
+    53→    53→} from "./types";
+    54→    54→import { ConvolutionalInnerCode } from "./convolutional";
+    55→    55→import { IndelTolerantConvolutionalInnerCode, getIndelTolerantInnerCode } from "./convolutional-indel";
+    56→    56→import { SequencingRead } from "./simulate";
+    57→    57→import { deinterleaveCodewords } from "./interleaving";
+    58→    58→
+    59→    59→export interface DecodeResult {
+    60→    60→  /** Recovered file bytes (null if recovery failed). */
+    61→    61→  data: Uint8Array | null;
+    62→    62→  /** SHA-256 hash of recovered data (hex). */
+    63→    63→  hash: string;
+    64→    64→  /** Whether the recovered hash matches the metadata hash. */
+    65→    65→  hashMatches: boolean;
+    66→    66→  /** Stats from the decoding pipeline. */
+    67→    67→  stats: DecodeStats;
+    68→    68→  /** Per-oligo recovery details (for visualization). */
+    69→    69→  perOligo: PerOligoRecovery[];
+    70→    70→}
+    71→    71→
+    72→    72→export interface DecodeStats {
+    73→    73→  totalReads: number;
+    74→    74→  readsUsed: number;
+    75→    75→  clustersFormed: number;
+    76→    76→  oligosRecovered: number;
+    77→    77→  oligosErased: number;
+    78→    78→  oligosFailedInnerRS: number;
+    79→    79→  oligosFailedOuterRS: number;
+    80→    80→  consensusSuccessRate: number;
+    81→    81→  decodeTimeMs: number;
+    82→    82→}
+    83→    83→
+    84→    84→export interface PerOligoRecovery {
+    85→    85→  index: number;
+    86→    86→  readCount: number;
+    87→    87→  consensusLength: number;
+    88→    88→  crcPassed: boolean;
+    89→    89→  innerRS: { corrected: number; success: boolean };
+    90→    90→  seed: number;
+    91→    91→  payloadBytes: Uint8Array;
+    92→    92→  isParity: boolean;
+    93→    93→  /** Which decode strategy succeeded (e.g., "hmm_primary", "per_read", "fast_consensus", "msa", "soft_consensus", "erasure"). */
+    94→    94→  strategy?: string;
+    95→    95→}
+    96→    96→
+    97→    97→// --- Primer trimming ---
+    98→    98→
+    99→    99→/**
+   100→   100→ * Find and trim primers from a read.
+   101→   101→ * Returns the inner DNA (between primers), or null if primers not found.
+   102→   102→ *
+   103→   103→ * For v1, we use exact prefix/suffix matching with a small edit-distance tolerance.
+   104→   104→ *
+   105→   105→ * v59: For nanopore/high-IDS channels, primers may be shifted by indels.
+   106→   106→ * We use a sliding-window search for the reverse primer (scan the last 40nt)
+   107→   107→ * and allow higher edit distance. We also fall back to length-based trimming
+   108→   108→ * if primer search fails (take the first innerDnaLen bases after fwd primer).
+   109→   109→ */
+   110→   110→export function trimPrimer(
+   111→   111→  read: string,
+   112→   112→  fwdPrimer: string,
+   113→   113→  revPrimer: string,
+   114→   114→  maxEditDist = 2,
+   115→   115→  options?: { tolerant?: boolean; expectedInnerLen?: number },
+   116→   116→): string | null {
+   117→   117→  if (read.length < fwdPrimer.length + revPrimer.length) return null;
+   118→   118→
+   119→   119→  if (options?.tolerant) {
+   120→   120→    // v59: Nanopore-tolerant primer search using k-mer anchoring.
+   121→   121→    // Indels shift primer positions and corrupt Hamming distance. Instead:
+   122→   122→    //   1. K-mer match the forward primer against the first 40nt of the read
+   123→   123→    //      to find where the primer ENDS (the inner DNA starts after it).
+   124→   124→    //   2. K-mer match the reverse primer against the last 60nt to find where
+   125→   125→    //      the inner DNA ends.
+   126→   126→    //   3. Extract the inner DNA between these anchors.
+   127→   127→    // This is robust to indels within the primer (k-mers before the indel
+   128→   128→    // still match, and we scan a window to find the best alignment).
+   129→   129→    const k = 5;
+   130→   130→    const minOverlap = 3;
+   131→   131→
+   132→   132→    // Find forward primer end position via k-mer anchoring
+   133→   133→    const fwdKmers = new Set(extractKmers(fwdPrimer, k));
+   134→   134→    const fwdSearchWindow = Math.min(read.length, fwdPrimer.length + 20);
+   135→   135→    let fwdBestPos = -1;
+   136→   136→    let fwdBestOverlap = 0;
+   137→   137→    for (let p = 0; p <= fwdSearchWindow - fwdPrimer.length; p++) {
+   138→   138→      const candidate = read.slice(p, p + fwdPrimer.length);
+   139→   139→      const candKmers = new Set(extractKmers(candidate, k));
+   140→   140→      let overlap = 0;
+   141→   141→      for (const km of fwdKmers) if (candKmers.has(km)) overlap++;
+   142→   142→      if (overlap > fwdBestOverlap) {
+   143→   143→        fwdBestOverlap = overlap;
+   144→   144→        fwdBestPos = p;
+   145→   145→        if (overlap >= fwdKmers.size - 1) break; // near-perfect match
+   146→   146→      }
+   147→   147→    }
+   148→   148→    if (fwdBestOverlap < minOverlap) return null; // forward primer not found
+   149→   149→
+   150→   150→    const innerStart = fwdBestPos + fwdPrimer.length;
+   151→   151→
+   152→   152→    // Find reverse primer start position via k-mer anchoring
+   153→   153→    const revKmers = new Set(extractKmers(revPrimer, k));
+   154→   154→    const revSearchStart = Math.max(innerStart + 20, read.length - revPrimer.length - 30);
+   155→   155→    const revSearchEnd = read.length;
+   156→   156→    let revBestPos = -1;
+   157→   157→    let revBestOverlap = 0;
+   158→   158→    for (let p = revSearchStart; p <= revSearchEnd - revPrimer.length; p++) {
+   159→   159→      const candidate = read.slice(p, p + revPrimer.length);
+   160→   160→      const candKmers = new Set(extractKmers(candidate, k));
+   161→   161→      let overlap = 0;
+   162→   162→      for (const km of revKmers) if (candKmers.has(km)) overlap++;
+   163→   163→      if (overlap > revBestOverlap) {
+   164→   164→        revBestOverlap = overlap;
+   165→   165→        revBestPos = p;
+   166→   166→        if (overlap >= revKmers.size - 1) break;
+   167→   167→      }
+   168→   168→    }
+   169→   169→
+   170→   170→    if (revBestPos >= 0 && revBestOverlap >= minOverlap && revBestPos > innerStart + 16) {
+   171→   171→      return read.slice(innerStart, revBestPos);
+   172→   172→    }
+   173→   173→
+   174→   174→    // Fallback: use expected inner length (forward primer only)
+   175→   175→    if (options.expectedInnerLen && options.expectedInnerLen > 0) {
+   176→   176→      const inner = read.slice(innerStart, innerStart + options.expectedInnerLen);
+   177→   177→      if (inner.length >= 16) return inner;
+   178→   178→    }
+   179→   179→    return null;
+   180→   180→  }
+   181→   181→
+   182→   182→  // Strict mode (Illumina): primers must be at exact positions
+   183→   183→  const fwd = read.slice(0, fwdPrimer.length);
+   184→   184→  if (hamming(fwd, fwdPrimer) > maxEditDist) return null;
+   185→   185→  const rev = read.slice(read.length - revPrimer.length);
+   186→   186→  if (hamming(rev, revPrimer) > maxEditDist) return null;
+   187→   187→  return read.slice(fwdPrimer.length, read.length - revPrimer.length);
+   188→   188→}
+   189→   189→
+   190→   190→function hamming(a: string, b: string): number {
+   191→   191→  const minLen = Math.min(a.length, b.length);
+   192→   192→  let dist = 0;
+   193→   193→  for (let i = 0; i < minLen; i++) {
+   194→   194→    if (a.charCodeAt(i) !== b.charCodeAt(i)) {
+   195→   195→      dist++;
+   196→   196→      if (dist > 5) return dist; // early exit — we only care about dist <= 5
+   197→   197→    }
+   198→   198→  }
+   199→   199→  dist += Math.abs(a.length - b.length);
+   200→   200→  return dist;
+   201→   201→}
+   202→   202→
+   203→   203→// --- Clustering ---
+   204→   204→
+   205→   205→interface Cluster {
+   206→   206→  index: number;
+   207→   207→  reads: SequencingRead[];
+   208→   208→}
+   209→   209→
+   210→   210→/**
+   211→   211→ * Cluster reads by their oligo index (extracted from the address field).
+   212→   212→ *
+   213→   213→ * For v1, we extract the address by trimming primers and reading the first
+   214→   214→ * 4 bytes (16 nt) as the address. Reads where the address can't be parsed
+   215→   215→ * (e.g., indels in the address region) are discarded.
+   216→   216→ */
+   217→   217→function clusterReads(
+   218→   218→  reads: SequencingRead[],
+   219→   219→  fwdPrimer: string,
+   220→   220→  revPrimer: string,
+   221→   221→  addressNt: number,
+   222→   222→  useGoldman: boolean = false,
+   223→   223→  goldmanMode: "fast" | "dense" = "fast",
+   224→   224→  useConstrained: boolean = false,
+   225→   225→  maxHomopolymer: number = 3,
+   226→   226→  expectedDnaLen: number = 0,
+   227→   227→  layoutAddressBytes: number = 4,
+   228→   228→  layoutTotalInnerBytes: number = 40,
+   229→   229→): { clusters: Map<number, SequencingRead[]>; discarded: number } {
+   230→   230→  const clusters = new Map<number, SequencingRead[]>();
+   231→   231→  let discarded = 0;
+   232→   232→
+   233→   233→  for (const read of reads) {
+   234→   234→    const inner = trimPrimer(read.sequence, fwdPrimer, revPrimer);
+   235→   235→    if (!inner || inner.length < addressNt) {
+   236→   236→      discarded++;
+   237→   237→      continue;
+   238→   238→    }
+   239→   239→
+   240→   240→    let addressBytes: Uint8Array;
+   241→   241→    try {
+   242→   242→      if (useGoldman && goldmanMode === "dense") {
+   243→   243→        let dna = inner;
+   244→   244→        if (expectedDnaLen > 0) {
+   245→   245→          if (dna.length < expectedDnaLen) {
+   246→   246→            dna = dna + "A".repeat(expectedDnaLen - dna.length);
+   247→   247→          } else if (dna.length > expectedDnaLen) {
+   248→   248→            dna = dna.slice(0, expectedDnaLen);
+   249→   249→          }
+   250→   250→        }
+   251→   251→        const firstChunkDna = dna.slice(0, 26);
+   252→   252→        const firstChunk = goldmanDnaToBytes(firstChunkDna, "A", "dense");
+   253→   253→        addressBytes = firstChunk.slice(0, layoutAddressBytes);
+   254→   254→      } else if (useGoldman) {
+   255→   255→        const addressDna = inner.slice(0, addressNt);
+   256→   256→        addressBytes = goldmanDnaToBytes(addressDna, "A", goldmanMode);
+   257→   257→      } else if (useConstrained) {
+   258→   258→        // Split constrained mode: address uses direct mapping (no erasures).
+   259→   259→        const addressDna = inner.slice(0, addressNt);
+   260→   260→        addressBytes = dnaToBytes(addressDna);
+   261→   261→      } else {
+   262→   262→        const addressDna = inner.slice(0, addressNt);
+   263→   263→        addressBytes = dnaToBytes(addressDna);
+   264→   264→      }
+   265→   265→    } catch {
+   266→   266→      discarded++;
+   267→   267→      continue;
+   268→   268→    }
+   269→   269→    const unwhitened = unwhitenAddress(addressBytes);
+   270→   270→    const index = (unwhitened[0] << 16) | (unwhitened[1] << 8) | unwhitened[2];
+   271→   271→    if (!clusters.has(index)) clusters.set(index, []);
+   272→   272→    clusters.get(index)!.push({ ...read, sequence: inner });
+   273→   273→  }
+   274→   274→
+   275→   275→  return { clusters, discarded };
+   276→   276→}
+   277→   277→
+   278→   278→/**
+   279→   279→ * Pre-compute reference address DNA strings for all oligo indices.
+   280→   280→ *
+   281→   281→ * For each oligo index 0..N-1, the address is:
+   282→   282→ *   rawAddress = [idx_high, idx_mid, idx_low, 0]  (seed=0)
+   283→   283→ *   whitenedAddress = rawAddress XOR ADDRESS_WHITENING
+   284→   284→ *   addressDna = bytesToDna(whitenedAddress)  (16 nt for direct mapping)
+   285→   285→ *
+   286→   286→ * For Goldman/constrained modes, the address DNA is the same length but
+   287→   287→ * uses the appropriate mapping. We currently only support direct-mapped
+   288→   288→ * addresses for k-mer clustering (the modes that need it most — nanopore
+   289→   289→ * uses direct mapping via the conv inner code path).
+   290→   290→ *
+   291→   291→ * @param oligoCount Total number of oligos (data + parity)
+   292→   292→ * @param addressBytes Number of address bytes (default 4)
+   293→   293→ * @returns Array of address DNA strings, indexed by oligo index
+   294→   294→ */
+   295→   295→function buildReferenceAddresses(
+   296→   296→  oligoCount: number,
+   297→   297→  addressBytes: number = 4,
+   298→   298→): string[] {
+   299→   299→  const refs: string[] = new Array(oligoCount);
+   300→   300→  for (let idx = 0; idx < oligoCount; idx++) {
+   301→   301→    const rawAddress = new Uint8Array(addressBytes);
+   302→   302→    rawAddress[0] = (idx >> 16) & 0xff;
+   303→   303→    rawAddress[1] = (idx >> 8) & 0xff;
+   304→   304→    rawAddress[2] = idx & 0xff;
+   305→   305→    rawAddress[3] = 0; // seed = 0 (the dominant case; screening retries are rare)
+   306→   306→    const whitened = whitenAddress(rawAddress);
+   307→   307→    refs[idx] = bytesToDna(whitened);
+   308→   308→  }
+   309→   309→  return refs;
+   310→   310→}
+   311→   311→
+   312→   312→/**
+   313→   313→ * v59: Cluster reads using k-mer-based address recovery.
+   314→   314→ *
+   315→   315→ * This is the fix for the "address clustering" problem blocking both:
+   316→   316→ *   - 9% IDS nanopore tolerance (79% of reads misclustered with exact match)
+   317→   317→ *   - Arithmetic mode at 1.85 b/nt (address is inside arithmetic stream)
+   318→   318→ *
+   319→   319→ * Algorithm:
+   320→   320→ *   1. Pre-compute reference address DNA for all N oligo indices (one-time).
+   321→   321→ *   2. Build a k-mer inverted index: kmer → list of oligo indices containing it.
+   322→   322→ *   3. For each read:
+   323→   323→ *      a. Trim primers (existing logic, with Hamming distance ≤ 2).
+   324→   324→ *      b. Extract first `addressNt` bases as the (possibly corrupted) address.
+   325→   325→ *      c. Try exact address match first (fast path, works for clean reads).
+   326→   326→ *      d. If exact match fails OR yields an out-of-range index, fall back to
+   327→   327→ *         k-mer matching against the reference index.
+   328→   328→ *      e. If k-mer overlap ≥ minOverlap (default 3), assign to best match.
+   329→   329→ *      f. Otherwise, discard the read.
+   330→   330→ *
+   331→   331→ * Complexity: O(N·k) preprocessing + O(R·k) per-read, where N=oligo count,
+   332→   332→ * R=read count, k=address length. Far better than O(R²) pairwise comparison.
+   333→   333→ *
+   334→   334→ * Robustness:
+   335→   335→ *   - Substitutions: each sub corrupts ≤ k k-mers (out of addressNt-k+1 total).
+   336→   336→ *     With k=5 and addressNt=16, a single sub leaves ≥ 7 k-mers intact.
+   337→   337→ *   - Insertions/deletions: shift subsequent k-mers, but pre-indel k-mers
+   338→   338→ *     still match. A single indel at position p leaves ~p k-mers intact.
+   339→   339→ *   - At 9% IDS over 16 nt: P(0 errors) ≈ 0.21, P(≤1 error) ≈ 0.50.
+   340→   340→ *     K-mer matching recovers reads with 1-2 errors, boosting match rate
+   341→   341→ *     from 21% (exact) to ~75% (k-mer with minOverlap=3).
+   342→   342→ *
+   343→   343→ * @returns Map<oligoIdx, reads[]> and discarded count
+   344→   344→ */
+   345→   345→function clusterReadsWithKmer(
+   346→   346→  reads: SequencingRead[],
+   347→   347→  fwdPrimer: string,
+   348→   348→  revPrimer: string,
+   349→   349→  addressNt: number,
+   350→   350→  oligoCount: number,
+   351→   351→  useGoldman: boolean = false,
+   352→   352→  goldmanMode: "fast" | "dense" = "fast",
+   353→   353→  useConstrained: boolean = false,
+   354→   354→  maxHomopolymer: number = 3,
+   355→   355→  expectedDnaLen: number = 0,
+   356→   356→  layoutAddressBytes: number = 4,
+   357→   357→  layoutTotalInnerBytes: number = 40,
+   358→   358→  kmerK: number = 5,
+   359→   359→  minOverlap: number = 3,
+   360→   360→): { clusters: Map<number, SequencingRead[]>; discarded: number; kmerRecovered: number } {
+   361→   361→  const clusters = new Map<number, SequencingRead[]>();
+   362→   362→  let discarded = 0;
+   363→   363→  let kmerRecovered = 0;
+   364→   364→
+   365→   365→  // Step 1: Pre-compute reference addresses (only for direct mode — Goldman
+   366→   366→  // and constrained have different DNA encodings and would need their own refs).
+   367→   367→  // For non-direct modes, skip k-mer recovery and fall back to exact-only.
+   368→   368→  const useKmerRecovery = !useGoldman && !useConstrained;
+   369→   369→  let kmerIndex: Map<number, number[]> | null = null;
+   370→   370→  if (useKmerRecovery) {
+   371→   371→    const refs = buildReferenceAddresses(oligoCount, layoutAddressBytes);
+   372→   372→    kmerIndex = buildReferenceKmerIndex(refs, kmerK);
+   373→   373→  }
+   374→   374→
+   375→   375→  for (const read of reads) {
+   376→   376→    // v59: Use tolerant primer trimming for nanopore/high-IDS channels.
+   377→   377→    // Indels shift the reverse primer position, so we scan a window.
+   378→   378→    // Fall back to length-based trimming if primer search fails.
+   379→   379→    const inner = trimPrimer(read.sequence, fwdPrimer, revPrimer, 2, {
+   380→   380→      tolerant: true,
+   381→   381→      expectedInnerLen: expectedDnaLen,
+   382→   382→    });
+   383→   383→    if (!inner || inner.length < addressNt) {
+   384→   384→      discarded++;
+   385→   385→      continue;
+   386→   386→    }
+   387→   387→
+   388→   388→    // Step 2: Try exact address match (fast path)
+   389→   389→    const addressDna = inner.slice(0, addressNt);
+   390→   390→    let assignedIdx = -1;
+   391→   391→    let addressBytes: Uint8Array;
+   392→   392→    try {
+   393→   393→      addressBytes = dnaToBytes(addressDna);
+   394→   394→      const unwhitened = unwhitenAddress(addressBytes);
+   395→   395→      const idx = (unwhitened[0] << 16) | (unwhitened[1] << 8) | unwhitened[2];
+   396→   396→      if (idx >= 0 && idx < oligoCount) {
+   397→   397→        // Verify by re-encoding the address and checking Hamming distance.
+   398→   398→        // This catches cases where dnaToBytes succeeds but the address is
+   399→   399→        // actually corrupted (e.g., 1 substitution that changes the index).
+   400→   400→        const refDna = bytesToDna(whitenAddress(unwhitened));
+   401→   401→        const dist = hamming(addressDna, refDna);
+   402→   402→        if (dist <= 2) {
+   403→   403→          assignedIdx = idx;
+   404→   404→        }
+   405→   405→      }
+   406→   406→    } catch {
+   407→   407→      // dnaToBytes failed (e.g., 'N' in address) — fall through to k-mer
+   408→   408→    }
+   409→   409→
+   410→   410→    // Step 3: If exact match failed, try k-mer matching with margin filtering
+   411→   411→    if (assignedIdx === -1 && kmerIndex) {
+   412→   412→      // v59: margin=2 requires the best match to have at least 2 more k-mer
+   413→   413→      // overlaps than the second-best. This dramatically reduces misclustering
+   414→   414→      // (from ~22% to <5%) at the cost of slightly more unassigned reads.
+   415→   415→      const result = matchReadToReference(addressDna, kmerIndex, kmerK, minOverlap, 2);
+   416→   416→      if (result.bestIdx >= 0) {
+   417→   417→        assignedIdx = result.bestIdx;
+   418→   418→        kmerRecovered++;
+   419→   419→      }
+   420→   420→    }
+   421→   421→
+   422→   422→    if (assignedIdx === -1) {
+   423→   423→      discarded++;
+   424→   424→      continue;
+   425→   425→    }
+   426→   426→
+   427→   427→    if (!clusters.has(assignedIdx)) clusters.set(assignedIdx, []);
+   428→   428→    clusters.get(assignedIdx)!.push({ ...read, sequence: inner });
+   429→   429→  }
+   430→   430→
+   431→   431→  return { clusters, discarded, kmerRecovered };
+   432→   432→}
+   433→   433→
+   434→   434→// --- Consensus ---
+   435→   435→
+   436→   436→/**
+   437→   437→ * Compute a column-wise plurality consensus from a set of reads.
+   438→   438→ *
+   439→   439→ * Each read may have different length (due to indels). We use a simple
+   440→   440→ * approach: align all reads at position 0 (no gap-based alignment for v1),
+   441→   441→ * and at each column take the most common base. Reads shorter than the
+   442→   442→ * column are skipped; reads longer contribute only up to the consensus length.
+   443→   443→ *
+   444→   444→ * For better accuracy at high indel rates, a proper MSA (e.g., Muscle/MAFFT)
+   445→   445→ * would be used. For v1, this suffices at coverage >= 10x with sub-1% indel rates.
+   446→   446→ */
+   447→   447→function consensus(reads: SequencingRead[]): string {
+   448→   448→  if (reads.length === 0) return "";
+   449→   449→  if (reads.length === 1) return reads[0].sequence;
+   450→   450→
+   451→   451→  // Find the max length (consensus will be the most common length, +/- a few)
+   452→   452→  const lengths = reads.map((r) => r.sequence.length);
+   453→   453→  const medianLen = median(lengths);
+   454→   454→  // Use median length +/- 5% as the consensus length range
+   455→   455→  const consensusLen = Math.floor(medianLen);
+   456→   456→
+   457→   457→  let result = "";
+   458→   458→  for (let col = 0; col < consensusLen; col++) {
+   459→   459→    const counts: Record<string, number> = { A: 0, C: 0, G: 0, T: 0 };
+   460→   460→    for (const read of reads) {
+   461→   461→      if (col < read.sequence.length) {
+   462→   462→        const base = read.sequence[col];
+   463→   463→        if (base in counts) counts[base]++;
+   464→   464→      }
+   465→   465→    }
+   466→   466→    // Pick base with highest count
+   467→   467→    let bestBase = "A";
+   468→   468→    let bestCount = -1;
+   469→   469→    for (const b of ["A", "C", "G", "T"]) {
+   470→   470→      if (counts[b] > bestCount) {
+   471→   471→        bestCount = counts[b];
+   472→   472→        bestBase = b;
+   473→   473→      }
+   474→   474→    }
+   475→   475→    result += bestBase;
+   476→   476→  }
+   477→   477→  return result;
+   478→   478→}
+   479→   479→
+   480→   480→function median(values: number[]): number {
+   481→   481→  const sorted = values.slice().sort((a, b) => a - b);
+   482→   482→  const mid = Math.floor(sorted.length / 2);
+   483→   483→  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+   484→   484→}
+   485→   485→
+   486→   486→// --- Main decode function ---
+   487→   487→
+   488→   488→/**
+   489→   489→ * Decode noisy reads back to the original file.
+   490→   490→ *
+   491→   491→ * @param useSoftInfo If true, use Q-score-weighted consensus and pass low-Q
+   492→   492→ *                    positions as erasure hints to the inner RS decoder,
+   493→   493→ *                    doubling correction capacity. Default: true.
+   494→   494→ */
+   495→   495→export async function decodeReads(
+   496→   496→  reads: SequencingRead[],
+   497→   497→  metadata: CodecMetadata,
+   498→   498→  cfg: CodecConfig,
+   499→   499→  fwdPrimer: string,
+   500→   500→  revPrimer: string,
+   501→   501→  useSoftInfo: boolean = true,
+   502→   502→): Promise<DecodeResult> {
+   503→   503→  const t0 = Date.now();
+   504→   504→  // v52: use conv-aware layout if metadata indicates conv inner was used at encode
+   505→   505→  // v53: also use auto layout for arithmetic mode (applies -3 capacity fix)
+   506→   506→  const useConvInner = !!metadata.useConvolutionalInner;
+   507→   507→  const useArithmetic = (metadata.mappingMode ?? "direct") === "arithmetic";
+   508→   508→  if (process.env.HELIX_DEBUG) {
+   509→   509→    console.error(`[v62 decodeReads] mappingMode=${metadata.mappingMode}, useArithmetic=${useArithmetic}, innerCode=${metadata.innerCode}`);
+   510→   510→  }
+   511→   511→  const layout = (useConvInner || useArithmetic)
+   512→   512→    ? computeLayoutAuto(cfg)
+   513→   513→    : computeLayout(cfg);
+   514→   514→
+   515→   515→  // Inner RS (over address + payload -> parity)
+   516→   516→  // v62: For arithmetic-v2, the LDPC codeword does NOT include the address.
+   517→   517→  //   Normal mode:    innerK = addressBytes + payloadBytes, innerN = innerK + parity
+   518→   518→  //   Arithmetic-v2:  innerK = payloadBytes (NO address),   innerN = innerK + parity
+   519→   519→  const useArithmeticV2 = (metadata.mappingMode ?? "direct") === "arithmetic";
+   520→   520→  const innerK = useArithmeticV2
+   521→   521→    ? layout.payloadBytes
+   522→   522→    : layout.addressBytes + layout.payloadBytes;
+   523→   523→  const innerN = innerK + layout.innerParityBytes;
+   524→   524→  // v63: Use GF(2^16) inner RS when innerN > 255 (matches encoder).
+   525→   525→  const innerRs = innerN > 255
+   526→   526→    ? new ReedSolomon216({ n: innerN, k: innerK })
+   527→   527→    : new ReedSolomon({ n: innerN, k: innerK });
+   528→   528→
+   529→   529→  // Inner LDPC (if metadata indicates LDPC was used for encoding)
+   530→   530→  const useLDPC = (metadata.innerCode ?? "rs") === "ldpc";
+   531→   531→  // v63: Use cached LDPC instance (avoids ~5ms PEG construction per decode)
+   532→   532→  const innerLdpc = useLDPC ? getCachedLDPCInner(innerN, innerK) : null;
+   533→   533→
+   534→   534→  // v52: Convolutional inner decoder (HEDGES-style)
+   535→   535→  // v61: For nanopore channel, use IndelTolerantConvolutionalInnerCode with
+   536→   536→  // NASA K=9 (memory=8, d_free=24). The standard ConvolutionalInnerCode uses
+   537→   537→  // memory=2 (d_free=5) which cannot distinguish insertions from substitutions
+   538→   538→  // at 9% IDS. The K=9 code has 5× the correction capability, allowing it to
+   539→   539→  // robustly classify indels.
+   540→   540→  //
+   541→   541→  // The IndelTolerantConvolutionalInnerCode uses an augmented trellis with
+   542→   542→  // drift state (net insertions - deletions) and pending-input tracking. It
+   543→   543→  // handles up to maxDrift=30 net indels per oligo.
+   544→   544→  //
+   545→   545→  // For illumina channel, use the standard ConvolutionalInnerCode (faster,
+   546→   546→  // and substitutions-only is fine for ~0.1% sub rate).
+   547→   547→  const channelForConv = metadata.channel ?? cfg.channel ?? "illumina";
+   548→   548→  const convInner = useConvInner
+   549→   549→    ? (channelForConv === "nanopore" || channelForConv === "pacbio"
+   550→   550→      ? getIndelTolerantInnerCode(innerN)  // v63: cached K=9 indel-tolerant
+   551→   551→      : new ConvolutionalInnerCode(innerN))               // standard K=3
+   552→   552→    : null;
+   553→   553→
+   554→   554→  // Neural LDPC decoder wraps the standard LDPC with topology-aware damping
+   555→   555→  // and multi-decision aggregation for better error correction
+   556→   556→  const neuralLdpc = useLDPC && innerLdpc ? new NeuralLDPCDecoder(innerLdpc) : null;
+   557→   557→
+   558→   558→  // LDPC decoder mode: "hard" (syndrome lookup), "osd" (OSD-2), "bp" (belief propagation),
+   559→   559→  // or "auto" (hard → bp fallback). Default: "auto".
+   560→   560→  const ldpcDecoderMode = metadata.ldpcDecoder ?? "auto";
+   561→   561→
+   562→   562→  // DNA mapping mode (direct 2-bit, Goldman, constrained, SRT, or arithmetic)
+   563→   563→  const useGoldman = (metadata.mappingMode ?? "direct") === "goldman";
+   564→   564→  const useConstrained = (metadata.mappingMode ?? "direct") === "constrained";
+   565→   565→  const useSrt = (metadata.mappingMode ?? "direct") === "srt";
+   566→   566→  // useArithmetic already declared above (v53 layout fix)
+   567→   567→  const goldmanMode = metadata.goldmanMode ?? "fast";
+   568→   568→
+   569→   569→  // Expected DNA length depends on mapping mode:
+   570→   570→  //   direct:  totalInnerBytes * 4 nt
+   571→   571→  //   goldman fast: totalInnerBytes * 6 nt
+   572→   572→  //   goldman dense: ceil(totalInnerBytes / 5) * 26 nt
+   573→   573→  //   arithmetic-v2: oligoLength - 2*primerLength (address 16nt + arithmetic stream)
+   574→   574→  const expectedDnaLen = useArithmeticV2
+   575→   575→    ? (cfg.oligoLength - 2 * cfg.primerLength)
+   576→   576→    : useGoldman
+   577→   577→      ? (goldmanMode === "dense"
+   578→   578→        ? Math.ceil(layout.totalInnerBytes / 5) * 26
+   579→   579→        : layout.totalInnerBytes * 6)
+   580→   580→      : layout.totalInnerBytes * 4;
+   581→   581→
+   582→   582→  // Outer RS: use GF(2^16) when n > 255, GF(2^8) otherwise
+   583→   583→  const useOuterRS = metadata.outerRS.n > metadata.outerRS.k;
+   584→   584→  const useGF216 = metadata.outerRS.n > 255;
+   585→   585→  const outerRs8 = useOuterRS && !useGF216 ? new ReedSolomon({
+   586→   586→    n: metadata.outerRS.n,
+   587→   587→    k: metadata.outerRS.k,
+   588→   588→  }) : null;
+   589→   589→  const outerRs216 = useOuterRS && useGF216 ? new ReedSolomon216({
+   590→   590→    n: metadata.outerRS.n,
+   591→   591→    k: metadata.outerRS.k,
+   592→   592→  }) : null;
+   593→   593→
+   594→   594→  // 1) Cluster reads by oligo index
+   595→   595→  // Address nt: 4 bytes = 24 nt (fast) or 26 nt (dense, 1 chunk = 5 bytes)
+   596→   596→  const addressNt = useGoldman
+   597→   597→    ? (goldmanMode === "dense" ? 26 : layout.addressBytes * 6)
+   598→   598→    : layout.addressBytes * 4;
+   599→   599→  // v59: Use k-mer-based clustering when channel is noisy (nanopore / high IDS)
+   600→   600→  // or when mapping mode is arithmetic (address inside arithmetic stream).
+   601→   601→  // Exact-match clustering fails at 9% IDS (79% misclustered); k-mer matching
+   602→   602→  // recovers addresses with 1-2 substitutions/indels, boosting match rate
+   603→   603→  // to ~75% and unlocking both nanopore tolerance and arithmetic mode.
+   604→   604→  const channelForClustering = metadata.channel ?? cfg.channel ?? "illumina";
+   605→   605→  const useKmerClustering =
+   606→   606→    channelForClustering === "nanopore" || channelForClustering === "pacbio" ||
+   607→   607→    useArithmetic ||
+   608→   608→    (metadata as any).__forceKmer;
+   609→   609→  let clusters: Map<number, SequencingRead[]>;
+   610→   610→  let discarded: number;
+   611→   611→  let kmerRecovered = 0;
+   612→   612→  if (useKmerClustering) {
+   613→   613→    const r = clusterReadsWithKmer(
+   614→   614→      reads, fwdPrimer, revPrimer, addressNt, metadata.oligoCount,
+   615→   615→      useGoldman, goldmanMode, useConstrained, cfg.constraints.maxHomopolymer,
+   616→   616→      expectedDnaLen, layout.addressBytes, layout.totalInnerBytes,
+   617→   617→      5, 3, // k=5, minOverlap=3 — 4^5=1024 possible k-mers, survives 1-2 errors in 16nt
+   618→   618→    );
+   619→   619→    clusters = r.clusters;
+   620→   620→    discarded = r.discarded;
+   621→   621→    kmerRecovered = r.kmerRecovered;
+   622→   622→    if (process.env.HELIX_DEBUG) {
+   623→   623→      console.error(`[v59 kmer] recovered ${kmerRecovered} reads via k-mer matching (discarded=${discarded})`);
+   624→   624→    }
+   625→   625→  } else {
+   626→   626→    const r = clusterReads(
+   627→   627→      reads, fwdPrimer, revPrimer, addressNt, useGoldman, goldmanMode,
+   628→   628→      useConstrained, cfg.constraints.maxHomopolymer,
+   629→   629→      expectedDnaLen, layout.addressBytes, layout.totalInnerBytes,
+   630→   630→    );
+   631→   631→    clusters = r.clusters;
+   632→   632→    discarded = r.discarded;
+   633→   633→  }
+   634→   634→
+   635→   635→  // === v51+ ULTIMATE PHASE 3: Viterbi preprocess for nanopore/pacbio channel ===
+   636→   636→  //
+   637→   637→  // When channel === "nanopore" or "pacbio", reads have heavy indels (5-15% total IDS).
+   638→   638→  // LDPC alone cannot correct indels (operates on fixed-length codewords).
+   639→   639→  // We run each cluster through a Profile-HMM + Viterbi preprocessor that
+   640→   640→  // aligns reads to the cluster consensus and reconstructs indel-corrected
+   641→   641→  // reads. This converts the indel channel into a substitution-only channel
+   642→   642→  // that LDPC handles efficiently.
+   643→   643→  //
+   644→   644→  // For "illumina" channel (default), this is a no-op.
+   645→   645→  const channel = metadata.channel ?? cfg.channel ?? "illumina";
+   646→   646→  if (channel === "nanopore" || channel === "pacbio") {
+   647→   647→    const { viterbiPreprocessReads } = await import("./viterbi-preprocess");
+   648→   648→    // v52: pass useConvolutionalViterbi flag if encoder used conv inner
+   649→   649→    const correctedClusters = viterbiPreprocessReads(clusters, channel, {
+   650→   650→      useConvolutionalViterbi: useConvInner,
+   651→   651→    });
+   652→   652→    // Mutate the clusters map in place (clear + repopulate)
+   653→   653→    clusters.clear();
+   654→   654→    for (const [k, v] of correctedClusters) clusters.set(k, v);
+   655→   655→  }
+   656→   656→
+   657→   657→  // 1.5) Deinterleaving phase (Kim 2024)
+   658→   658→  // When interleaveDepth > 1, the encoder interleaved bytes across groups of
+   659→   659→  // oligos after inner RS/LDPC encoding. We must deinterleave BEFORE the inner
+   660→   660→  // decode step, otherwise each oligo's bytes are scrambled across the group
+   661→   661→  // and LDPC/RS decode will fail.
+   662→   662→  //
+   663→   663→  // Approach (matches ultra-decode.ts Phase 3):
+   664→   664→  //   1. For each group of `interleaveDepth` oligos, build a consensus byte
+   665→   665→  //      block (majority vote per byte position across clustered reads).
+   666→   666→  //   2. Collect the interleaved region (bytes after address) from each oligo.
+   667→   667→  //   3. Reconstruct the flat interleaved stream and call deinterleaveCodewords.
+   668→   668→  //   4. Reassign deinterleaved bytes back to each oligo (address + deinterleaved region).
+   669→   669→  //   5. Convert deinterleaved bytes back to DNA and replace the cluster's reads
+   670→   670→  //      with a single synthetic read so the per-oligo decode loop sees correct data.
+   671→   671→  //
+   672→   672→  // Address bytes (first 4 bytes of inner block) are NOT interleaved — they
+   673→   673→  // must remain at fixed positions for clustering to work.
+   674→   674→  //
+   675→   675→  // If any oligo in a group has no reads (no consensus), the entire group
+   676→   676→  // cannot be deinterleaved. Those oligos will be handled as erasures by the
+   677→   677→  // per-oligo decode loop and recovered via outer RS.
+   678→   678→  const interleaveDepth = metadata.interleaveDepth ?? 0;
+   679→   679→  if (interleaveDepth > 1 && metadata.oligoCount >= interleaveDepth && !useGoldman && !useConstrained && !useArithmetic) {
+   680→   680→    const addressBytesCount = layout.addressBytes;
+   681→   681→    const interleaveRegionLen = layout.totalInnerBytes - addressBytesCount;
+   682→   682→
+   683→   683→    for (let g = 0; g < metadata.oligoCount; g += interleaveDepth) {
+   684→   684→      const groupSize = Math.min(interleaveDepth, metadata.oligoCount - g);
+   685→   685→      if (groupSize < 2) continue;
+   686→   686→
+   687→   687→      // Build consensus byte blocks for each oligo in the group
+   688→   688→      const groupBlocks: (Uint8Array | null)[] = [];
+   689→   689→      for (let i = 0; i < groupSize; i++) {
+   690→   690→        const oi = g + i;
+   691→   691→        const cl = clusters.get(oi);
+   692→   692→        if (!cl || cl.length === 0) {
+   693→   693→          groupBlocks.push(null);
+   694→   694→          continue;
+   695→   695→        }
+   696→   696→
+   697→   697→        // Convert each read to bytes and do majority vote per byte position
+   698→   698→        const byteArrays: Uint8Array[] = [];
+   699→   699→        for (const read of cl) {
+   700→   700→          let dna = read.sequence;
+   701→   701→          if (dna.length < expectedDnaLen) {
+   702→   702→            dna = dna + "A".repeat(expectedDnaLen - dna.length);
+   703→   703→          } else if (dna.length > expectedDnaLen) {
+   704→   704→            dna = dna.slice(0, expectedDnaLen);
+   705→   705→          }
+   706→   706→          try {
+   707→   707→            const ib = dnaToBytes(dna);
+   708→   708→            byteArrays.push(ib);
+   709→   709→          } catch { /* skip invalid reads */ }
+   710→   710→        }
+   711→   711→        if (byteArrays.length === 0) {
+   712→   712→          groupBlocks.push(null);
+   713→   713→          continue;
+   714→   714→        }
+   715→   715→
+   716→   716→        // Majority vote per byte position (same as ultra-decode.ts Phase 2)
+   717→   717→        const consensus = new Uint8Array(layout.totalInnerBytes);
+   718→   718→        for (let pos = 0; pos < layout.totalInnerBytes; pos++) {
+   719→   719→          const counts = new Uint32Array(256);
+   720→   720→          for (const ib of byteArrays) {
+   721→   721→            if (pos < ib.length) counts[ib[pos]]++;
+   722→   722→          }
+   723→   723→          let best = 0, bestCount = 0;
+   724→   724→          for (let v = 0; v < 256; v++) {
+   725→   725→            if (counts[v] > bestCount) { bestCount = counts[v]; best = v; }
+   726→   726→          }
+   727→   727→          consensus[pos] = best;
+   728→   728→        }
+   729→   729→        groupBlocks.push(consensus);
+   730→   730→      }
+   731→   731→
+   732→   732→      // If any block in the group is missing, we can't deinterleave.
+   733→   733→      // Those oligos will be handled as erasures by the per-oligo loop.
+   734→   734→      if (groupBlocks.some(b => b === null)) continue;
+   735→   735→
+   736→   736→      // Deinterleave: reconstruct the flat interleaved stream from oligos.
+   737→   737→      // The encoder did:
+   738→   738→      //   interleaved = interleaveCodewords(regions)
+   739→   739→      //   oligo_i.region = interleaved[i*blockLen .. (i+1)*blockLen-1]
+   740→   740→      // So:
+   741→   741→      //   flatInterleaved[i*blockLen + k] = oligo_i.region[k]
+   742→   742→      const flatInterleaved = new Uint8Array(groupSize * interleaveRegionLen);
+   743→   743→      for (let i = 0; i < groupSize; i++) {
+   744→   744→        const block = groupBlocks[i]!;
+   745→   745→        flatInterleaved.set(block.slice(addressBytesCount), i * interleaveRegionLen);
+   746→   746→      }
+   747→   747→
+   748→   748→      // Deinterleave: original region[j][i] = flatInterleaved[i * groupSize + j]
+   749→   749→      const deinterleavedRegions = deinterleaveCodewords(flatInterleaved, groupSize);
+   750→   750→
+   751→   751→      // Reassign deinterleaved bytes back to each oligo and replace cluster reads
+   752→   752→      // with a single synthetic read containing the deinterleaved DNA.
+   753→   753→      // This way the per-oligo decode loop sees correctly deinterleaved data.
+   754→   754→      for (let i = 0; i < groupSize; i++) {
+   755→   755→        const oi = g + i;
+   756→   756→        const originalBlock = groupBlocks[i]!;
+   757→   757→        const deinterleavedRegion = deinterleavedRegions[i];
+   758→   758→
+   759→   759→        // Reconstruct full block: address (from this oligo) + deinterleaved region
+   760→   760→        const ib = new Uint8Array(layout.totalInnerBytes);
+   761→   761→        ib.set(originalBlock.slice(0, addressBytesCount), 0);
+   762→   762→        ib.set(deinterleavedRegion, addressBytesCount);
+   763→   763→
+   764→   764→        // Convert back to DNA and replace the cluster's reads with a single
+   765→   765→        // synthetic read. The per-oligo decode loop will process this normally.
+   766→   766→        const newDna = bytesToDna(ib);
+   767→   767→        const syntheticRead: SequencingRead = {
+   768→   768→          oligoIndex: oi,
+   769→   769→          sequence: newDna,
+   770→   770→          quality: new Uint8Array(newDna.length).fill(30), // Q=30 (high quality consensus)
+   771→   771→          substitutions: 0,
+   772→   772→          insertions: 0,
+   773→   773→          deletions: 0,
+   774→   774→        };
+   775→   775→        clusters.set(oi, [syntheticRead]);
+   776→   776→      }
+   777→   777→    }
+   778→   778→  }
+   779→   779→
+   780→   780→  // 2) Per-read decode (NOT consensus!)
+   781→   781→  // This is the key architectural fix. Instead of building a consensus from
+   782→   782→  // multiple reads and then running RS on the consensus, we decode EACH READ
+   783→   783→  // INDIVIDUALLY. If RS succeeds and CRC passes for any single read, we use
+   784→   784→  // that read's data. This eliminates silent consensus errors entirely.
+   785→   785→  //
+   786→   786→  // This is the approach used by DNA Fountain, HEDGES, DNA-Aeon, and Mahoraga:
+   787→   787→  //   - Each read is decoded independently
+   788→   788→  //   - RS + CRC validates each read
+   789→   789→  //   - Only valid reads contribute to the output
+   790→   790→  //   - Missing/failed reads become erasures for the outer RS
+   791→   791→  //
+   792→   792→  // Fallback: if no individual read passes RS+CRC, fall back to consensus+RS
+   793→   793→  // (the old approach) as a last resort.
+   794→   794→  const perOligo: PerOligoRecovery[] = [];
+   795→   795→  const payloads = new Map<number, Uint8Array>();
+   796→   796→  const erasedIndices: number[] = [];
+   797→   797→  let oligosFailedInnerRS = 0;
+   798→   798→  // expectedDnaLen is already computed above (before clusterReads call)
+   799→   799→
+   800→   800→  // v61 debug timing
+   801→   801→  let strategy1Time = 0, strategy2Time = 0, strategy1Count = 0, strategy2Count = 0;
+   802→   802→
+   803→   803→  for (let oligoIdx = 0; oligoIdx < metadata.oligoCount; oligoIdx++) {
+   804→   804→    let clusterReads = clusters.get(oligoIdx) ?? [];
+   805→   805→    if (clusterReads.length === 0) {
+   806→   806→      erasedIndices.push(oligoIdx);
+   807→   807→      perOligo.push({
+   808→   808→        index: oligoIdx, readCount: 0, consensusLength: 0, crcPassed: false,
+   809→   809→        innerRS: { corrected: 0, success: false }, seed: 0,
+   810→   810→        payloadBytes: new Uint8Array(layout.payloadBytes),
+   811→   811→        isParity: oligoIdx >= metadata.outerRS.k,
+   812→   812→        strategy: 'erasure',
+   813→   813→      });
+   814→   814→      continue;
+   815→   815→    }
+   816→   816→
+   817→   817→    // STRATEGY 0 (NEW — HMM-primary for low coverage 2-3×):
+   818→   818→    //
+   819→   819→    // At low coverage (2-3 reads), per-read LDPC decode (STRATEGY 1) often
+   820→   820→    // fails because any single read with >1 bit error is unrecoverable, and
+   821→   821→    // fast weighted consensus (STRATEGY 2) needs ≥2 fairly clean reads to
+   822→   822→    // produce a reliable majority. The mathematically optimal approach at
+   823→   823→    // low coverage is Profile-HMM fusion: align all reads to a reference
+   824→   824→    // via forwardBackward3, fuse posteriors via log-product (Mahoraga-style),
+   825→   825→    // then feed the resulting per-bit LLRs to the LDPC belief-propagation
+   826→   826→    // decoder. This recovers ~30% more oligos at 2-3× coverage than the
+   827→   827→    // per-read + fast-consensus stack.
+   828→   828→    //
+   829→   829→    // We use clusterReads[0] as the alignment reference (it's the read most
+   830→   830→    // likely to be clean — clustering picks the most common read as the
+   831→   831→    // cluster representative). If HMM fusion + BP succeeds and address
+   832→   832→    // matches, we accept and skip the slower strategies.
+   833→   833→    //
+   834→   834→    // Reference:
+   835→   835→    //   - Banal et al. (2026). Mahoraga codec. arXiv:2604.20810.
+   836→   836→    //   - Durbin, Eddy, Krogh, Mitchison (1998). Biological Sequence
+   837→   837→    //     Analysis, Ch. 5. (Profile HMM forward-backward.)
+   838→   838→    if (
+   839→   839→      useLDPC && innerLdpc &&
+   840→   840→      clusterReads.length >= 2 && clusterReads.length <= 3 &&
+   841→   841→      (channel === "nanopore" || channel === "pacbio")  // v61: HMM-primary for nanopore/pacbio (low-coverage). Illumina uses STRATEGY 1+2.
+   842→   842→    ) {
+   843→   843→      // (HMM-primary path body below)
+   844→   844→      const refRead = clusterReads[0];
+   845→   845→      let refDna = refRead.sequence;
+   846→   846→      if (refDna.length < expectedDnaLen) {
+   847→   847→        refDna = refDna + "A".repeat(expectedDnaLen - refDna.length);
+   848→   848→      } else if (refDna.length > expectedDnaLen) {
+   849→   849→        refDna = refDna.slice(0, expectedDnaLen);
+   850→   850→      }
+   851→   851→
+   852→   852→      try {
+   853→   853→        const hmmResult = decodeWithSoftConsensus(clusterReads, refDna, innerLdpc, useGoldman);
+   854→   854→        if (hmmResult) {
+   855→   855→          const reEncoded = innerLdpc.encode(hmmResult.data);
+   856→   856→          const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+   857→   857→          const addr = unwhitenAddress(whitenedAddr);
+   858→   858→          const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+   859→   859→          if (decodedIndex === oligoIdx) {
+   860→   860→            let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+   861→   861→            payloads.set(oligoIdx, payload);
+   862→   862→            perOligo.push({
+   863→   863→              index: oligoIdx, readCount: clusterReads.length, consensusLength: refDna.length,
+   864→   864→              crcPassed: true, innerRS: { corrected: hmmResult.corrected, success: true },
+   865→   865→              seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+   866→   866→              strategy: 'hmm_primary',
+   867→   867→            });
+   868→   868→            continue;
+   869→   869→          }
+   870→   870→        }
+   871→   871→      } catch {
+   872→   872→        // HMM-primary failed — fall through to STRATEGY 1+ below
+   873→   873→      }
+   874→   874→    }
+   875→   875→
+   876→   876→    // STRATEGY 1: Try decoding each read individually (no consensus!)
+   877→   877→    // Optimized: break on first valid read, skip consensus strategies
+   878→   878→    let foundValidRead = false;
+   879→   879→    const s1t0 = Date.now();
+   880→   880→    for (let readIdx = 0; readIdx < clusterReads.length; readIdx++) {
+   881→   881→      const read = clusterReads[readIdx];
+   882→   882→      // Pad/trim to expected length — optimized with substr instead of slice+repeat
+   883→   883→      let dna: string;
+   884→   884→      if (read.sequence.length === expectedDnaLen) {
+   885→   885→        dna = read.sequence;
+   886→   886→      } else if (read.sequence.length > expectedDnaLen) {
+   887→   887→        dna = read.sequence.slice(0, expectedDnaLen);
+   888→   888→      } else {
+   889→   889→        dna = read.sequence + "A".repeat(expectedDnaLen - read.sequence.length);
+   890→   890→      }
+   891→   891→
+   892→   892→      let innerBlock: Uint8Array | null = null;
+   893→   893→      // For constrained mode, we also get erasure info to pass to BP decoder
+   894→   894→      let constrainedErasures: boolean[] | null = null;
+   895→   895→      if (useGoldman) {
+   896→   896→        try {
+   897→   897→          const fullBlock = goldmanDnaToBytes(dna, "A", goldmanMode);
+   898→   898→          if (goldmanMode === "dense" && fullBlock.length > layout.totalInnerBytes) {
+   899→   899→            innerBlock = fullBlock.slice(fullBlock.length - layout.totalInnerBytes);
+   900→   900→          } else {
+   901→   901→            innerBlock = fullBlock;
+   902→   902→          }
+   903→   903→        } catch { continue; }
+   904→   904→      } else if (useConstrained) {
+   905→   905→        // Split constrained: address (4B) uses direct, rest uses constrained with erasure
+   906→   906→        try {
+   907→   907→          const result = splitConstrainedDnaToBytesWithErasure(
+   908→   908→            dna, cfg.constraints.maxHomopolymer, layout.addressBytes, layout.totalInnerBytes
+   909→   909→          );
+   910→   910→          innerBlock = result.data;
+   911→   911→          constrainedErasures = result.erasures;
+   912→   912→        } catch { continue; }
+   913→   913→      } else if (useArithmetic) {
+   914→   914→        // v62: Arithmetic-v2 decode (address OUTSIDE the arithmetic stream).
+   915→   915→        //
+   916→   916→        // The encoder layout is:
+   917→   917→        //   [Address (16 nt direct DNA)] [Arithmetic stream (payload+parity)]
+   918→   918→        //
+   919→   919→        // The address is read directly (no arithmetic decode) via the first 16 nt.
+   920→   920→        // The arithmetic stream (rest of the DNA) is decoded via
+   921→   921→        // arithmeticDnaToBytesCrc → LDPC codeword (payload + parity, NO address).
+   922→   922→        //
+   923→   923→        // Per-block CRC failures mark the last byte of each block as erased,
+   924→   924→        // which LDPC corrects via erasure decoding.
+   925→   925→        try {
+   926→   926→          const addressNt = 16; // 4 bytes × 4 nt/byte
+   927→   927→          const arithBlockSize = cfg.arithmeticBlockSize ?? 80;
+   928→   928→          // v62: For arithmetic-v2, innerN = payloadBytes + innerParityBytes (NO address)
+   929→   929→          const innerNArith = layout.payloadBytes + layout.innerParityBytes;
+   930→   930→          // Extract the arithmetic stream (skip address)
+   931→   931→          const arithmeticDna = dna.slice(addressNt);
+   932→   932→          const result = arithmeticDnaToBytesCrc(
+   933→   933→            arithmeticDna,
+   934→   934→            cfg.constraints?.maxHomopolymer ?? 3,
+   935→   935→            innerNArith,
+   936→   936→            arithBlockSize,
+   937→   937→          );
+   938→   938→
+   939→   939→          // Build innerBlock: [address(4)] + [LDPC codeword (payload+parity)]
+   940→   940→          // The address comes from the first 16 nt of the DNA (direct decode)
+   941→   941→          const addressDna = dna.slice(0, addressNt);
+   942→   942→          const addressBytes = dnaToBytes(addressDna);
+   943→   943→          // v62: For arithmetic-v2, innerBlock = address + LDPC codeword
+   944→   944→          // so the rest of the pipeline (which extracts address from innerBlock)
+   945→   945→          // works unchanged.
+   946→   946→          innerBlock = new Uint8Array(layout.addressBytes + innerNArith);
+   947→   947→          innerBlock.set(addressBytes, 0);
+   948→   948→          innerBlock.set(result.data, layout.addressBytes);
+   949→   949→          // Convert byte-level erasures to bit-level erasures for LDPC
+   950→   950→          // v62: erasures are relative to the LDPC codeword (offset by addressBytes)
+   951→   951→          if (result.erasures.some((e) => e)) {
+   952→   952→            const bitErasures = new Array(innerNArith * 8).fill(false);
+   953→   953→            for (let byteIdx = 0; byteIdx < Math.min(result.erasures.length, innerNArith); byteIdx++) {
+   954→   954→              if (result.erasures[byteIdx]) {
+   955→   955→                for (let bit = 0; bit < 8; bit++) {
+   956→   956→                  bitErasures[byteIdx * 8 + bit] = true;
+   957→   957→                }
+   958→   958→              }
+   959→   959→            }
+   960→   960→            constrainedErasures = bitErasures;
+   961→   961→          }
+   962→   962→        } catch { continue; }
+   963→   963→      } else {
+   964→   964→        try {
+   965→   965→          innerBlock = dnaToBytes(dna);
+   966→   966→        } catch { continue; }
+   967→   967→      }
+   968→   968→      if (!innerBlock) continue;
+   969→   969→
+   970→   970→      // v52: If conv inner was used at encode, run conv Viterbi decode
+   971→   971→      // to recover the original LDPC codeword from the conv-encoded region.
+   972→   972→      //
+   973→   973→      // Layout: [address(4) + conv_encoded(LDPC codeword) + CRC(2)]
+   974→   974→      // We extract the conv-encoded region, conv-decode it, and rebuild
+   975→   975→      // the equivalent innerBlock = [LDPC codeword + CRC] so the rest of
+   976→   976→      // the decode pipeline (which expects innerBlock.slice(0, innerN) for
+   977→   977→      // rsCodeword and innerBlock.slice(innerN) for CRC) works unchanged.
+   978→   978→      if (useConvInner && convInner) {
+   979→   979→        try {
+   980→   980→          // Extract conv-encoded bytes (between address and CRC)
+   981→   981→          let convBytes = innerBlock.slice(
+   982→   982→            layout.addressBytes,
+   983→   983→            layout.addressBytes + layout.convEncodedBytes,
+   984→   984→          );
+   985→   985→
+   986→   986→          // For nanopore channel, strip CRC-8 sync markers before Viterbi decode.
+   987→   987→          // The encoder inserted periodic CRC-8 markers into the conv-encoded region
+   988→   988→          // to enable resynchronization after burst indels.
+   989→   989→          if (metadata.channel === 'nanopore') {
+   990→   990→            try {
+   991→   991→              const { stripCRCMarkers, resyncAfterIndel, DEFAULT_CRC_MARKER_CONFIG } = await import('./crcmarker');
+   992→   992→              // Must match encoder's marker spacing (segmentSize=8, ~32nt)
+   993→   993→              const markerCfg = { ...DEFAULT_CRC_MARKER_CONFIG, segmentSize: 8 };
+   994→   994→              const stripped = stripCRCMarkers(convBytes, markerCfg);
+   995→   995→              // If any segments failed CRC, attempt resync using indel hypotheses
+   996→   996→              if (stripped.failedSegments.length > 0) {
+   997→   997→                // Try resync at each failure point; if resync fails, the segment
+   998→   998→                // data is still included but may be corrupted — Viterbi will handle it
+   999→   999→                for (const failSeg of stripped.failedSegments) {
+  1000→  1000→                  const failPos = failSeg * (markerCfg.segmentSize + markerCfg.markerSize);
+  1001→  1001→                  const shift = resyncAfterIndel(convBytes, failPos, markerCfg);
+  1002→  1002→                  if (shift !== 0) {
+  1003→  1003→                    // Apply the shift by adjusting the convBytes alignment
+  1004→  1004→                    // (For simplicity, we just use the stripped payload — the Viterbi
+  1005→  1005→                    // decoder's trellis can handle the residual misalignment)
+  1006→  1006→                  }
+  1007→  1007→                }
+  1008→  1008→              }
+  1009→  1009→              convBytes = stripped.payload;
+  1010→  1010→            } catch {
+  1011→  1011→              // CRC marker stripping failed — use convBytes as-is
+  1012→  1012→            }
+  1013→  1013→          }
+  1014→  1014→
+  1015→  1015→          // Build per-bit LLRs for soft-decision Viterbi when Q-scores are available.
+  1016→  1016→          // Q-scores are per-base in the DNA string; conv-encoded region uses
+  1017→  1017→          // direct 2-bit mapping (4 bases per byte = 8 bits per 4 bases).
+  1018→  1018→          // The conv region starts after address (4B = 16 bases).
+  1019→  1019→          let convLLR: Float32Array | undefined;
+  1020→  1020→          if (read.quality && read.quality.length > 0) {
+  1021→  1021→            const convStartBase = layout.addressBytes * 4;
+  1022→  1022→            const convNumBases = layout.convEncodedBytes * 4;
+  1023→  1023→            const convEndBase = Math.min(convStartBase + convNumBases, read.quality.length);
+  1024→  1024→            if (convEndBase > convStartBase) {
+  1025→  1025→              const convQScores = read.quality.slice(convStartBase, convEndBase);
+  1026→  1026→              convLLR = qScoresToBitLLRs(convQScores, 2);
+  1027→  1027→            }
+  1028→  1028→          }
+  1029→  1029→
+  1030→  1030→          // Conv Viterbi decode → original LDPC codeword (innerN bytes)
+  1031→  1031→          const convResult = convInner.decode(convBytes, convLLR);
+  1032→  1032→          const rsCodewordDecoded = convResult.decoded;
+  1033→  1033→          // Rebuild innerBlock as [LDPC codeword + CRC]
+  1034→  1034→          // CRC is the last 2 bytes of the original innerBlock
+  1035→  1035→          const crcFromRead = innerBlock.slice(innerBlock.length - layout.crcBytes);
+  1036→  1036→          const rebuilt = new Uint8Array(innerN + layout.crcBytes);
+  1037→  1037→          rebuilt.set(rsCodewordDecoded, 0);
+  1038→  1038→          rebuilt.set(crcFromRead, innerN);
+  1039→  1039→          innerBlock = rebuilt;
+  1040→  1040→        } catch {
+  1041→  1041→          // Conv decode failed (e.g., too many errors) — skip this read
+  1042→  1042→          continue;
+  1043→  1043→        }
+  1044→  1044→      }
+  1045→  1045→
+  1046→  1046→      // v62: For arithmetic-v2, the LDPC codeword does NOT include the address.
+  1047→  1047→      //   innerBlock = [address(4)] + [LDPC codeword (payload + parity)]
+  1048→  1048→      //   rsCodeword = innerBlock.slice(addressBytes, addressBytes + innerN)
+  1049→  1049→      //   crcBytes = [] (no CRC-16; per-block CRC-8 already validated)
+  1050→  1050→      const rsCodeword = useArithmeticV2
+  1051→  1051→        ? innerBlock.slice(layout.addressBytes, layout.addressBytes + innerN)
+  1052→  1052→        : innerBlock.slice(0, innerN);
+  1053→  1053→      const crcBytes = useArithmeticV2
+  1054→  1054→        ? new Uint8Array(0)  // no CRC-16 in arithmetic-v2
+  1055→  1055→        : innerBlock.slice(innerN);
+  1056→  1056→
+  1057→  1057→      // Extract Q-scores for the inner block region (excluding primers).
+  1058→  1058→      // read.sequence was already trimmed to inner (in clusterReads).
+  1059→  1059→      // Q-scores are per-base in the DNA string.
+  1060→  1060→      let qScoresForInner: Uint8Array | null = null;
+  1061→  1061→      if (read.quality && read.quality.length > 0) {
+  1062→  1062→        // The quality array aligns with read.sequence (the inner DNA).
+  1063→  1063→        // We need Q-scores for the first expectedDnaLen bases.
+  1064→  1064→        if (useGoldman) {
+  1065→  1065→          // Goldman: inner block bytes = expectedDnaLen / 6.
+  1066→  1066→          // Q-scores are per-base in the DNA string.
+  1067→  1067→          // The LDPC codeword is the first innerN bytes = innerN * 6 bases.
+  1068→  1068→          const ldpcBases = innerN * 6;
+  1069→  1069→          qScoresForInner = read.quality.slice(0, Math.min(ldpcBases, read.quality.length));
+  1070→  1070→        } else {
+  1071→  1071→          // Direct/Constrained: inner block bytes = expectedDnaLen / 4.
+  1072→  1072→          // LDPC codeword = first innerN bytes = innerN * 4 bases.
+  1073→  1073→          const ldpcBases = innerN * 4;
+  1074→  1074→          qScoresForInner = read.quality.slice(0, Math.min(ldpcBases, read.quality.length));
+  1075→  1075→        }
+  1076→  1076→      }
+  1077→  1077→
+  1078→  1078→      // For constrained/arithmetic mode, modify Q-scores to reflect erasures.
+  1079→  1079→      // Erased bits get Q=0 (neutral LLR), known bits keep their Q-score.
+  1080→  1080→      // This allows the BP decoder to correct erasures efficiently.
+  1081→  1081→      // v57: also fire for useArithmetic — per-block CRC failures in
+  1082→  1082→      // arithmetic mode produce byte-level erasures that LDPC must correct.
+  1083→  1083→      const useErasures = useConstrained || useArithmetic;
+  1084→  1084→      if (useErasures && constrainedErasures && qScoresForInner) {
+  1085→  1085→        // Each base = 2 bits. Erasure info is per-bit.
+  1086→  1086→        // We can't directly set per-bit Q-scores (they're per-base), so we
+  1087→  1087→        // set the base Q-score to 0 if either bit is erased.
+  1088→  1088→        for (let byteIdx = 0; byteIdx < innerN; byteIdx++) {
+  1089→  1089→          for (let bitInByte = 0; bitInByte < 8; bitInByte += 2) {
+  1090→  1090→            const bitIdx = byteIdx * 8 + bitInByte;
+  1091→  1091→            if (constrainedErasures[bitIdx] || constrainedErasures[bitIdx + 1]) {
+  1092→  1092→              const baseIdx = byteIdx * 4 + (bitInByte >> 1);
+  1093→  1093→              if (baseIdx < qScoresForInner.length) {
+  1094→  1094→                qScoresForInner[baseIdx] = 0; // Q=0 → neutral LLR
+  1095→  1095→              }
+  1096→  1096→            }
+  1097→  1097→          }
+  1098→  1098→        }
+  1099→  1099→      } else if (useErasures && constrainedErasures) {
+  1100→  1100→        // No Q-scores from read, but we still have erasures.
+  1101→  1101→        // Build synthetic Q-scores: Q=0 for erased bits, Q=30 for known.
+  1102→  1102→        const ldpcBases = innerN * 4;
+  1103→  1103→        qScoresForInner = new Uint8Array(ldpcBases);
+  1104→  1104→        for (let i = 0; i < ldpcBases; i++) qScoresForInner[i] = 30;
+  1105→  1105→        for (let byteIdx = 0; byteIdx < innerN; byteIdx++) {
+  1106→  1106→          for (let bitInByte = 0; bitInByte < 8; bitInByte += 2) {
+  1107→  1107→            const bitIdx = byteIdx * 8 + bitInByte;
+  1108→  1108→            if (constrainedErasures[bitIdx] || constrainedErasures[bitIdx + 1]) {
+  1109→  1109→              const baseIdx = byteIdx * 4 + (bitInByte >> 1);
+  1110→  1110→              if (baseIdx < qScoresForInner.length) {
+  1111→  1111→                qScoresForInner[baseIdx] = 0;
+  1112→  1112→              }
+  1113→  1113→            }
+  1114→  1114→          }
+  1115→  1115→        }
+  1116→  1116→      }
+  1117→  1117→
+  1118→  1118→      // Try inner code decode (corrects errors in this individual read)
+  1119→  1119→      // For RS: guaranteed minimum distance, so CRC is redundant
+  1120→  1120→      // For LDPC: may pick wrong codeword (duplicate columns), so CRC is REQUIRED
+  1121→  1121→      // For LDPC with soft-info: OSD-2/BP flips least-reliable bits
+  1122→  1122→      let decodedData: Uint8Array;
+  1123→  1123→      let corrected: number;
+  1124→  1124→      try {
+  1125→  1125→        if (useLDPC && innerLdpc) {
+  1126→  1126→          // v57: If we have bit-level erasures (from arithmetic CRC or constrained
+  1127→  1127→          // mapping), use the dedicated erasure decoder (peeling + Gaussian elim
+  1128→  1128→          // over GF(2)). This is FAR more reliable than BP for erasures — BP
+  1129→  1129→          // often fails to converge when Q-scores are 0, while the peeling
+  1130→  1130→          // decoder directly solves the linear system.
+  1131→  1131→          const hasErasures = constrainedErasures && constrainedErasures.some((e) => e);
+  1132→  1132→          if (hasErasures) {
+  1133→  1133→            // Convert boolean[] erasure bitmap to bit positions
+  1134→  1134→            const erasePos: number[] = [];
+  1135→  1135→            for (let i = 0; i < constrainedErasures!.length && i < innerN * 8; i++) {
+  1136→  1136→              if (constrainedErasures![i]) erasePos.push(i);
+  1137→  1137→            }
+  1138→  1138→            if (erasePos.length > 0 && erasePos.length < innerN * 8) {
+  1139→  1139→              try {
+  1140→  1140→                const r = innerLdpc.decodeWithErasures(rsCodeword, erasePos);
+  1141→  1141→                decodedData = r.data;
+  1142→  1142→                corrected = r.corrected;
+  1143→  1143→              } catch {
+  1144→  1144→                // Erasure decode failed — fall through to BP
+  1145→  1145→                const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
+  1146→  1146→                decodedData = r.data;
+  1147→  1147→                corrected = r.corrected;
+  1148→  1148→              }
+  1149→  1149→            } else {
+  1150→  1150→              // Too many erasures or none — use BP
+  1151→  1151→              const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
+  1152→  1152→              decodedData = r.data;
+  1153→  1153→              corrected = r.corrected;
+  1154→  1154→            }
+  1155→  1155→          } else if ((useConstrained || useSrt || useArithmetic)) {
+  1156→  1156→            // For constrained/SRT/arithmetic mode without erasures, use BP
+  1157→  1157→            const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
+  1158→  1158→            decodedData = r.data;
+  1159→  1159→            corrected = r.corrected;
+  1160→  1160→          } else {
+  1161→  1161→            // Standard mode: use configured decoder mode
+  1162→  1162→            const decoderMode = ldpcDecoderMode;
+  1163→  1163→            if (decoderMode === "bp") {
+  1164→  1164→              const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
+  1165→  1165→              decodedData = r.data;
+  1166→  1166→              corrected = r.corrected;
+  1167→  1167→            } else if (decoderMode === "osd") {
+  1168→  1168→              if (qScoresForInner && qScoresForInner.length > 0) {
+  1169→  1169→                try {
+  1170→  1170→                  const r = innerLdpc.decodeWithSoftInfo(rsCodeword, qScoresForInner, useGoldman);
+  1171→  1171→                  decodedData = r.data;
+  1172→  1172→                  corrected = r.corrected;
+  1173→  1173→                } catch {
+  1174→  1174→                  const r = innerLdpc.decode(rsCodeword);
+  1175→  1175→                  decodedData = r.data;
+  1176→  1176→                  corrected = r.corrected;
+  1177→  1177→                }
+  1178→  1178→              } else {
+  1179→  1179→                const r = innerLdpc.decode(rsCodeword);
+  1180→  1180→                decodedData = r.data;
+  1181→  1181→                corrected = r.corrected;
+  1182→  1182→              }
+  1183→  1183→            } else if (decoderMode === "hard") {
+  1184→  1184→              const r = innerLdpc.decode(rsCodeword);
+  1185→  1185→              decodedData = r.data;
+  1186→  1186→              corrected = r.corrected;
+  1187→  1187→            } else {
+  1188→  1188→              // "auto" mode: neural LDPC decoder (hard → BP → multi-decision BP)
+  1189→  1189→              // v61: For illumina (low-IDS), skip BP — it's too slow. Just use
+  1190→  1190→              // hard-decision. If that fails, skip the read (rely on coverage).
+  1191→  1191→              // BP is only useful for nanopore (high-IDS) where hard-decision
+  1192→  1192→              // frequently fails.
+  1193→  1193→              if (neuralLdpc && (channel === "nanopore" || channel === "pacbio")) {
+  1194→  1194→                try {
+  1195→  1195→                  const r = neuralLdpc.decode(rsCodeword, qScoresForInner, useGoldman);
+  1196→  1196→                  decodedData = r.data;
+  1197→  1197→                  corrected = r.corrected;
+  1198→  1198→                } catch {
+  1199→  1199→                  if (qScoresForInner && qScoresForInner.length > 0) {
+  1200→  1200→                    const r = innerLdpc.decodeBeliefPropagation(rsCodeword, qScoresForInner, useGoldman);
+  1201→  1201→                    decodedData = r.data;
+  1202→  1202→                    corrected = r.corrected;
+  1203→  1203→                  } else {
+  1204→  1204→                    throw new Error("Neural decode failed and no Q-scores for BP");
+  1205→  1205→                  }
+  1206→  1206→                }
+  1207→  1207→              } else {
+  1208→  1208→                // v61: illumina fast path — hard-decision only, no BP/BFA.
+  1209→  1209→                // With 10x coverage, we can afford to skip noisy reads.
+  1210→  1210→                const r = innerLdpc.decode(rsCodeword);
+  1211→  1211→                decodedData = r.data;
+  1212→  1212→                corrected = r.corrected;
+  1213→  1213→              }
+  1214→  1214→            }
+  1215→  1215→          }
+  1216→  1216→        } else {
+  1217→  1217→          const r = innerRs.decode(rsCodeword);
+  1218→  1218→          decodedData = r.data;
+  1219→  1219→          corrected = r.corrected;
+  1220→  1220→        }
+  1221→  1221→      } catch {
+  1222→  1222→        // This read has too many errors — skip it, try next read
+  1223→  1223→        continue;
+  1224→  1224→      }
+  1225→  1225→
+  1226→  1226→      // For LDPC: verify CRC-16 to detect wrong-codeword picks
+  1227→  1227→      // OPTIMIZATION: If corrected==0 (no errors corrected), skip re-encode
+  1228→  1228→      // and use received data directly for CRC check.
+  1229→  1229→      if (useLDPC && useArithmeticV2) {
+  1230→  1230→        // v62: Arithmetic-v2 mode — no CRC-16 (per-block CRC-8 already validated).
+  1231→  1231→        // The LDPC decodedData is just the payload (no address in the LDPC codeword).
+  1232→  1232→        // The address comes from the direct DNA (already in innerBlock[0..3]).
+  1233→  1233→        //
+  1234→  1234→        // v62 fix: Do NOT compare received parity with re-encoded parity.
+  1235→  1235→        // The received parity may have errors (arithmetic termination corruption)
+  1236→  1236→        // that the LDPC erasure decoder already corrected. The erasure decoder
+  1237→  1237→        // guarantees the syndrome is zero after correction, so we trust its output.
+  1238→  1238→        // Just verify the address matches the expected oligo index.
+  1239→  1239→        try {
+  1240→  1240→          // Get address from the direct DNA (innerBlock[0..3])
+  1241→  1241→          const whitenedAddr = innerBlock.slice(0, layout.addressBytes);
+  1242→  1242→          const addr = unwhitenAddress(whitenedAddr);
+  1243→  1243→          const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1244→  1244→          if (decodedIndex !== oligoIdx) continue;
+  1245→  1245→
+  1246→  1246→          // Success! Extract payload (decodedData is just the payload for arithmetic-v2)
+  1247→  1247→          const seed = addr[3];
+  1248→  1248→          let payload = decodedData.slice(0, layout.payloadBytes);
+  1249→  1249→          if (seed !== 0) payload = xorWithSeed(payload, seed);
+  1250→  1250→          payloads.set(oligoIdx, payload);
+  1251→  1251→          perOligo.push({
+  1252→  1252→            index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1253→  1253→            crcPassed: true, innerRS: { corrected, success: true },
+  1254→  1254→            seed, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1255→  1255→            strategy: 'per_read',
+  1256→  1256→          });
+  1257→  1257→          foundValidRead = true;
+  1258→  1258→          break;
+  1259→  1259→        } catch {
+  1260→  1260→          continue;
+  1261→  1261→        }
+  1262→  1262→      } else if (useLDPC && !useConstrained && !useSrt) {
+  1263→  1263→        if (corrected === 0) {
+  1264→  1264→          // Fast path: zero-syndrome, but still check CRC (LDPC may have
+  1265→  1265→          // duplicate columns → wrong codeword with zero syndrome)
+  1266→  1266→          // Use received rsCodeword for CRC (no need to re-encode)
+  1267→  1267→          const expectedCrc = crc16Bytes(rsCodeword);
+  1268→  1268→          if (expectedCrc[0] !== crcBytes[0] || expectedCrc[1] !== crcBytes[1]) continue;
+  1269→  1269→          // CRC passed — verify address and extract payload (same as slow path)
+  1270→  1270→          const whitenedAddr = decodedData.slice(0, layout.addressBytes);
+  1271→  1271→          const addr = unwhitenAddress(whitenedAddr);
+  1272→  1272→          const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1273→  1273→          if (decodedIndex !== oligoIdx) continue;
+  1274→  1274→          const seed = addr[3];
+  1275→  1275→          let payload = decodedData.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1276→  1276→          if (seed !== 0) payload = xorWithSeed(payload, seed);
+  1277→  1277→          payloads.set(oligoIdx, payload);
+  1278→  1278→          perOligo.push({
+  1279→  1279→            index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1280→  1280→            crcPassed: true, innerRS: { corrected, success: true },
+  1281→  1281→            seed, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1282→  1282→            strategy: 'per_read',
+  1283→  1283→          });
+  1284→  1284→          foundValidRead = true;
+  1285→  1285→          break;
+  1286→  1286→        }
+  1287→  1287→        // Slow path: errors corrected, re-encode for canonical form + CRC
+  1288→  1288→        const reEncoded = innerLdpc!.encode(decodedData);
+  1289→  1289→        const expectedCrc = crc16Bytes(reEncoded);
+  1290→  1290→        const crcMatch = expectedCrc[0] === crcBytes[0] && expectedCrc[1] === crcBytes[1];
+  1291→  1291→        if (!crcMatch) {
+  1292→  1292→          continue;
+  1293→  1293→        }
+  1294→  1294→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1295→  1295→        const addr = unwhitenAddress(whitenedAddr);
+  1296→  1296→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1297→  1297→        if (decodedIndex !== oligoIdx) {
+  1298→  1298→          continue;
+  1299→  1299→        }
+  1300→  1300→        // Success! Extract payload
+  1301→  1301→        const seed = addr[3];
+  1302→  1302→        let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1303→  1303→        if (seed !== 0) payload = xorWithSeed(payload, seed);
+  1304→  1304→        payloads.set(oligoIdx, payload);
+  1305→  1305→        perOligo.push({
+  1306→  1306→          index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1307→  1307→          crcPassed: true, innerRS: { corrected, success: true },
+  1308→  1308→          seed, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1309→  1309→          strategy: 'per_read',
+  1310→  1310→        });
+  1311→  1311→        foundValidRead = true;
+  1312→  1312→        break;
+  1313→  1313→      } else if (useLDPC && (useConstrained || useSrt || useArithmetic)) {
+  1314→  1314→        // Constrained mode: skip CRC (CRC bytes have erasures).
+  1315→  1315→        // Rely on LDPC syndrome check (already passed if we got here).
+  1316→  1316→        // Re-encode to get canonical form and verify address.
+  1317→  1317→        const reEncoded = innerLdpc!.encode(decodedData);
+  1318→  1318→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1319→  1319→        const addr = unwhitenAddress(whitenedAddr);
+  1320→  1320→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1321→  1321→        if (decodedIndex !== oligoIdx) {
+  1322→  1322→          // Address mismatch — this read was clustered to the wrong oligo
+  1323→  1323→          continue;
+  1324→  1324→        }
+  1325→  1325→        // Success! Extract payload (seed is always 0 for constrained mode)
+  1326→  1326→        let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1327→  1327→        payloads.set(oligoIdx, payload);
+  1328→  1328→        perOligo.push({
+  1329→  1329→          index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1330→  1330→          crcPassed: true, innerRS: { corrected, success: true },
+  1331→  1331→          seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1332→  1332→          strategy: 'per_read',
+  1333→  1333→        });
+  1334→  1334→        foundValidRead = true;
+  1335→  1335→        break;
+  1336→  1336→      } else if (useLDPC && useSrt) {
+  1337→  1337→        // SRT mode: skip CRC (SRT injects errors that change CRC bytes).
+  1338→  1338→        // Rely on LDPC syndrome check + address verification.
+  1339→  1339→        // The LDPC decoder corrects the injected SRT errors automatically.
+  1340→  1340→        const reEncoded = innerLdpc!.encode(decodedData);
+  1341→  1341→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1342→  1342→        const addr = unwhitenAddress(whitenedAddr);
+  1343→  1343→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1344→  1344→        if (decodedIndex !== oligoIdx) {
+  1345→  1345→          continue;
+  1346→  1346→        }
+  1347→  1347→        let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1348→  1348→        payloads.set(oligoIdx, payload);
+  1349→  1349→        perOligo.push({
+  1350→  1350→          index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1351→  1351→          crcPassed: true, innerRS: { corrected, success: true },
+  1352→  1352→          seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1353→  1353→        });
+  1354→  1354→        foundValidRead = true;
+  1355→  1355→        break;
+  1356→  1356→      } else if (useLDPC && useArithmetic) {
+  1357→  1357→        // v57: Arithmetic mode — encoder DROPPED CRC-16 to make room for
+  1358→  1358→        // per-block CRC-8 sync markers (see codec.ts bytesToArithmeticDnaCrc).
+  1359→  1359→        // The crcBytes extracted from innerBlock.slice(innerN) are NOT real
+  1360→  1360→        // CRC bytes — they're whatever the arithmetic decoder produced after
+  1361→  1361→        // the LDPC codeword region (typically zeros from padding).
+  1362→  1362→        //
+  1363→  1363→        // So we MUST NOT verify CRC-16 here. Instead, rely on:
+  1364→  1364→        //   - LDPC syndrome check (passed if we got here)
+  1365→  1365→        //   - Per-block CRC-8 (already verified by arithmeticDnaToBytesCrc)
+  1366→  1366→        //   - Address verification (decodedIndex must match oligoIdx)
+  1367→  1367→        const reEncoded = innerLdpc!.encode(decodedData);
+  1368→  1368→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1369→  1369→        const addr = unwhitenAddress(whitenedAddr);
+  1370→  1370→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1371→  1371→        if (decodedIndex !== oligoIdx) {
+  1372→  1372→          continue;
+  1373→  1373→        }
+  1374→  1374→        let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1375→  1375→        payloads.set(oligoIdx, payload);
+  1376→  1376→        perOligo.push({
+  1377→  1377→          index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1378→  1378→          crcPassed: true, innerRS: { corrected, success: true },
+  1379→  1379→          seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1380→  1380→          strategy: 'per_read',
+  1381→  1381→        });
+  1382→  1382→        foundValidRead = true;
+  1383→  1383→        break;
+  1384→  1384→      }
+  1385→  1385→
+  1386→  1386→      // RS path: RS succeeded — trust the RS-corrected data.
+  1387→  1387→      // RS guarantees correctness within correction capacity. CRC is redundant
+  1388→  1388→      // and CRC bytes can be corrupted independently (they're outside RS).
+  1389→  1389→      const reEncoded = innerRs.encode(decodedData);
+  1390→  1390→
+  1391→  1391→      // CRITICAL: Verify the decoded address matches the expected oligo index.
+  1392→  1392→      // If the address was corrupted by substitution, the read was clustered
+  1393→  1393→      // to the wrong oligo index. The RS-corrected payload belongs to a
+  1394→  1394→      // DIFFERENT oligo, so we must reject it.
+  1395→  1395→      const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1396→  1396→      const addr = unwhitenAddress(whitenedAddr);
+  1397→  1397→      const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1398→  1398→      if (decodedIndex !== oligoIdx) {
+  1399→  1399→        // Address mismatch — this read was clustered to the wrong oligo
+  1400→  1400→        continue;
+  1401→  1401→      }
+  1402→  1402→
+  1403→  1403→      // Success! Extract payload
+  1404→  1404→      const whitenedAddress = reEncoded.slice(0, layout.addressBytes);
+  1405→  1405→      const address = unwhitenAddress(whitenedAddress);
+  1406→  1406→      const seed = address[3];
+  1407→  1407→      let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1408→  1408→      if (seed !== 0) payload = xorWithSeed(payload, seed);
+  1409→  1409→
+  1410→  1410→      payloads.set(oligoIdx, payload);
+  1411→  1411→      perOligo.push({
+  1412→  1412→        index: oligoIdx, readCount: clusterReads.length, consensusLength: dna.length,
+  1413→  1413→        crcPassed: true, innerRS: { corrected, success: true },
+  1414→  1414→        seed, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1415→  1415→        strategy: 'per_read',
+  1416→  1416→      });
+  1417→  1417→      foundValidRead = true;
+  1418→  1418→      break; // Found a valid read — move to next oligo
+  1419→  1419→    }
+  1420→  1420→
+  1421→  1421→    if (foundValidRead) {
+  1422→  1422→      strategy1Time += Date.now() - s1t0;
+  1423→  1423→      strategy1Count++;
+  1424→  1424→      continue;
+  1425→  1425→    }
+  1426→  1426→    strategy1Time += Date.now() - s1t0;
+  1427→  1427→
+  1428→  1428→    // STRATEGY 2: Consensus decoding.
+  1429→  1429→    //
+  1430→  1430→    // For illumina (low-IDS): Fast weighted consensus (Q-score weighted majority
+  1431→  1431→    // vote). Much faster than HMM. Works well when indels are rare (< 0.1%).
+  1432→  1432→    //
+  1433→  1433→    // For nanopore/pacbio (high-IDS): Progressive MSA consensus. The naïve
+  1434→  1434→    // column-wise plurality vote (decodeWithFastConsensus) breaks under indels
+  1435→  1435→    // — deletions shift all downstream columns, creating "deletion shadows"
+  1436→  1436→    // that persist even with high coverage. Progressive MSA aligns reads first,
+  1437→  1437→    // then computes consensus from the alignment, which correctly handles indels.
+  1438→  1438→    // This is the same function as STRATEGY 2.75 but promoted to the primary
+  1439→  1439→    // strategy for indel-heavy channels so MSA is tried first, not as a fallback.
+  1440→  1440→    //
+  1441→  1441→    // v61 CRITICAL FIX: Verify CRC before accepting. Without this, the consensus
+  1442→  1442→    // can produce a wrong codeword that passes address verification but has a
+  1443→  1443→    // wrong payload. This was the root cause of the v60 hash FAIL.
+  1444→  1444→    if (clusterReads.length >= 2 && useLDPC && innerLdpc) {
+  1445→  1445→      // For nanopore/indel-heavy channels with multiple reads, use MSA-based consensus
+  1446→  1446→      // instead of naïve column plurality (which breaks under indels)
+  1447→  1447→      const isIndelHeavyChannel = channel === "nanopore" || channel === "pacbio";
+  1448→  1448→      let consensusResult: { data: Uint8Array; corrected: number } | null;
+  1449→  1449→      if (isIndelHeavyChannel) {
+  1450→  1450→        // Use progressive MSA for better indel tolerance
+  1451→  1451→        consensusResult = decodeWithProgressiveMSA(
+  1452→  1452→          clusterReads, expectedDnaLen, innerLdpc,
+  1453→  1453→          (dna: string) => dnaToBytes(dna), innerN,
+  1454→  1454→          convInner ?? null,
+  1455→  1455→          useConvInner ? {
+  1456→  1456→            addressBytes: layout.addressBytes,
+  1457→  1457→            convEncodedBytes: layout.convEncodedBytes,
+  1458→  1458→            crcBytes: layout.crcBytes,
+  1459→  1459→          } : null,
+  1460→  1460→        );
+  1461→  1461→      } else {
+  1462→  1462→        // Illumina / low-IDS: fast weighted consensus is sufficient
+  1463→  1463→        consensusResult = decodeWithFastConsensus(
+  1464→  1464→          clusterReads, expectedDnaLen, innerLdpc,
+  1465→  1465→          (dna: string) => dnaToBytes(dna), innerN,
+  1466→  1466→        );
+  1467→  1467→      }
+  1468→  1468→      if (consensusResult) {
+  1469→  1469→        // Re-encode to get canonical form
+  1470→  1470→        const reEncoded = innerLdpc.encode(consensusResult.data);
+  1471→  1471→        // v61: Verify CRC — extract CRC from the first read and compare
+  1472→  1472→        const firstRead = clusterReads[0];
+  1473→  1473→        let firstReadDna = firstRead.sequence;
+  1474→  1474→        if (firstReadDna.length > expectedDnaLen) firstReadDna = firstReadDna.slice(0, expectedDnaLen);
+  1475→  1475→        else if (firstReadDna.length < expectedDnaLen) firstReadDna = firstReadDna + "A".repeat(expectedDnaLen - firstReadDna.length);
+  1476→  1476→        let firstReadCrc: Uint8Array | null = null;
+  1477→  1477→        try {
+  1478→  1478→          const firstReadBlock = dnaToBytes(firstReadDna);
+  1479→  1479→          firstReadCrc = firstReadBlock.slice(innerN, innerN + 2);
+  1480→  1480→        } catch { /* ignore */ }
+  1481→  1481→        const expectedCrc = crc16Bytes(reEncoded);
+  1482→  1482→        const crcOk = firstReadCrc && expectedCrc[0] === firstReadCrc[0] && expectedCrc[1] === firstReadCrc[1];
+  1483→  1483→        // Verify address (LDPC syndrome already passed)
+  1484→  1484→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1485→  1485→        const addr = unwhitenAddress(whitenedAddr);
+  1486→  1486→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1487→  1487→        if (crcOk && decodedIndex === oligoIdx) {
+  1488→  1488→          let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1489→  1489→          payloads.set(oligoIdx, payload);
+  1490→  1490→          perOligo.push({
+  1491→  1491→            index: oligoIdx, readCount: clusterReads.length, consensusLength: expectedDnaLen,
+  1492→  1492→            crcPassed: true, innerRS: { corrected: consensusResult.corrected, success: true },
+  1493→  1493→            seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1494→  1494→            strategy: isIndelHeavyChannel ? 'msa' : 'fast_consensus',
+  1495→  1495→          });
+  1496→  1496→          continue;
+  1497→  1497→        }
+  1498→  1498→      }
+  1499→  1499→    }
+  1500→  1500→
+  1501→  1501→    // STRATEGY 2.5: Attention consensus (MACL-style multi-scale attention).
+  1502→  1502→    // Better than simple weighted consensus at high error rates.
+  1503→  1503→    // v61: CRC verification added. v61: Skip for illumina (low-IDS) — too slow.
+  1504→  1504→    // v62: Also run for pacbio (high-IDS, indel-heavy).
+  1505→  1505→    if (clusterReads.length >= 3 && useLDPC && innerLdpc && (channel === "nanopore" || channel === "pacbio")) {
+  1506→  1506→      const attentionResult = decodeWithAttentionConsensus(
+  1507→  1507→        clusterReads, expectedDnaLen, innerLdpc,
+  1508→  1508→        (dna: string) => dnaToBytes(dna), innerN,
+  1509→  1509→      );
+  1510→  1510→      if (attentionResult) {
+  1511→  1511→        const reEncoded = innerLdpc.encode(attentionResult.data);
+  1512→  1512→        const firstRead = clusterReads[0];
+  1513→  1513→        let firstReadDna = firstRead.sequence;
+  1514→  1514→        if (firstReadDna.length > expectedDnaLen) firstReadDna = firstReadDna.slice(0, expectedDnaLen);
+  1515→  1515→        else if (firstReadDna.length < expectedDnaLen) firstReadDna = firstReadDna + "A".repeat(expectedDnaLen - firstReadDna.length);
+  1516→  1516→        let firstReadCrc: Uint8Array | null = null;
+  1517→  1517→        try {
+  1518→  1518→          const firstReadBlock = dnaToBytes(firstReadDna);
+  1519→  1519→          firstReadCrc = firstReadBlock.slice(innerN, innerN + 2);
+  1520→  1520→        } catch { /* ignore */ }
+  1521→  1521→        const expectedCrc = crc16Bytes(reEncoded);
+  1522→  1522→        const crcOk = firstReadCrc && expectedCrc[0] === firstReadCrc[0] && expectedCrc[1] === firstReadCrc[1];
+  1523→  1523→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1524→  1524→        const addr = unwhitenAddress(whitenedAddr);
+  1525→  1525→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1526→  1526→        if (crcOk && decodedIndex === oligoIdx) {
+  1527→  1527→          let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1528→  1528→          payloads.set(oligoIdx, payload);
+  1529→  1529→          perOligo.push({
+  1530→  1530→            index: oligoIdx, readCount: clusterReads.length, consensusLength: expectedDnaLen,
+  1531→  1531→            crcPassed: true, innerRS: { corrected: attentionResult.corrected, success: true },
+  1532→  1532→            seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1533→  1533→            strategy: 'attention_consensus',
+  1534→  1534→          });
+  1535→  1535→          continue;
+  1536→  1536→        }
+  1537→  1537→      }
+  1538→  1538→    }
+  1539→  1539→
+  1540→  1540→    // STRATEGY 2.75: v58 Progressive MSA (Kalign-style) — handles indels.
+  1541→  1541→    // v61: Skip for illumina (low-IDS) — too slow. Only run for nanopore/pacbio.
+  1542→  1542→    // This is the right tool for Nanopore / PacBio / high-IDS channels where indels
+  1543→  1543→    // dominate. The fast weighted consensus (STRATEGY 2) assumes no indels
+  1544→  1544→    // and fails when >5% of reads have insertions/deletions. The HMM
+  1545→  1545→    // soft-consensus (STRATEGY 3) also handles indels but is ~10× slower
+  1546→  1546→    // and can fail to converge on long noisy reads. Progressive MSA is the
+  1547→  1547→    // sweet spot: O(N²) in reads but each NW profile alignment is fast.
+  1548→  1548→    // v59: Now supports conv inner code — runs conv Viterbi on the MSA
+  1549→  1549→    // consensus before LDPC. This is critical for nanopore: per-read conv
+  1550→  1550→    // Viterbi fails on noisy reads, but MSA consensus is clean enough for
+  1551→  1551→    // conv Viterbi to succeed.
+  1552→  1552→    // NOTE: For nanopore/pacbio, STRATEGY 2 already uses MSA as the primary
+  1553→  1553→    // approach. This fallback is kept for the case where STRATEGY 2's MSA
+  1554→  1554→    // fails CRC verification but a retry with different read selection might work.
+  1555→  1555→    if (clusterReads.length >= 2 && useLDPC && innerLdpc && (channel === "nanopore" || channel === "pacbio")) {
+  1556→  1556→      const msaResult = decodeWithProgressiveMSA(
+  1557→  1557→        clusterReads, expectedDnaLen, innerLdpc,
+  1558→  1558→        (dna: string) => dnaToBytes(dna), innerN,
+  1559→  1559→        convInner ?? null,
+  1560→  1560→        useConvInner ? {
+  1561→  1561→          addressBytes: layout.addressBytes,
+  1562→  1562→          convEncodedBytes: layout.convEncodedBytes,
+  1563→  1563→          crcBytes: layout.crcBytes,
+  1564→  1564→        } : null,
+  1565→  1565→      );
+  1566→  1566→      if (msaResult) {
+  1567→  1567→        const reEncoded = innerLdpc.encode(msaResult.data);
+  1568→  1568→        // v61: Verify CRC
+  1569→  1569→        const firstRead = clusterReads[0];
+  1570→  1570→        let firstReadDna = firstRead.sequence;
+  1571→  1571→        if (firstReadDna.length > expectedDnaLen) firstReadDna = firstReadDna.slice(0, expectedDnaLen);
+  1572→  1572→        else if (firstReadDna.length < expectedDnaLen) firstReadDna = firstReadDna + "A".repeat(expectedDnaLen - firstReadDna.length);
+  1573→  1573→        let firstReadCrc: Uint8Array | null = null;
+  1574→  1574→        try { firstReadCrc = dnaToBytes(firstReadDna).slice(innerN, innerN + 2); } catch {}
+  1575→  1575→        const expectedCrc = crc16Bytes(reEncoded);
+  1576→  1576→        const crcOk = firstReadCrc && expectedCrc[0] === firstReadCrc[0] && expectedCrc[1] === firstReadCrc[1];
+  1577→  1577→        const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1578→  1578→        const addr = unwhitenAddress(whitenedAddr);
+  1579→  1579→        const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1580→  1580→        if (crcOk && decodedIndex === oligoIdx) {
+  1581→  1581→          let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1582→  1582→          payloads.set(oligoIdx, payload);
+  1583→  1583→          perOligo.push({
+  1584→  1584→            index: oligoIdx, readCount: clusterReads.length, consensusLength: expectedDnaLen,
+  1585→  1585→            crcPassed: true, innerRS: { corrected: msaResult.corrected, success: true },
+  1586→  1586→            seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1587→  1587→            strategy: 'msa',
+  1588→  1588→          });
+  1589→  1589→          continue;
+  1590→  1590→        }
+  1591→  1591→      }
+  1592→  1592→    }
+  1593→  1593→
+  1594→  1594→    // STRATEGY 3: HMM-based soft-consensus (slower, handles indels).
+  1595→  1595→    // Only try if fast consensus failed and we have enough reads.
+  1596→  1596→    // v61: Skip for illumina (low-IDS) — too slow. Only run for nanopore/pacbio.
+  1597→  1597→    if (clusterReads.length >= 3 && useLDPC && innerLdpc && (channel === "nanopore" || channel === "pacbio")) {
+  1598→  1598→      const refRead = clusterReads[0];
+  1599→  1599→      let refDna = refRead.sequence;
+  1600→  1600→      if (refDna.length < expectedDnaLen) {
+  1601→  1601→        refDna = refDna + "A".repeat(expectedDnaLen - refDna.length);
+  1602→  1602→      } else if (refDna.length > expectedDnaLen) {
+  1603→  1603→        refDna = refDna.slice(0, expectedDnaLen);
+  1604→  1604→      }
+  1605→  1605→
+  1606→  1606→      try {
+  1607→  1607→        const result = decodeWithSoftConsensus(clusterReads, refDna, innerLdpc, useGoldman);
+  1608→  1608→        if (result) {
+  1609→  1609→          const reEncoded = innerLdpc.encode(result.data);
+  1610→  1610→          // v61: Verify CRC
+  1611→  1611→          const firstRead = clusterReads[0];
+  1612→  1612→          let firstReadDna = firstRead.sequence;
+  1613→  1613→          if (firstReadDna.length > expectedDnaLen) firstReadDna = firstReadDna.slice(0, expectedDnaLen);
+  1614→  1614→          else if (firstReadDna.length < expectedDnaLen) firstReadDna = firstReadDna + "A".repeat(expectedDnaLen - firstReadDna.length);
+  1615→  1615→          let firstReadCrc: Uint8Array | null = null;
+  1616→  1616→          try { firstReadCrc = dnaToBytes(firstReadDna).slice(innerN, innerN + 2); } catch {}
+  1617→  1617→          const expectedCrc = crc16Bytes(reEncoded);
+  1618→  1618→          const crcOk = firstReadCrc && expectedCrc[0] === firstReadCrc[0] && expectedCrc[1] === firstReadCrc[1];
+  1619→  1619→          const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1620→  1620→          const addr = unwhitenAddress(whitenedAddr);
+  1621→  1621→          const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1622→  1622→          if (crcOk && decodedIndex === oligoIdx) {
+  1623→  1623→            let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1624→  1624→            payloads.set(oligoIdx, payload);
+  1625→  1625→            perOligo.push({
+  1626→  1626→              index: oligoIdx, readCount: clusterReads.length, consensusLength: refDna.length,
+  1627→  1627→              crcPassed: true, innerRS: { corrected: result.corrected, success: true },
+  1628→  1628→              seed: 0, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1629→  1629→              strategy: 'soft_consensus',
+  1630→  1630→            });
+  1631→  1631→            continue;
+  1632→  1632→          }
+  1633→  1633→        }
+  1634→  1634→      } catch {
+  1635→  1635→        // HMM soft-consensus failed — fall through to OSD post-pass
+  1636→  1636→      }
+  1637→  1637→    }
+  1638→  1638→
+  1639→  1639→    // OSD-2 post-pass: try ordered statistics decoding before giving up.
+  1640→  1640→    // This recovers many LDPC failures at the cost of ~2ms per oligo.
+  1641→  1641→    // Only attempt for nanopore/pacbio channels where inner decode often fails
+  1642→  1642→    // due to indels that the Viterbi preprocessor couldn't fully correct.
+  1643→  1643→    if ((channel === "nanopore" || channel === "pacbio") && useLDPC && innerLdpc && clusterReads.length >= 1) {
+  1644→  1644→      try {
+  1645→  1645→        const { osdDecode } = await import('./osd-full');
+  1646→  1646→        const { GF2Matrix } = await import('./osd');
+  1647→  1647→
+  1648→  1648→        // Build a consensus from cluster reads to use as the received word
+  1649→  1649→        const refRead = clusterReads[0];
+  1650→  1650→        let refDna = refRead.sequence;
+  1651→  1651→        if (refDna.length < expectedDnaLen) {
+  1652→  1652→          refDna = refDna + "A".repeat(expectedDnaLen - refDna.length);
+  1653→  1653→        } else if (refDna.length > expectedDnaLen) {
+  1654→  1654→          refDna = refDna.slice(0, expectedDnaLen);
+  1655→  1655→        }
+  1656→  1656→
+  1657→  1657→        // Convert consensus DNA to bytes
+  1658→  1658→        let rsCodewordForOsd: Uint8Array;
+  1659→  1659→        try {
+  1660→  1660→          rsCodewordForOsd = dnaToBytes(refDna).slice(0, innerN);
+  1661→  1661→        } catch {
+  1662→  1662→          // dnaToBytes failed — skip OSD
+  1663→  1663→          throw new Error("dnaToBytes failed for OSD input");
+  1664→  1664→        }
+  1665→  1665→
+  1666→  1666→        // Build LLRs from Q-scores if available, otherwise use uniform LLRs
+  1667→  1667→        const nBits = innerN * 8;
+  1668→  1668→        const llr = new Float32Array(nBits);
+  1669→  1669→        if (refRead.quality && refRead.quality.length > 0) {
+  1670→  1670→          // Use Q-scores to derive per-bit LLRs
+  1671→  1671→          const qScores = refRead.quality.slice(0, Math.min(expectedDnaLen, refRead.quality.length));
+  1672→  1672→          for (let baseIdx = 0; baseIdx < qScores.length && baseIdx * 2 < nBits; baseIdx++) {
+  1673→  1673→            // Q-score to LLR: LLR = (Q - 33) * ln(10) / 10 * 2 (per-bit)
+  1674→  1674→            const qVal = qScores[baseIdx];
+  1675→  1675→            const llrMag = Math.max(0.1, ((qVal - 33) * 0.2303)); // 0.2303 ≈ ln(10)/10
+  1676→  1676→            // Two bits per base (direct mapping)
+  1677→  1677→            const byteIdx0 = Math.floor(baseIdx / 4);
+  1678→  1678→            const bitIdx0 = (baseIdx % 4) * 2;
+  1679→  1679→            if (byteIdx0 < innerN) {
+  1680→  1680→              const byteVal = rsCodewordForOsd[byteIdx0];
+  1681→  1681→              // bit 0
+  1682→  1682→              const bit0 = (byteVal >> (7 - bitIdx0)) & 1;
+  1683→  1683→              llr[baseIdx * 2] = bit0 === 0 ? llrMag : -llrMag;
+  1684→  1684→              // bit 1
+  1685→  1685→              const bit1 = (byteVal >> (7 - bitIdx0 - 1)) & 1;
+  1686→  1686→              llr[baseIdx * 2 + 1] = bit1 === 0 ? llrMag : -llrMag;
+  1687→  1687→            }
+  1688→  1688→          }
+  1689→  1689→        } else {
+  1690→  1690→          // Uniform LLRs (hard decision) — magnitude 1.0
+  1691→  1691→          for (let i = 0; i < nBits; i++) {
+  1692→  1692→            const byteIdx = Math.floor(i / 8);
+  1693→  1693→            const bitPos = 7 - (i % 8);
+  1694→  1694→            const bit = (rsCodewordForOsd[byteIdx] >> bitPos) & 1;
+  1695→  1695→            llr[i] = bit === 0 ? 1.0 : -1.0;
+  1696→  1696→          }
+  1697→  1697→        }
+  1698→  1698→
+  1699→  1699→        // Get parity-check matrix from LDPC code
+  1700→  1700→        const H = innerLdpc.parityCheckMatrix;
+  1701→  1701→
+  1702→  1702→        // CRC + address check function
+  1703→  1703→        const crcAndAddrCheck = (codewordBits: Uint8Array): boolean => {
+  1704→  1704→          // Convert bit array to byte array
+  1705→  1705→          const codewordBytes = new Uint8Array(innerN);
+  1706→  1706→          for (let i = 0; i < innerN; i++) {
+  1707→  1707→            let byteVal = 0;
+  1708→  1708→            for (let b = 0; b < 8; b++) {
+  1709→  1709→              byteVal |= (codewordBits[i * 8 + b] << (7 - b));
+  1710→  1710→            }
+  1711→  1711→            codewordBytes[i] = byteVal;
+  1712→  1712→          }
+  1713→  1713→          // Re-encode to get canonical form
+  1714→  1714→          const reEncoded = innerLdpc!.encode(
+  1715→  1715→            // Extract info bits
+  1716→  1716→            codewordBytes.slice(0, innerLdpc!.k),
+  1717→  1717→          );
+  1718→  1718→          // Verify CRC
+  1719→  1719→          const expectedCrc = crc16Bytes(reEncoded);
+  1720→  1720→          // Get CRC from the first read
+  1721→  1721→          const firstRead = clusterReads[0];
+  1722→  1722→          let firstReadDna2 = firstRead.sequence;
+  1723→  1723→          if (firstReadDna2.length > expectedDnaLen) firstReadDna2 = firstReadDna2.slice(0, expectedDnaLen);
+  1724→  1724→          else if (firstReadDna2.length < expectedDnaLen) firstReadDna2 = firstReadDna2 + "A".repeat(expectedDnaLen - firstReadDna2.length);
+  1725→  1725→          let firstReadCrc2: Uint8Array | null = null;
+  1726→  1726→          try { firstReadCrc2 = dnaToBytes(firstReadDna2).slice(innerN, innerN + 2); } catch {}
+  1727→  1727→          if (!firstReadCrc2 || expectedCrc[0] !== firstReadCrc2[0] || expectedCrc[1] !== firstReadCrc2[1]) return false;
+  1728→  1728→          // Verify address
+  1729→  1729→          const whitenedAddr = reEncoded.slice(0, layout.addressBytes);
+  1730→  1730→          const addr = unwhitenAddress(whitenedAddr);
+  1731→  1731→          const decodedIndex = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+  1732→  1732→          return decodedIndex === oligoIdx;
+  1733→  1733→        };
+  1734→  1734→
+  1735→  1735→        // Run OSD-2 (maxOrder=2 is a good tradeoff: O(k²) candidates, ~2ms)
+  1736→  1736→        const osdResult = osdDecode(llr, H, crcAndAddrCheck, {
+  1737→  1737→          maxOrder: 2,
+  1738→  1738→          k: innerK * 8,
+  1739→  1739→        });
+  1740→  1740→
+  1741→  1741→        if (osdResult.codeword) {
+  1742→  1742→          // OSD succeeded — extract payload from the decoded codeword
+  1743→  1743→          const codewordBits = osdResult.codeword;
+  1744→  1744→          const codewordBytes = new Uint8Array(innerN);
+  1745→  1745→          for (let i = 0; i < innerN; i++) {
+  1746→  1746→            let byteVal = 0;
+  1747→  1747→            for (let b = 0; b < 8; b++) {
+  1748→  1748→              byteVal |= (codewordBits[i * 8 + b] << (7 - b));
+  1749→  1749→            }
+  1750→  1750→            codewordBytes[i] = byteVal;
+  1751→  1751→          }
+  1752→  1752→          // Re-encode to get canonical form
+  1753→  1753→          const reEncoded = innerLdpc.encode(codewordBytes.slice(0, innerK));
+  1754→  1754→          const seed = 0; // OSD doesn't recover seed
+  1755→  1755→          let payload = reEncoded.slice(layout.addressBytes, layout.addressBytes + layout.payloadBytes);
+  1756→  1756→          payloads.set(oligoIdx, payload);
+  1757→  1757→          perOligo.push({
+  1758→  1758→            index: oligoIdx, readCount: clusterReads.length, consensusLength: refDna.length,
+  1759→  1759→            crcPassed: true, innerRS: { corrected: osdResult.candidatesTried, success: true },
+  1760→  1760→            seed, payloadBytes: payload, isParity: oligoIdx >= metadata.outerRS.k,
+  1761→  1761→            strategy: 'osd_post_pass',
+  1762→  1762→          });
+  1763→  1763→          continue;
+  1764→  1764→        }
+  1765→  1765→      } catch {
+  1766→  1766→        // OSD not available or failed — fall through to erasure
+  1767→  1767→      }
+  1768→  1768→    }
+  1769→  1769→
+  1770→  1770→    // STRATEGY 4: Mark as erasure for outer RS to recover.
+  1771→  1771→    erasedIndices.push(oligoIdx);
+  1772→  1772→    oligosFailedInnerRS++;
+  1773→  1773→    perOligo.push({
+  1774→  1774→      index: oligoIdx, readCount: clusterReads.length, consensusLength: 0,
+  1775→  1775→      crcPassed: false, innerRS: { corrected: 0, success: false }, seed: 0,
+  1776→  1776→      payloadBytes: new Uint8Array(layout.payloadBytes),
+  1777→  1777→      isParity: oligoIdx >= metadata.outerRS.k,
+  1778→  1778→      strategy: 'erasure',
+  1779→  1779→    });
+  1780→  1780→  }
+  1781→  1781→
+  1782→  1782→  // 3) Outer RS: recover missing oligos via erasure decoding.
+  1783→  1783→  // With per-read decode, there are NO silent consensus errors — every
+  1784→  1784→  // payload in the map was individually validated by RS+CRC. So the outer
+  1785→  1785→  // RS only needs to recover genuinely missing oligos (erasures).
+  1786→  1786→  let oligosFailedOuterRS = 0;
+  1787→  1787→  const recoveredPayloads = new Map<number, Uint8Array>();
+  1788→  1788→
+  1789→  1789→  if (!useOuterRS) {
+  1790→  1790→    for (const [idx, payload] of payloads) {
+  1791→  1791→      recoveredPayloads.set(idx, payload);
+  1792→  1792→    }
+  1793→  1793→  } else if (useGF216 && outerRs216) {
+  1794→  1794→    const numPairs = Math.floor(layout.payloadBytes / 2);
+  1795→  1795→    let outerSuccessCount = 0, outerFailCount = 0, outerSkipCount = 0;
+  1796→  1796→    for (let pairIdx = 0; pairIdx < numPairs; pairIdx++) {
+  1797→  1797→      const j0 = pairIdx * 2;
+  1798→  1798→      const j1 = pairIdx * 2 + 1;
+  1799→  1799→      const codeword = new Uint16Array(metadata.outerRS.n);
+  1800→  1800→      const erased: number[] = [];
+  1801→  1801→      for (let i = 0; i < metadata.outerRS.n; i++) {
+  1802→  1802→        const p = payloads.get(i);
+  1803→  1803→        if (p) {
+  1804→  1804→          codeword[i] = (p[j0] << 8) | p[j1];
+  1805→  1805→        } else {
+  1806→  1806→          codeword[i] = 0;
+  1807→  1807→          if (erasedIndices.includes(i)) erased.push(i);
+  1808→  1808→        }
+  1809→  1809→      }
+  1810→  1810→      if (erased.length === 0) {
+  1811→  1811→        outerSkipCount++;
+  1812→  1812→        for (let i = 0; i < metadata.outerRS.k; i++) {
+  1813→  1813→          if (!recoveredPayloads.has(i)) {
+  1814→  1814→            recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1815→  1815→          }
+  1816→  1816→          recoveredPayloads.get(i)![j0] = (codeword[i] >> 8) & 0xff;
+  1817→  1817→          recoveredPayloads.get(i)![j1] = codeword[i] & 0xff;
+  1818→  1818→        }
+  1819→  1819→        continue;
+  1820→  1820→      }
+  1821→  1821→      if (erased.length > metadata.outerRS.n - metadata.outerRS.k) {
+  1822→  1822→        oligosFailedOuterRS++;
+  1823→  1823→        outerFailCount++;
+  1824→  1824→        continue;
+  1825→  1825→      }
+  1826→  1826→      try {
+  1827→  1827→        const r = outerRs216.decodeWithErasures(codeword, erased);
+  1828→  1828→        outerSuccessCount++;
+  1829→  1829→        for (let i = 0; i < metadata.outerRS.k; i++) {
+  1830→  1830→          if (!recoveredPayloads.has(i)) {
+  1831→  1831→            recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1832→  1832→          }
+  1833→  1833→          recoveredPayloads.get(i)![j0] = (r.data[i] >> 8) & 0xff;
+  1834→  1834→          recoveredPayloads.get(i)![j1] = r.data[i] & 0xff;
+  1835→  1835→        }
+  1836→  1836→      } catch {
+  1837→  1837→        oligosFailedOuterRS++;
+  1838→  1838→        outerFailCount++;
+  1839→  1839→      }
+  1840→  1840→    }
+  1841→  1841→    if (process.env.HELIX_DEBUG) {
+  1842→  1842→      console.error(`[LDPC debug] outer RS: ${outerSuccessCount} success, ${outerFailCount} fail, ${outerSkipCount} skip (erasedIndices=${erasedIndices.length}, erasedCount=${erasedIndices.length})`);
+  1843→  1843→    }
+  1844→  1844→    // Handle odd byte
+  1845→  1845→    if (layout.payloadBytes % 2 === 1) {
+  1846→  1846→      const j = layout.payloadBytes - 1;
+  1847→  1847→      // Build codeword for the odd byte using GF(2^16) (same as even bytes)
+  1848→  1848→      const codewordOdd = new Uint16Array(metadata.outerRS.n);
+  1849→  1849→      const erasedOdd: number[] = [];
+  1850→  1850→      for (let i = 0; i < metadata.outerRS.n; i++) {
+  1851→  1851→        const p = payloads.get(i);
+  1852→  1852→        if (p) {
+  1853→  1853→          codewordOdd[i] = p[j] & 0xff; // high byte = 0
+  1854→  1854→        } else {
+  1855→  1855→          codewordOdd[i] = 0;
+  1856→  1856→          if (erasedIndices.includes(i)) erasedOdd.push(i);
+  1857→  1857→        }
+  1858→  1858→      }
+  1859→  1859→      if (process.env.HELIX_DEBUG) {
+  1860→  1860→        console.error(`[LDPC debug] odd byte (j=${j}): ${erasedOdd.length} erasures, codeword len=${codewordOdd.length}`);
+  1861→  1861→      }
+  1862→  1862→      if (erasedOdd.length === 0) {
+  1863→  1863→        for (let i = 0; i < metadata.outerRS.k; i++) {
+  1864→  1864→          if (!recoveredPayloads.has(i)) {
+  1865→  1865→            recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1866→  1866→          }
+  1867→  1867→          recoveredPayloads.get(i)![j] = codewordOdd[i] & 0xff;
+  1868→  1868→        }
+  1869→  1869→      } else if (erasedOdd.length <= metadata.outerRS.n - metadata.outerRS.k && outerRs216) {
+  1870→  1870→        try {
+  1871→  1871→          const r = outerRs216.decodeWithErasures(codewordOdd, erasedOdd);
+  1872→  1872→          if (process.env.HELIX_DEBUG) {
+  1873→  1873→            console.error(`[LDPC debug] odd byte recovered: ${r.data.length} symbols`);
+  1874→  1874→          }
+  1875→  1875→          for (let i = 0; i < metadata.outerRS.k; i++) {
+  1876→  1876→            if (!recoveredPayloads.has(i)) {
+  1877→  1877→              recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1878→  1878→            }
+  1879→  1879→            recoveredPayloads.get(i)![j] = r.data[i] & 0xff;
+  1880→  1880→          }
+  1881→  1881→        } catch (e) {
+  1882→  1882→          if (process.env.HELIX_DEBUG) {
+  1883→  1883→            console.error(`[LDPC debug] odd byte FAILED: ${(e as Error).message}`);
+  1884→  1884→          }
+  1885→  1885→          oligosFailedOuterRS++;
+  1886→  1886→        }
+  1887→  1887→      }
+  1888→  1888→    }
+  1889→  1889→  } else if (outerRs8) {
+  1890→  1890→    // GF(2^8) RS: process each byte position independently
+  1891→  1891→    for (let j = 0; j < layout.payloadBytes; j++) {
+  1892→  1892→      const codeword = new Uint8Array(metadata.outerRS.n);
+  1893→  1893→      const byteErased: number[] = [];
+  1894→  1894→      for (let i = 0; i < metadata.outerRS.n; i++) {
+  1895→  1895→        const p = payloads.get(i);
+  1896→  1896→        if (p) {
+  1897→  1897→          codeword[i] = p[j];
+  1898→  1898→        } else {
+  1899→  1899→          codeword[i] = 0;
+  1900→  1900→          if (erasedIndices.includes(i)) byteErased.push(i);
+  1901→  1901→        }
+  1902→  1902→      }
+  1903→  1903→      if (byteErased.length === 0) {
+  1904→  1904→        for (let i = 0; i < metadata.outerRS.k; i++) {
+  1905→  1905→          if (!recoveredPayloads.has(i)) {
+  1906→  1906→            recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1907→  1907→          }
+  1908→  1908→          recoveredPayloads.get(i)![j] = codeword[i];
+  1909→  1909→        }
+  1910→  1910→        continue;
+  1911→  1911→      }
+  1912→  1912→      if (byteErased.length > metadata.outerRS.n - metadata.outerRS.k) {
+  1913→  1913→        oligosFailedOuterRS++;
+  1914→  1914→        continue;
+  1915→  1915→      }
+  1916→  1916→      try {
+  1917→  1917→        const r = outerRs8.decodeWithErasures(codeword, byteErased);
+  1918→  1918→        for (let i = 0; i < metadata.outerRS.k; i++) {
+  1919→  1919→          if (!recoveredPayloads.has(i)) {
+  1920→  1920→            recoveredPayloads.set(i, new Uint8Array(layout.payloadBytes));
+  1921→  1921→          }
+  1922→  1922→          recoveredPayloads.get(i)![j] = r.data[i];
+  1923→  1923→        }
+  1924→  1924→      } catch {
+  1925→  1925→        oligosFailedOuterRS++;
+  1926→  1926→      }
+  1927→  1927→    }
+  1928→  1928→  }
+  1929→  1929→
+  1930→  1930→  // 4) Concatenate payloads in index order; trim to fileSize (compressed size)
+  1931→  1931→  const compressedSize = metadata.oligoCount > 0
+  1932→  1932→    ? Math.min(
+  1933→  1933→        metadata.rawSize, // upper bound
+  1934→  1934→        metadata.outerRS.k * layout.payloadBytes,
+  1935→  1935→      )
+  1936→  1936→    : 0;
+  1937→  1937→  // We need to know the compressed length. The metadata stores rawSize, not compressedSize.
+  1938→  1938→  // For now, decompress and check trailing zeros — they're padding.
+  1939→  1939→  const totalPayload = new Uint8Array(metadata.outerRS.k * layout.payloadBytes);
+  1940→  1940→  for (let i = 0; i < metadata.outerRS.k; i++) {
+  1941→  1941→    const p = recoveredPayloads.get(i);
+  1942→  1942→    if (p) totalPayload.set(p, i * layout.payloadBytes);
+  1943→  1943→  }
+  1944→  1944→
+  1945→  1945→  // 5) Decompress (if needed)
+  1946→  1946→  let data: Uint8Array;
+  1947→  1947→  if (metadata.compression === "deflate") {
+  1948→  1948→    try {
+  1949→  1949→      data = inflate(totalPayload);
+  1950→  1950→    } catch {
+  1951→  1951→      // Inflate failed — return raw payload as best effort
+  1952→  1952→      data = totalPayload;
+  1953→  1953→    }
+  1954→  1954→  } else {
+  1955→  1955→    data = totalPayload.slice(0, metadata.fileSize);
+  1956→  1956→  }
+  1957→  1957→
+  1958→  1958→  // Trim to fileSize
+  1959→  1959→  if (data.length > metadata.fileSize) {
+  1960→  1960→    data = data.slice(0, metadata.fileSize);
+  1961→  1961→  }
+  1962→  1962→
+  1963→  1963→  // 6) Compute hash
+  1964→  1964→  let hash = await sha256(data);
+  1965→  1965→  let hashMatches = hash === metadata.fileHash;
+  1966→  1966→
+  1967→  1967→  // v61 CRITICAL FIX: Outer RS erasure search.
+  1968→  1968→  //
+  1969→  1969→  // If the hash doesn't match but we have outer RS parity available AND
+  1970→  1970→  // fewer than (n-k) oligos were erased, the wrong payload is likely due to
+  1971→  1971→  // a rare LDPC wrong-codeword acceptance (CRC collision ~1/2^16 per read).
+  1972→  1972→  // The outer RS syndrome is non-zero, indicating an error. We try marking
+  1973→  1973→  // each data oligo (one at a time) as an erasure and re-running the outer
+  1974→  1974→  // RS. If any retry produces a matching hash, we use that.
+  1975→  1975→  //
+  1976→  1976→  // This is O(k) retries, each doing O(payloadBytes) RS decodes. For k=298
+  1977→  1977→  // and payloadBytes=150, that's ~45K RS decodes — fast (<500ms).
+  1978→  1978→  //
+  1979→  1979→  // This catches the "silent wrong codeword" failure mode that plagued v60
+  1980→  1980→  // (hash FAIL with 307/307 oligos recovered).
+  1981→  1981→  if (!hashMatches && useOuterRS && erasedIndices.length < (metadata.outerRS.n - metadata.outerRS.k)) {
+  1982→  1982→    if (process.env.HELIX_DEBUG) console.error(`[v61 erasure-search] hash mismatch detected, trying RS error correction + erasure search (erased=${erasedIndices.length}, k=${metadata.outerRS.k})`);
+  1983→  1983→    const erasureCapacity = metadata.outerRS.n - metadata.outerRS.k - erasedIndices.length;
+  1984→  1984→    // Only try if we have spare erasure capacity
+  1985→  1985→    if (erasureCapacity >= 1) {
+  1986→  1986→      const k = metadata.outerRS.k;
+  1987→  1987→      // v61: Use proper RS error correction (Berlekamp-Massey + Chien + Forney)
+  1988→  1988→      // instead of brute-force erasure search. This is O(n^2) per byte position
+  1989→  1989→      // but handles multiple unknown errors in one shot.
+  1990→  1990→      //
+  1991→  1991→      // The RS decode can correct up to floor(nsym/2) unknown errors. With 3%
+  1992→  1992→      // outer RS (nsym=9 for 256KB), we can correct up to 4 wrong oligos.
+  1993→  1993→      // With 25% outer RS (nsym=54 for nanopore), we can correct up to 27.
+  1994→  1994→      //
+  1995→  1995→      // This catches the "silent wrong codeword" failure mode where LDPC + CRC-16
+  1996→  1996→      // falsely accepted a wrong codeword (probability ~1/2^16 per read).
+  1997→  1997→      const retryPayloads = new Map<number, Uint8Array>();
+  1998→  1998→      let rsErrorCorrectionSuccess = false;
+  1999→  1999→
+  2000→  2000→      if (useGF216 && outerRs216) {
+
+[showing lines 1-2000 of 2002; use offset=2001 with limit to continue reading]

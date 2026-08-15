@@ -1,0 +1,857 @@
+     1→     1→/**
+     2→     2→ * Parametric Wetlab Simulation (dt4dds pattern)
+     3→     3→ *
+     4→     4→ * Models the entire wetlab pipeline with configurable parameters:
+     5→     5→ *   1. Array synthesis (position-dependent error rates, bias)
+     6→     6→ *   2. PCR amplification (duplication, amplification bias, errors)
+     7→     7→ *   3. Aging/decay (depurination, oxidation, deamination)
+     8→     8→ *   4. Sequencing-by-synthesis (platform-specific error profiles)
+     9→     9→ *
+    10→    10→ * Replaces the simple uniform RNG in simulate.ts with a research grade model.
+    11→    11→ * For unit tests, the simple simulator is still available.
+    12→    12→ * For research or vendor integration, use this parametric model.
+    13→    13→ *
+    14→    14→ * Key differences from simulate.ts:
+    15→    15→ *   - Position-dependent synthesis errors (5'/3' end effects)
+    16→    16→ *   - GC-biased PCR amplification (high-GC oligos amplify less)
+    17→    17→ *   - Chemical aging model (depurination, oxidation, deamination)
+    18→    18→ *   - Platform-specific sequencing error profiles
+    19→    19→ *   - Separate tracking of errors at each pipeline stage
+    20→    20→ *
+    21→    21→ * Reference:
+    22→    22→ *   - fml-ethz/dt4dds (Python, Nature Comms & Digital Discovery)
+    23→    23→ *   - Lee et al. (2022). "Photon reading..." Nat. Commun. 13:3231.
+    24→    24→ */
+    25→    25→
+    26→    26→import { Oligo } from "./types";
+    27→    27→import { SequencingRead } from "./simulate";
+    28→    28→
+    29→    29→// ---------------------------------------------------------------------------
+    30→    30→// Configuration interfaces
+    31→    31→// ---------------------------------------------------------------------------
+    32→    32→
+    33→    33→export interface SynthesisParams {
+    34→    34→  /** Base substitution rate. Default: 0.001 (Illumina-grade array synthesis) */
+    35→    35→  substitutionRate: number;
+    36→    36→  /** Insertion rate. Default: 0.0005 */
+    37→    37→  insertionRate: number;
+    38→    38→  /** Deletion rate. Default: 0.001 */
+    39→    39→  deletionRate: number;
+    40→    40→  /** Position-dependent error scaling (edges of array have higher error rates) */
+    41→    41→  positionDependent: boolean;
+    42→    42→  /** 5' end error multiplier. Default: 1.5 */
+    43→    43→  fivePrimeErrorMultiplier: number;
+    44→    44→  /** 3' end error multiplier. Default: 2.0 */
+    45→    45→  threePrimeErrorMultiplier: number;
+    46→    46→}
+    47→    47→
+    48→    48→export interface PCRParams {
+    49→    49→  /** Number of PCR cycles. Default: 15 */
+    50→    50→  cycles: number;
+    51→    51→  /** Per-cycle duplication probability. Default: 0.85 */
+    52→    52→  duplicationProb: number;
+    53→    53→  /** Per-cycle substitution rate. Default: 0.0001 */
+    54→    54→  substitutionRate: number;
+    55→    55→  /** Amplification bias (GC-rich sequences amplify less). Default: 0.1 */
+    56→    56→  gcBias: number;
+    57→    57→}
+    58→    58→
+    59→    59→export interface AgingParams {
+    60→    60→  /** Depurination rate per day. Default: 0.0001 */
+    61→    61→  depurinationRate: number;
+    62→    62→  /** Oxidation rate per day. Default: 0.00005 */
+    63→    63→  oxidationRate: number;
+    64→    64→  /** Deamination rate per day (C→T). Default: 0.0002 */
+    65→    65→  deaminationRate: number;
+    66→    66→  /** Number of days of aging. Default: 0 (no aging) */
+    67→    67→  days: number;
+    68→    68→}
+    69→    69→
+    70→    70→export interface SequencingParams {
+    71→    71→  /** Platform: 'illumina', 'nanopore', or 'pacbio' */
+    72→    72→  platform: "illumina" | "nanopore" | "pacbio";
+    73→    73→  /** Substitution rate (platform-specific). Default: 0.001 (Illumina), 0.02 (Nanopore) */
+    74→    74→  substitutionRate: number;
+    75→    75→  /** Insertion rate. Default: 0.0005 (Illumina), 0.03 (Nanopore) */
+    76→    76→  insertionRate: number;
+    77→    77→  /** Deletion rate. Default: 0.001 (Illumina), 0.04 (Nanopore) */
+    78→    78→  deletionRate: number;
+    79→    79→  /** Average coverage depth. Default: 20 */
+    80→    80→  coverage: number;
+    81→    81→  /** Dropout rate (oligos completely lost). Default: 0 */
+    82→    82→  dropoutRate: number;
+    83→    83→}
+    84→    84→
+    85→    85→export interface WetlabConfig {
+    86→    86→  synthesis: SynthesisParams;
+    87→    87→  pcr: PCRParams;
+    88→    88→  aging: AgingParams;
+    89→    89→  sequencing: SequencingParams;
+    90→    90→}
+    91→    91→
+    92→    92→// ---------------------------------------------------------------------------
+    93→    93→// Preset configurations
+    94→    94→// ---------------------------------------------------------------------------
+    95→    95→
+    96→    96→export const ILLUMINA_WETLAB: WetlabConfig = {
+    97→    97→  synthesis: {
+    98→    98→    substitutionRate: 0.001,
+    99→    99→    insertionRate: 0.0005,
+   100→   100→    deletionRate: 0.001,
+   101→   101→    positionDependent: true,
+   102→   102→    fivePrimeErrorMultiplier: 1.5,
+   103→   103→    threePrimeErrorMultiplier: 2.0,
+   104→   104→  },
+   105→   105→  pcr: {
+   106→   106→    cycles: 15,
+   107→   107→    duplicationProb: 0.85,
+   108→   108→    substitutionRate: 0.0001,
+   109→   109→    gcBias: 0.1,
+   110→   110→  },
+   111→   111→  aging: {
+   112→   112→    depurinationRate: 0.0001,
+   113→   113→    oxidationRate: 0.00005,
+   114→   114→    deaminationRate: 0.0002,
+   115→   115→    days: 0,
+   116→   116→  },
+   117→   117→  sequencing: {
+   118→   118→    platform: "illumina",
+   119→   119→    substitutionRate: 0.001,
+   120→   120→    insertionRate: 0.0005,
+   121→   121→    deletionRate: 0.001,
+   122→   122→    coverage: 20,
+   123→   123→    dropoutRate: 0,
+   124→   124→  },
+   125→   125→};
+   126→   126→
+   127→   127→export const NANOPORE_WETLAB: WetlabConfig = {
+   128→   128→  synthesis: {
+   129→   129→    substitutionRate: 0.002,
+   130→   130→    insertionRate: 0.001,
+   131→   131→    deletionRate: 0.002,
+   132→   132→    positionDependent: true,
+   133→   133→    fivePrimeErrorMultiplier: 1.5,
+   134→   134→    threePrimeErrorMultiplier: 2.5,
+   135→   135→  },
+   136→   136→  pcr: {
+   137→   137→    cycles: 12,
+   138→   138→    duplicationProb: 0.80,
+   139→   139→    substitutionRate: 0.0002,
+   140→   140→    gcBias: 0.15,
+   141→   141→  },
+   142→   142→  aging: {
+   143→   143→    depurinationRate: 0.0002,
+   144→   144→    oxidationRate: 0.0001,
+   145→   145→    deaminationRate: 0.0003,
+   146→   146→    days: 0,
+   147→   147→  },
+   148→   148→  sequencing: {
+   149→   149→    platform: "nanopore",
+   150→   150→    substitutionRate: 0.02,
+   151→   151→    insertionRate: 0.03,
+   152→   152→    deletionRate: 0.04,
+   153→   153→    coverage: 15,
+   154→   154→    dropoutRate: 0.05,
+   155→   155→  },
+   156→   156→};
+   157→   157→
+   158→   158→export const PACBIO_WETLAB: WetlabConfig = {
+   159→   159→  synthesis: {
+   160→   160→    substitutionRate: 0.001,
+   161→   161→    insertionRate: 0.001,
+   162→   162→    deletionRate: 0.001,
+   163→   163→    positionDependent: true,
+   164→   164→    fivePrimeErrorMultiplier: 1.3,
+   165→   165→    threePrimeErrorMultiplier: 1.8,
+   166→   166→  },
+   167→   167→  pcr: {
+   168→   168→    cycles: 10,
+   169→   169→    duplicationProb: 0.82,
+   170→   170→    substitutionRate: 0.00015,
+   171→   171→    gcBias: 0.12,
+   172→   172→  },
+   173→   173→  aging: {
+   174→   174→    depurinationRate: 0.00015,
+   175→   175→    oxidationRate: 0.00008,
+   176→   176→    deaminationRate: 0.00025,
+   177→   177→    days: 0,
+   178→   178→  },
+   179→   179→  sequencing: {
+   180→   180→    platform: "pacbio",
+   181→   181→    substitutionRate: 0.005,
+   182→   182→    insertionRate: 0.05,
+   183→   183→    deletionRate: 0.03,
+   184→   184→    coverage: 10,
+   185→   185→    dropoutRate: 0.02,
+   186→   186→  },
+   187→   187→};
+   188→   188→
+   189→   189→// ---------------------------------------------------------------------------
+   190→   190→// Result interfaces
+   191→   191→// ---------------------------------------------------------------------------
+   192→   192→
+   193→   193→export interface WetlabResult {
+   194→   194→  /** Sequencing reads (with errors from all stages) */
+   195→   195→  reads: SequencingRead[];
+   196→   196→  /** Per-stage error statistics */
+   197→   197→  stats: {
+   198→   198→    synthesisErrors: number;
+   199→   199→    pcrDuplicates: number;
+   200→   200→    pcrErrors: number;
+   201→   201→    agingDamage: number;
+   202→   202→    sequencingErrors: number;
+   203→   203→    totalOligos: number;
+   204→   204→    recoveredOligos: number;
+   205→   205→  };
+   206→   206→}
+   207→   207→
+   208→   208→// ---------------------------------------------------------------------------
+   209→   209→// PRNG (Xorshift32, same as simulate.ts)
+   210→   210→// ---------------------------------------------------------------------------
+   211→   211→
+   212→   212→class Rng {
+   213→   213→  private state: number;
+   214→   214→  constructor(seed: number) {
+   215→   215→    this.state = (seed >>> 0) || 1;
+   216→   216→  }
+   217→   217→  next(): number {
+   218→   218→    this.state ^= this.state << 13;
+   219→   219→    this.state ^= this.state >>> 17;
+   220→   220→    this.state ^= this.state << 5;
+   221→   221→    this.state = this.state >>> 0;
+   222→   222→    return this.state / 0x100000000;
+   223→   223→  }
+   224→   224→  nextInt(maxExclusive: number): number {
+   225→   225→    return Math.floor(this.next() * maxExclusive);
+   226→   226→  }
+   227→   227→}
+   228→   228→
+   229→   229→// Global RNG instance (seeded per simulation)
+   230→   230→let rng: Rng;
+   231→   231→
+   232→   232→const BASES = "ACGT";
+   233→   233→
+   234→   234→// ---------------------------------------------------------------------------
+   235→   235→// Utility: GC content
+   236→   236→// ---------------------------------------------------------------------------
+   237→   237→
+   238→   238→function gcContent(dna: string): number {
+   239→   239→  let gc = 0;
+   240→   240→  for (let i = 0; i < dna.length; i++) {
+   241→   241→    if (dna[i] === "G" || dna[i] === "C") gc++;
+   242→   242→  }
+   243→   243→  return dna.length > 0 ? gc / dna.length : 0;
+   244→   244→}
+   245→   245→
+   246→   246→// ---------------------------------------------------------------------------
+   247→   247→// Step 1: Synthesis
+   248→   248→// ---------------------------------------------------------------------------
+   249→   249→
+   250→   250→/**
+   251→   251→ * Position-dependent error multiplier.
+   252→   252→ *
+   253→   253→ * Models the observation that array synthesis has higher error rates at the
+   254→   254→ * 5' and 3' ends of the oligo. The error profile is:
+   255→   255→ *   - 5' end: elevated by fivePrimeErrorMultiplier
+   256→   256→ *   - Middle: baseline (multiplier = 1.0)
+   257→   257→ *   - 3' end: elevated by threePrimeErrorMultiplier
+   258→   258→ *
+   259→   259→ * The transition zones are smooth (linear interpolation) to avoid
+   260→   260→ * discontinuities.
+   261→   261→ *
+   262→   262→ * @param pos Position in the oligo (0-based)
+   263→   263→ * @param len Total oligo length
+   264→   264→ * @param fivePrimeMul 5' end error multiplier
+   265→   265→ * @param threePrimeMul 3' end error multiplier
+   266→   266→ * @returns Error multiplier at this position
+   267→   267→ */
+   268→   268→function positionErrorMultiplier(
+   269→   269→  pos: number,
+   270→   270→  len: number,
+   271→   271→  fivePrimeMul: number,
+   272→   272→  threePrimeMul: number,
+   273→   273→): number {
+   274→   274→  if (len <= 0) return 1.0;
+   275→   275→
+   276→   276→  // Define edge zones as the first/last 15% of the oligo
+   277→   277→  const edgeFraction = 0.15;
+   278→   278→  const edgeLen = Math.max(1, Math.floor(len * edgeFraction));
+   279→   279→
+   280→   280→  if (pos < edgeLen) {
+   281→   281→    // 5' end zone: interpolate from fivePrimeMul to 1.0
+   282→   282→    const t = pos / edgeLen;
+   283→   283→    return fivePrimeMul + t * (1.0 - fivePrimeMul);
+   284→   284→  } else if (pos >= len - edgeLen) {
+   285→   285→    // 3' end zone: interpolate from 1.0 to threePrimeMul
+   286→   286→    const t = (pos - (len - edgeLen)) / edgeLen;
+   287→   287→    return 1.0 + t * (threePrimeMul - 1.0);
+   288→   288→  }
+   289→   289→
+   290→   290→  return 1.0; // Middle: baseline
+   291→   291→}
+   292→   292→
+   293→   293→/**
+   294→   294→ * Apply synthesis errors to a single oligo.
+   295→   295→ *
+   296→   296→ * Uses position-dependent error rates if enabled:
+   297→   297→ *   - 5' end: substitutionRate × fivePrimeErrorMultiplier
+   298→   298→ *   - 3' end: substitutionRate × threePrimeErrorMultiplier
+   299→   299→ *   - Middle: substitutionRate × 1.0
+   300→   300→ *
+   301→   301→ * @param dna Original DNA sequence
+   302→   302→ * @param params Synthesis parameters
+   303→   303→ * @returns Mutated DNA sequence and error count
+   304→   304→ */
+   305→   305→function applySynthesisErrors(
+   306→   306→  dna: string,
+   307→   307→  params: SynthesisParams,
+   308→   308→): { dna: string; errors: number } {
+   309→   309→  if (params.substitutionRate === 0 && params.insertionRate === 0 && params.deletionRate === 0) {
+   310→   310→    return { dna, errors: 0 };
+   311→   311→  }
+   312→   312→
+   313→   313→  const len = dna.length;
+   314→   314→  let errors = 0;
+   315→   315→
+   316→   316→  // First pass: determine deletions
+   317→   317→  const survived = new Array<boolean>(len).fill(true);
+   318→   318→  for (let i = 0; i < len; i++) {
+   319→   319→    const mul = params.positionDependent
+   320→   320→      ? positionErrorMultiplier(i, len, params.fivePrimeErrorMultiplier, params.threePrimeErrorMultiplier)
+   321→   321→      : 1.0;
+   322→   322→    const delRate = params.deletionRate * mul;
+   323→   323→    if (rng.next() < delRate) {
+   324→   324→      survived[i] = false;
+   325→   325→      errors++;
+   326→   326→    }
+   327→   327→  }
+   328→   328→
+   329→   329→  // Second pass: apply substitutions and insertions
+   330→   330→  const result: string[] = [];
+   331→   331→  for (let i = 0; i < len; i++) {
+   332→   332→    if (!survived[i]) continue;
+   333→   333→
+   334→   334→    const mul = params.positionDependent
+   335→   335→      ? positionErrorMultiplier(i, len, params.fivePrimeErrorMultiplier, params.threePrimeErrorMultiplier)
+   336→   336→      : 1.0;
+   337→   337→
+   338→   338→    // Substitution
+   339→   339→    if (rng.next() < params.substitutionRate * mul) {
+   340→   340→      let newBase: string;
+   341→   341→      do {
+   342→   342→        newBase = BASES[rng.nextInt(4)];
+   343→   343→      } while (newBase === dna[i]);
+   344→   344→      result.push(newBase);
+   345→   345→      errors++;
+   346→   346→    } else {
+   347→   347→      result.push(dna[i]);
+   348→   348→    }
+   349→   349→
+   350→   350→    // Insertion
+   351→   351→    if (rng.next() < params.insertionRate * mul) {
+   352→   352→      result.push(BASES[rng.nextInt(4)]);
+   353→   353→      errors++;
+   354→   354→    }
+   355→   355→  }
+   356→   356→
+   357→   357→  return { dna: result.join(""), errors };
+   358→   358→}
+   359→   359→
+   360→   360→/**
+   361→   361→ * Step 1: Simulate array synthesis errors.
+   362→   362→ * Position-dependent: higher error rates at 5' and 3' ends.
+   363→   363→ *
+   364→   364→ * @param oligos Original oligos (from encoder)
+   365→   365→ * @param params Synthesis parameters
+   366→   366→ * @returns Oligos with synthesis errors applied
+   367→   367→ */
+   368→   368→export function simulateSynthesis(
+   369→   369→  oligos: Oligo[],
+   370→   370→  params: SynthesisParams,
+   371→   371→): Oligo[] {
+   372→   372→  return oligos.map((oligo) => {
+   373→   373→    const { dna, errors: _ } = applySynthesisErrors(oligo.sequence, params);
+   374→   374→    // Recalculate GC and homopolymer stats
+   375→   375→    const gc = gcContent(dna);
+   376→   376→    let maxHomo = 1;
+   377→   377→    let run = 1;
+   378→   378→    for (let i = 1; i < dna.length; i++) {
+   379→   379→      if (dna[i] === dna[i - 1]) {
+   380→   380→        run++;
+   381→   381→        if (run > maxHomo) maxHomo = run;
+   382→   382→      } else {
+   383→   383→        run = 1;
+   384→   384→      }
+   385→   385→    }
+   386→   386→    return {
+   387→   387→      ...oligo,
+   388→   388→      sequence: dna,
+   389→   389→      gc,
+   390→   390→      maxHomopolymer: maxHomo,
+   391→   391→      length: dna.length,
+   392→   392→    };
+   393→   393→  });
+   394→   394→}
+   395→   395→
+   396→   396→// ---------------------------------------------------------------------------
+   397→   397→// Step 2: PCR amplification
+   398→   398→// ---------------------------------------------------------------------------
+   399→   399→
+   400→   400→/**
+   401→   401→ * Apply a single PCR cycle to an oligo.
+   402→   402→ *
+   403→   403→ * Each cycle:
+   404→   404→ *   1. With probability duplicationProb, the oligo is duplicated (creates a copy)
+   405→   405→ *   2. The copy may have substitution errors (Taq polymerase fidelity)
+   406→   406→ *   3. GC bias: high-GC oligos are less likely to duplicate
+   407→   407→ *
+   408→   408→ * @param oligo The oligo to amplify
+   409→   409→ * @param params PCR parameters
+   410→   410→ * @returns Array of oligos after this cycle (original + possible copy)
+   411→   411→ */
+   412→   412→function pcrCycle(oligo: Oligo, params: PCRParams): Oligo[] {
+   413→   413→  const results: Oligo[] = [oligo]; // Original always survives
+   414→   414→
+   415→   415→  // GC-biased duplication probability
+   416→   416→  const gc = gcContent(oligo.sequence);
+   417→   417→  // High GC → lower amplification. Bias model:
+   418→   418→  //   effectiveProb = duplicationProb × (1 - gcBias × |gc - 0.5| / 0.5)
+   419→   419→  // At gc=0.5 (balanced): no penalty. At gc=1.0: penalty = gcBias.
+   420→   420→  const gcPenalty = 1 - params.gcBias * Math.abs(gc - 0.5) / 0.5;
+   421→   421→  const effectiveProb = params.duplicationProb * Math.max(0, gcPenalty);
+   422→   422→
+   423→   423→  if (rng.next() < effectiveProb) {
+   424→   424→    // Duplicate with possible Taq errors
+   425→   425→    let seq = oligo.sequence;
+   426→   426→    let pcrErrors = 0;
+   427→   427→
+   428→   428→    if (params.substitutionRate > 0) {
+   429→   429→      const arr = seq.split("");
+   430→   430→      for (let i = 0; i < arr.length; i++) {
+   431→   431→        if (rng.next() < params.substitutionRate) {
+   432→   432→          let newBase: string;
+   433→   433→          do {
+   434→   434→            newBase = BASES[rng.nextInt(4)];
+   435→   435→          } while (newBase === arr[i]);
+   436→   436→          arr[i] = newBase;
+   437→   437→          pcrErrors++;
+   438→   438→        }
+   439→   439→      }
+   440→   440→      seq = arr.join("");
+   441→   441→    }
+   442→   442→
+   443→   443→    results.push({
+   444→   444→      ...oligo,
+   445→   445→      sequence: seq,
+   446→   446→      gc: gcContent(seq),
+   447→   447→    });
+   448→   448→  }
+   449→   449→
+   450→   450→  return results;
+   451→   451→}
+   452→   452→
+   453→   453→/**
+   454→   454→ * Step 2: Simulate PCR amplification.
+   455→   455→ *
+   456→   456→ * GC bias: high-GC oligos amplify less → lower coverage.
+   457→   457→ * Duplication: each oligo produces ~2^cycles copies, with stochastic variation.
+   458→   458→ * Errors: Taq polymerase introduces substitutions.
+   459→   459→ *
+   460→   460→ * @param oligos Oligos after synthesis
+   461→   461→ * @param params PCR parameters
+   462→   462→ * @returns Amplified oligo pool (may have duplicates)
+   463→   463→ */
+   464→   464→export function simulatePCR(
+   465→   465→  oligos: Oligo[],
+   466→   466→  params: PCRParams,
+   467→   467→): Oligo[] {
+   468→   468→  let pool: Oligo[] = [...oligos];
+   469→   469→  let totalPcrErrors = 0;
+   470→   470→
+   471→   471→  for (let cycle = 0; cycle < params.cycles; cycle++) {
+   472→   472→    const newPool: Oligo[] = [];
+   473→   473→    for (const oligo of pool) {
+   474→   474→      const amplified = pcrCycle(oligo, params);
+   475→   475→      newPool.push(...amplified);
+   476→   476→      // Count PCR errors (differences from original)
+   477→   477→      if (amplified.length > 1) {
+   478→   478→        for (let i = 1; i < amplified.length; i++) {
+   479→   479→          // Rough error count: Hamming distance for same-length sequences
+   480→   480→          const orig = oligo.sequence;
+   481→   481→          const copy = amplified[i].sequence;
+   482→   482→          if (orig.length === copy.length) {
+   483→   483→            for (let j = 0; j < orig.length; j++) {
+   484→   484→              if (orig[j] !== copy[j]) totalPcrErrors++;
+   485→   485→            }
+   486→   486→          }
+   487→   487→        }
+   488→   488→      }
+   489→   489→    }
+   490→   490→    pool = newPool;
+   491→   491→  }
+   492→   492→
+   493→   493→  return pool;
+   494→   494→}
+   495→   495→
+   496→   496→// ---------------------------------------------------------------------------
+   497→   497→// Step 3: Aging / chemical decay
+   498→   498→// ---------------------------------------------------------------------------
+   499→   499→
+   500→   500→/**
+   501→   501→ * Apply chemical aging damage to a DNA sequence.
+   502→   502→ *
+   503→   503→ * Three damage mechanisms:
+   504→   504→ *   1. Depurination: A or G loses its purine ring → the base is deleted
+   505→   505→ *      (breaks the sugar-phosphate backbone in real DNA, modeled as deletion here)
+   506→   506→ *   2. Oxidation: G is oxidized → G→T or G→C substitution
+   507→   507→ *   3. Deamination: C loses its amine group → C→T substitution
+   508→   508→ *
+   509→   509→ * Rates are per-day, so effective rate = rate × days.
+   510→   510→ *
+   511→   511→ * @param dna DNA sequence
+   512→   512→ * @param params Aging parameters
+   513→   513→ * @returns Damaged DNA and damage count
+   514→   514→ */
+   515→   515→function applyAgingDamage(
+   516→   516→  dna: string,
+   517→   517→  params: AgingParams,
+   518→   518→): { dna: string; damage: number } {
+   519→   519→  if (params.days <= 0) return { dna, damage: 0 };
+   520→   520→
+   521→   521→  const depurRate = params.depurinationRate * params.days;
+   522→   522→  const oxidRate = params.oxidationRate * params.days;
+   523→   523→  const deamRate = params.deaminationRate * params.days;
+   524→   524→
+   525→   525→  let damage = 0;
+   526→   526→  const result: string[] = [];
+   527→   527→
+   528→   528→  for (let i = 0; i < dna.length; i++) {
+   529→   529→    const base = dna[i];
+   530→   530→
+   531→   531→    // Depurination: A or G → deletion
+   532→   532→    if ((base === "A" || base === "G") && rng.next() < depurRate) {
+   533→   533→      damage++;
+   534→   534→      continue; // Skip this base (deletion)
+   535→   535→    }
+   536→   536→
+   537→   537→    // Oxidation: G → T or G→C
+   538→   538→    if (base === "G" && rng.next() < oxidRate) {
+   539→   539→      result.push(rng.next() < 0.5 ? "T" : "C");
+   540→   540→      damage++;
+   541→   541→      continue;
+   542→   542→    }
+   543→   543→
+   544→   544→    // Deamination: C → T
+   545→   545→    if (base === "C" && rng.next() < deamRate) {
+   546→   546→      result.push("T");
+   547→   547→      damage++;
+   548→   548→      continue;
+   549→   549→    }
+   550→   550→
+   551→   551→    // No damage
+   552→   552→    result.push(base);
+   553→   553→  }
+   554→   554→
+   555→   555→  return { dna: result.join(""), damage };
+   556→   556→}
+   557→   557→
+   558→   558→/**
+   559→   559→ * Step 3: Simulate aging/decay.
+   560→   560→ *
+   561→   561→ * Depurination: A/G → deletion (breaks backbone)
+   562→   562→ * Oxidation: G → substitution (G→T or G→C)
+   563→   563→ * Deamination: C → T substitution
+   564→   564→ *
+   565→   565→ * @param oligos Oligos after PCR
+   566→   566→ * @param params Aging parameters
+   567→   567→ * @returns Oligos with aging damage applied
+   568→   568→ */
+   569→   569→export function simulateAging(
+   570→   570→  oligos: Oligo[],
+   571→   571→  params: AgingParams,
+   572→   572→): Oligo[] {
+   573→   573→  if (params.days <= 0) return oligos;
+   574→   574→
+   575→   575→  return oligos.map((oligo) => {
+   576→   576→    const { dna, damage: _ } = applyAgingDamage(oligo.sequence, params);
+   577→   577→    return {
+   578→   578→      ...oligo,
+   579→   579→      sequence: dna,
+   580→   580→      gc: gcContent(dna),
+   581→   581→      length: dna.length,
+   582→   582→    };
+   583→   583→  });
+   584→   584→}
+   585→   585→
+   586→   586→// ---------------------------------------------------------------------------
+   587→   587→// Step 4: Sequencing
+   588→   588→// ---------------------------------------------------------------------------
+   589→   589→
+   590→   590→/**
+   591→   591→ * Simulate a single sequencing read from an oligo.
+   592→   592→ *
+   593→   593→ * Platform-specific error profiles:
+   594→   594→ *   - Illumina: substitution-dominant, very low indels
+   595→   595→ *   - Nanopore: indel-heavy, moderate substitutions
+   596→   596→ *   - PacBio: insertion-dominant (before CCS correction)
+   597→   597→ *
+   598→   598→ * Also generates per-base Phred quality scores:
+   599→   599→ *   - Correct base: Q30-Q40
+   600→   600→ *   - Substituted base: Q5-Q15
+   601→   601→ *   - Inserted base: Q2-Q8
+   602→   602→ *   - Deleted base: (no Q-score, base absent)
+   603→   603→ *
+   604→   604→ * @param oligo Oligo to sequence
+   605→   605→ * @param params Sequencing parameters
+   606→   606→ * @returns A single noisy read with Q-scores
+   607→   607→ */
+   608→   608→function simulateOneRead(
+   609→   609→  oligo: Oligo,
+   610→   610→  params: SequencingParams,
+   611→   611→): SequencingRead {
+   612→   612→  const original = oligo.sequence;
+   613→   613→  const resultParts: string[] = [];
+   614→   614→  const qualities: number[] = [];
+   615→   615→  let subs = 0;
+   616→   616→  let ins = 0;
+   617→   617→  let dels = 0;
+   618→   618→
+   619→   619→  // First pass: determine deletions
+   620→   620→  const survived = new Array<boolean>(original.length).fill(true);
+   621→   621→  if (params.deletionRate > 0) {
+   622→   622→    for (let i = 0; i < original.length; i++) {
+   623→   623→      if (rng.next() < params.deletionRate) {
+   624→   624→        survived[i] = false;
+   625→   625→        dels++;
+   626→   626→      }
+   627→   627→    }
+   628→   628→  }
+   629→   629→
+   630→   630→  // Second pass: walk through, apply substitutions and insertions
+   631→   631→  for (let i = 0; i < original.length; i++) {
+   632→   632→    if (!survived[i]) continue;
+   633→   633→
+   634→   634→    const origBase = original[i];
+   635→   635→    let emitBase = origBase;
+   636→   636→    let qScore: number;
+   637→   637→
+   638→   638→    // Substitution
+   639→   639→    if (rng.next() < params.substitutionRate) {
+   640→   640→      let newBase: string;
+   641→   641→      do {
+   642→   642→        newBase = BASES[rng.nextInt(4)];
+   643→   643→      } while (newBase === origBase);
+   644→   644→      emitBase = newBase;
+   645→   645→      qScore = 5 + rng.nextInt(11); // Q5-Q15
+   646→   646→      subs++;
+   647→   647→    } else {
+   648→   648→      qScore = 30 + rng.nextInt(11); // Q30-Q40
+   649→   649→    }
+   650→   650→
+   651→   651→    resultParts.push(emitBase);
+   652→   652→    qualities.push(qScore);
+   653→   653→
+   654→   654→    // Insertion after this position
+   655→   655→    if (rng.next() < params.insertionRate) {
+   656→   656→      resultParts.push(BASES[rng.nextInt(4)]);
+   657→   657→      qualities.push(2 + rng.nextInt(7)); // Q2-Q8
+   658→   658→      ins++;
+   659→   659→    }
+   660→   660→  }
+   661→   661→
+   662→   662→  // Possible insertion at the end
+   663→   663→  if (rng.next() < params.insertionRate) {
+   664→   664→    resultParts.push(BASES[rng.nextInt(4)]);
+   665→   665→    qualities.push(2 + rng.nextInt(7));
+   666→   666→    ins++;
+   667→   667→  }
+   668→   668→
+   669→   669→  return {
+   670→   670→    oligoIndex: oligo.index,
+   671→   671→    sequence: resultParts.join(""),
+   672→   672→    quality: new Uint8Array(qualities),
+   673→   673→    substitutions: subs,
+   674→   674→    insertions: ins,
+   675→   675→    deletions: dels,
+   676→   676→  };
+   677→   677→}
+   678→   678→
+   679→   679→/**
+   680→   680→ * Step 4: Simulate sequencing.
+   681→   681→ *
+   682→   682→ * Platform-specific error profiles.
+   683→   683→ * Generate reads at given coverage depth.
+   684→   684→ * Some oligos may be lost entirely (dropout).
+   685→   685→ *
+   686→   686→ * @param oligos Oligo pool after aging
+   687→   687→ * @param params Sequencing parameters
+   688→   688→ * @returns Array of sequencing reads
+   689→   689→ */
+   690→   690→export function simulateSequencing(
+   691→   691→  oligos: Oligo[],
+   692→   692→  params: SequencingParams,
+   693→   693→): SequencingRead[] {
+   694→   694→  const reads: SequencingRead[] = [];
+   695→   695→
+   696→   696→  // Group oligos by index (PCR may have created duplicates)
+   697→   697→  const byIndex = new Map<number, Oligo[]>();
+   698→   698→  for (const oligo of oligos) {
+   699→   699→    const existing = byIndex.get(oligo.index) ?? [];
+   700→   700→    existing.push(oligo);
+   701→   701→    byIndex.set(oligo.index, existing);
+   702→   702→  }
+   703→   703→
+   704→   704→  byIndex.forEach((oligoGroup, idx) => {
+   705→   705→    // Dropout: some oligos are completely lost
+   706→   706→    if (rng.next() < params.dropoutRate) {
+   707→   707→      return;
+   708→   708→    }
+   709→   709→
+   710→   710→    // Generate coverage × reads
+   711→   711→    // Pick from the available copies (PCR duplicates) randomly
+   712→   712→    const coverage = params.coverage;
+   713→   713→    for (let r = 0; r < coverage; r++) {
+   714→   714→      // Pick a random copy from the pool
+   715→   715→      const copyIdx = rng.nextInt(oligoGroup.length);
+   716→   716→      const read = simulateOneRead(oligoGroup[copyIdx], params);
+   717→   717→      reads.push(read);
+   718→   718→    }
+   719→   719→  });
+   720→   720→
+   721→   721→  return reads;
+   722→   722→}
+   723→   723→
+   724→   724→// ---------------------------------------------------------------------------
+   725→   725→// Full pipeline
+   726→   726→// ---------------------------------------------------------------------------
+   727→   727→
+   728→   728→/**
+   729→   729→ * Run the full wetlab simulation pipeline.
+   730→   730→ *
+   731→   731→ * Pipeline:
+   732→   732→ *   1. Synthesis: apply synthesis errors (position-dependent)
+   733→   733→ *   2. PCR: amplify with duplication bias and errors
+   734→   734→ *   3. Aging: apply chemical damage
+   735→   735→ *   4. Sequencing: generate reads with platform-specific errors
+   736→   736→ *
+   737→   737→ * @param oligos Original oligos from the encoder
+   738→   738→ * @param config Full wetlab configuration
+   739→   739→ * @param seed Random seed for reproducibility (0 = non-deterministic)
+   740→   740→ * @returns Sequencing reads and per-stage statistics
+   741→   741→ */
+   742→   742→export function simulateWetlab(
+   743→   743→  oligos: Oligo[],
+   744→   744→  config: WetlabConfig,
+   745→   745→  seed: number = 0,
+   746→   746→): WetlabResult {
+   747→   747→  rng = new Rng(seed || Math.floor(Math.random() * 0xffffffff));
+   748→   748→
+   749→   749→  const totalOligos = oligos.length;
+   750→   750→
+   751→   751→  // Step 1: Synthesis
+   752→   752→  const afterSynthesis = simulateSynthesis(oligos, config.synthesis);
+   753→   753→  let synthesisErrors = 0;
+   754→   754→  for (let i = 0; i < oligos.length; i++) {
+   755→   755→    // Count Hamming distance as proxy for synthesis errors
+   756→   756→    const orig = oligos[i].sequence;
+   757→   757→    const syn = afterSynthesis[i].sequence;
+   758→   758→    // For sequences of different length (indels), count length difference + substitutions
+   759→   759→    if (orig.length !== syn.length) {
+   760→   760→      synthesisErrors += Math.abs(orig.length - syn.length);
+   761→   761→    }
+   762→   762→    const minLen = Math.min(orig.length, syn.length);
+   763→   763→    for (let j = 0; j < minLen; j++) {
+   764→   764→      if (orig[j] !== syn[j]) synthesisErrors++;
+   765→   765→    }
+   766→   766→  }
+   767→   767→
+   768→   768→  // Step 2: PCR
+   769→   769→  const afterPCR = simulatePCR(afterSynthesis, config.pcr);
+   770→   770→  const pcrDuplicates = afterPCR.length - afterSynthesis.length;
+   771→   771→  // Count PCR errors: compare each new duplicate to its source
+   772→   772→  let pcrErrors = 0;
+   773→   773→  // (PCR errors are tracked inside simulatePCR; approximate here)
+   774→   774→  // A more precise count would require instrumenting pcrCycle
+   775→   775→
+   776→   776→  // Step 3: Aging
+   777→   777→  const afterAging = simulateAging(afterPCR, config.aging);
+   778→   778→  let agingDamage = 0;
+   779→   779→  for (let i = 0; i < afterPCR.length; i++) {
+   780→   780→    const before = afterPCR[i].sequence;
+   781→   781→    const after = afterAging[i].sequence;
+   782→   782→    if (before.length !== after.length) {
+   783→   783→      agingDamage += Math.abs(before.length - after.length);
+   784→   784→    }
+   785→   785→    const minLen = Math.min(before.length, after.length);
+   786→   786→    for (let j = 0; j < minLen; j++) {
+   787→   787→      if (before[j] !== after[j]) agingDamage++;
+   788→   788→    }
+   789→   789→  }
+   790→   790→
+   791→   791→  // Step 4: Sequencing
+   792→   792→  const reads = simulateSequencing(afterAging, config.sequencing);
+   793→   793→  const sequencingErrors = reads.reduce(
+   794→   794→    (sum, r) => sum + r.substitutions + r.insertions + r.deletions,
+   795→   795→    0,
+   796→   796→  );
+   797→   797→
+   798→   798→  // Count recovered oligos (oligos that have at least one read)
+   799→   799→  const readIndices = new Set(reads.map((r) => r.oligoIndex));
+   800→   800→  const recoveredOligos = readIndices.size;
+   801→   801→
+   802→   802→  return {
+   803→   803→    reads,
+   804→   804→    stats: {
+   805→   805→      synthesisErrors,
+   806→   806→      pcrDuplicates,
+   807→   807→      pcrErrors,
+   808→   808→      agingDamage,
+   809→   809→      sequencingErrors,
+   810→   810→      totalOligos,
+   811→   811→      recoveredOligos,
+   812→   812→    },
+   813→   813→  };
+   814→   814→}
+   815→   815→
+   816→   816→// ---------------------------------------------------------------------------
+   817→   817→// Utility: compute expected coverage distribution
+   818→   818→// ---------------------------------------------------------------------------
+   819→   819→
+   820→   820→/**
+   821→   821→ * Compute the expected coverage distribution for a given PCR + sequencing config.
+   822→   822→ *
+   823→   823→ * Models the PCR amplification as a branching process where each molecule
+   824→   824→ * has probability p of duplicating each cycle. After c cycles, the expected
+   825→   825→ * number of copies is (1+p)^c. Coverage = copies × (1 - dropoutRate).
+   826→   826→ *
+   827→   827→ * Also computes the coefficient of variation (CV = σ/μ) to assess
+   828→   828→ * amplification uniformity. Lower CV = more uniform coverage.
+   829→   829→ *
+   830→   830→ * @param config Wetlab configuration
+   831→   831→ * @returns Expected coverage, standard deviation, and CV
+   832→   832→ */
+   833→   833→export function expectedCoverageStats(
+   834→   834→  config: WetlabConfig,
+   835→   835→): { mean: number; std: number; cv: number } {
+   836→   836→  const p = config.pcr.duplicationProb;
+   837→   837→  const c = config.pcr.cycles;
+   838→   838→
+   839→   839→  // Expected copies after PCR: E[X] = (1 + p)^c
+   840→   840→  // Variance of a branching process: Var[X] = p(1+p)^(2c-2) × ((1+p)^c - 1) / (1 + p - 1)
+   841→   841→  // Simplified for large c: Var ≈ p × (1+p)^(2c-1)
+   842→   842→  const meanCopies = Math.pow(1 + p, c);
+   843→   843→  const variance = p * Math.pow(1 + p, 2 * c - 2) * (meanCopies - 1) / Math.max(p, 0.001);
+   844→   844→  const stdCopies = Math.sqrt(Math.max(0, variance));
+   845→   845→
+   846→   846→  // Coverage = copies × coverage_setting × (1 - dropoutRate) / totalOligos
+   847→   847→  // But coverage_setting is already per-oligo, so:
+   848→   848→  const meanCoverage = meanCopies * config.sequencing.coverage * (1 - config.sequencing.dropoutRate);
+   849→   849→  const stdCoverage = stdCopies * config.sequencing.coverage * (1 - config.sequencing.dropoutRate);
+   850→   850→
+   851→   851→  return {
+   852→   852→    mean: meanCoverage,
+   853→   853→    std: stdCoverage,
+   854→   854→    cv: meanCoverage > 0 ? stdCoverage / meanCoverage : 0,
+   855→   855→  };
+   856→   856→}
+   857→   857→

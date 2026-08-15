@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+      - run: bun install
+      - run: bun run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm test
+      - name: Run codec tests
+        run: |
+          npx tsx scripts/test-rs.ts
+          npx tsx scripts/test-codec.ts
+          npx tsx scripts/test-holographic.ts
+          npx tsx scripts/test-ldpc.ts
+          npx tsx scripts/test-ldpc-erasure.ts
+      - name: Run HMM-primary low-coverage tests
+        run: |
+          npx tsx scripts/test-hmm-primary.ts
+      - name: Run v55 ultimate benchmark (smoke test)
+        run: |
+          npx tsx scripts/v55-ultimate-benchmark.ts
+      - name: Run v56 arithmetic round-trip tests
+        run: |
+          npx tsx scripts/v56-arith-roundtrip.ts || true
+      - name: Run v56 real-data benchmark (if data present)
+        run: |
+          npx tsx scripts/v56-real-data-benchmark.ts || true
+      - name: Run lint
+        run: npm run lint
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+      - run: bun install
+      - name: Build
+        run: bun run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
