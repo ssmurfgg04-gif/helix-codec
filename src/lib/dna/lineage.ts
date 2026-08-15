@@ -226,10 +226,10 @@ export function needsMigration(archive: BioArchive): { needed: boolean; reason: 
     archive.manifest.lifecycle.migrationInterval.replace(/[^0-9]/g, ""),
   ) || 10;
 
-  if (yearsSinceCreated > migrationIntervalYears) {
+  if (yearsSinceCreation > migrationIntervalYears) {
     return {
       needed: true,
-      reason: `Archive is ${yearsSinceCreated.toFixed(1)}y old (migration interval: ${archive.manifest.lifecycle.migrationInterval})`,
+      reason: `Archive is ${yearsSinceCreation.toFixed(1)}y old (migration interval: ${archive.manifest.lifecycle.migrationInterval})`,
     };
   }
 

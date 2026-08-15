@@ -100,8 +100,9 @@ export function attentionConsensus(
 
       // Q-score weight
       let qWeight = 0.9;
-      if (reads[i].quality && pos < reads[i].quality.length) {
-        const q = reads[i].quality[pos];
+      const read = reads[i];
+      if (read?.quality && pos < read.quality.length) {
+        const q = read.quality[pos]!;
         qWeight = 1 - Math.pow(10, -q / 10);
       }
 

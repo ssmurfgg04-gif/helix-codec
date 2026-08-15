@@ -219,14 +219,15 @@ export function alignedConsensus(
       }
       if (!(base in votes)) continue;
 
+      const read = reads[row];
       let weight = 1;
-      if (useQualityWeights && reads[row].quality) {
+      if (useQualityWeights && read?.quality) {
         // Map MSA column back to read position (count non-gap chars)
         let readPos = 0;
         for (let c = 0; c < col; c++) {
           if (msa[row][c] !== GAP) readPos++;
         }
-        const q = reads[row].quality[readPos] ?? 30;
+        const q = read?.quality?.[readPos] ?? 30;
         weight = 1 - Math.pow(10, -q / 10);
         totalQ += q;
         qCount++;

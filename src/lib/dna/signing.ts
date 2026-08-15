@@ -62,7 +62,7 @@ export function signManifest(obj: unknown, privateKey: Uint8Array): string {
   const messageHash = sha256(new TextEncoder().encode(canonical));
   const signature = ed25519.sign(messageHash, privateKey);
   return Array.from(signature)
-    .map((b) => b.toString(16).padStart(2, "0"))
+    .map((b) => (b as number).toString(16).padStart(2, "0"))
     .join("");
 }
 
@@ -93,7 +93,7 @@ export function verifyManifest(
  */
 export function publicKeyToHex(pk: Uint8Array): string {
   return Array.from(pk)
-    .map((b) => b.toString(16).padStart(2, "0"))
+    .map((b) => (b as number).toString(16).padStart(2, "0"))
     .join("");
 }
 

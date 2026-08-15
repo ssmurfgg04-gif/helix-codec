@@ -2,6 +2,7 @@
   "name": "helix-codec",
   "version": "3.0.0",
   "private": true,
+  "type": "module",
   "description": "Production DNA storage codec — Reed-Solomon, LDPC, convolutional, fountain, holographic sharding, content-addressed archives, and peer-leading deterministic encoding (BHE + Gungnir + DNA-Aeon)",
   "keywords": ["dna-storage", "reed-solomon", "ldpc", "convolutional-code", "fountain-code", "nanopore", "holographic-sharding", "wasm", "content-addressed", "helix"],
   "scripts": {
@@ -15,7 +16,9 @@
     "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "bench": "node scripts/quick-bench.js",
+    "bench:full": "npx tsx scripts/bench-final.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",

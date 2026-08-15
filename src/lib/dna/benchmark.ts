@@ -9,7 +9,8 @@
  *   5. Error correction capacity demonstration (max errors corrected).
  */
 
-import { encodeFile, CodecConfig } from "./codec";
+import { encodeFile } from "./codec";
+import { CodecConfig } from "./types";
 import { decodeReads } from "./decode";
 import { simulate, MutationConfig, PRESET_ILLUMINA, PRESET_NANOPORE, PRESET_CLEAN } from "./simulate";
 import { computeLayout } from "./types";

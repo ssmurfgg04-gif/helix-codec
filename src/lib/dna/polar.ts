@@ -45,7 +45,7 @@ export const DEFAULT_POLAR_CONFIG: PolarConfig = {
 function generateInfoPositions(N: number, K: number): number[] {
   // Simple reliability sequence: use bit-reversal order
   // In practice, this would be precomputed via polarization weight
-  const positions: number[] = [];
+  const positions: { idx: number; weight: number }[] = [];
   for (let i = 0; i < N; i++) {
     // Use a simple heuristic: prefer positions with higher bit-reversal
     const reversed = reverseBits(i, Math.log2(N));

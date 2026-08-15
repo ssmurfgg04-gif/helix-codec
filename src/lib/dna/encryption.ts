@@ -87,7 +87,7 @@ export function deriveKey(password: string, salt: Uint8Array): Uint8Array {
 export function computeKeyId(key: Uint8Array): string {
   const hash = sha256(key);
   return Array.from(hash.slice(0, 16))
-    .map((b) => b.toString(16).padStart(2, "0"))
+    .map((b) => (b as number).toString(16).padStart(2, "0"))
     .join("");
 }
 

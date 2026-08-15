@@ -235,8 +235,8 @@ export function generateDnaPool(
     const j = Math.floor(Math.random() * (i + 1));
     [strands[i], strands[j]] = [strands[j], strands[i]];
     // Swap file map entries too
-    const tmp = fileMap.get(i);
-    fileMap.set(i, fileMap.get(j));
+    const tmp = fileMap.get(i) ?? '';
+    fileMap.set(i, fileMap.get(j) ?? '');
     fileMap.set(j, tmp);
   }
 

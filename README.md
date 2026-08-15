@@ -90,6 +90,24 @@ Reads → cluster → HMM-Viterbi → conv-Viterbi → LDPC → outer RS → dec
 
 > **All numbers below are from in-simulation testing using dt4dds parametric models, not physical wetlab validation.** Real-world performance depends on synthesis provider, sequencing chemistry, and sample preparation.
 
+### Quick Benchmark (v3.0, Node.js 24, single core)
+
+| Module | Operation | Time/op | Throughput |
+|--------|-----------|---------|------------|
+| P0 BHE FSM | Encode 256B | 0.074 ms | ~3.4 MB/s |
+| P1 Gungnir | Encode 200nt | 0.012 ms | ~16.7 MB/s |
+| P1 Gungnir | Decode (0 errors) | 0.005 ms | ~40 MB/s |
+| P1 Gungnir | Decode (1 error) | 0.371 ms | ~0.5 MB/s |
+| P3 DNA-Aeon | Encode 128B | 0.055 ms | ~2.3 MB/s |
+| P4 dt4dds | Synthesis 200nt | 0.017 ms | ~11.8 MB/s |
+| P4 dt4dds | PCR 50 oligos | 0.152 ms | — |
+| P6 YYC | Encode 128B | 0.012 ms | ~10.7 MB/s |
+| P6 YYC | Decode 512nt | 0.038 ms | ~13.5 MB/s |
+| RLL+GC | Encode 256B | 0.027 ms | ~9.5 MB/s |
+| .hlx Archive | Write header | 0.001 ms | — |
+| .hlx Archive | O(1) seek | 0.000 ms | — |
+| BLAKE3 Addr | Derive address | 0.003 ms | ~66 MB/s |
+
 ### Illumina Channel
 
 | Metric | Value | Notes |
@@ -126,24 +144,36 @@ Reads → cluster → HMM-Viterbi → conv-Viterbi → LDPC → outer RS → dec
 
 ---
 
-## Peer Comparison (Honest Audit)
+## Peer Comparison (Honest Audit, Updated 2026)
 
-| Feature | Helix v3.0 | Microsoft BHE | Gungnir | DNA-Aeon | dt4dds | ADS Codex |
-|---------|-----------|---------------|---------|----------|--------|-----------|
-| Constraint encoding | ✅ FSM + seed-retry | ✅ FSM (origin) | — | — | — | — |
-| Single-read recovery | ✅ Gungnir mode | — | ✅ (origin) | — | — | — |
-| Arithmetic inner code | ✅ DNA-Aeon mode | — | — | ✅ (origin) | — | — |
-| Parametric simulation | ✅ dt4dds model | — | — | — | ✅ (origin) | — |
-| Density optimization | ✅ ADS tuning | — | — | — | — | ✅ (origin) |
-| GF(2^16) outer RS | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| LDPC inner code | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Encryption | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Web API | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| TypeScript/Node.js | ✅ | C++ | Python | Python | Python | Python |
-| Streaming archive | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Holographic sharding | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Feature | Helix v3.0 | Microsoft BHE | Gungnir | DNA-Aeon | dt4dds | ADS Codex | DNA-MGC+ |
+|---------|-----------|---------------|---------|----------|--------|-----------|----------|
+| Constraint encoding | ✅ FSM + seed-retry | ✅ FSM (origin) | — | — | — | — | — |
+| Single-read recovery | ✅ Gungnir mode | — | ✅ (origin) | — | — | — | ✅ (improved) |
+| Arithmetic inner code | ✅ DNA-Aeon mode | — | — | ✅ (origin) | — | — | — |
+| Parametric simulation | ✅ dt4dds model | — | — | — | ✅ (origin) | — | ✅ |
+| Density optimization | ✅ ADS tuning | — | — | — | — | ✅ (origin) | — |
+| GF(2^16) outer RS | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| LDPC inner code | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Encryption | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Web API | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| TypeScript/Node.js | ✅ | C++ | Python | Python | Python | Python | — |
+| Streaming archive | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Holographic sharding | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 **Verdict**: Helix has the best **feature breadth**. Peers lead in specific depth — Helix now integrates all their best ideas. Individual peers may outperform Helix in their specialty (e.g., ADS Codex achieves 0.99 bits/nt with LUT acceleration; BHE FSM is faster in C++), but no single peer matches Helix's coverage of the full DNA storage pipeline.
+
+### Latest Research Advances (2024–2026)
+
+| Area | Latest | Impact on Helix | Priority |
+|------|--------|-----------------|----------|
+| Single-read recovery | **DNA-MGC+** (Khabbaz, arXiv:2603.14527, 2026) | Multi-metric gains over Gungnir | **High** |
+| Density ceiling | **Banal-Schilling** (arXiv:2604.20810, 2026) — 155.8 EB/g | Soft-info approach for >0.99 bits/nt | **High** |
+| Indel correction | **Half-Marker Codes** (Haghighat & Duman, 2025) | 50% sync overhead reduction | **High** |
+| IDS polar codes | **DNA-BP** (Zhang, 2025) | Joint IDS + GC constraint correction | Medium |
+| Simulation | **DDS-E-Sim** (NeurIPS 2025) | Learned error distributions | Medium |
+| Homopolymer encoding | **Improved HF Encoding** (Hojatizadeh, 2025) | +2.14% compression | Low |
+| YYC rule discovery | **Transformer+RL** (Liu, 2026) | Learned rule matrices | Low |
 
 ---
 
@@ -243,6 +273,8 @@ const innerParity = optimalInnerParity("nanopore", 150);    // 6
 | No GPU/FPGA acceleration | Decode throughput limited by CPU | SIMD + WASM provide 10–50× over pure JS | Future work |
 | Archive compaction not implemented | LSM journal grows without bound | Architecture defined, code pending | Phase 4 |
 | Python SDK not yet available | CLI-only for Python users | REST API available, native SDK planned | Future work |
+| DNA-MGC+ not yet integrated | Gungnir is best available single-read codec | DNA-MGC+ outperforms on DT4DDS (2026) | Planned |
+| Soft-info decoding not implemented | Density ceiling at ~1.82 bits/nt | Banal-Schilling 2026 approach for >0.99 | Research |
 
 > **Bottom line**: Helix v3.0 is the most feature-complete open-source DNA storage codec, but it has not been validated in a physical wetlab. Illumina-channel performance is strong in simulation. Nanopore at >9% IDS remains a hard open problem that the community is still solving.
 
@@ -311,6 +343,13 @@ await writeHlxArchive(encoded, "output.hlx");
 const restored = await readHlxArchive("output.hlx");
 ```
 
+### Benchmark
+
+```bash
+npm run bench        # Quick benchmark (all P0-P6 modules)
+npm run bench:full   # Full benchmark suite (TS, needs tsx)
+```
+
 ---
 
 ## Installation & Usage
@@ -349,7 +388,32 @@ console.log(`Decoded: ${Buffer.from(decoded).toString()}`);
 npm test              # Run vitest suite
 npm run test:watch    # Watch mode
 npm run test:coverage # Coverage report
+npm run bench         # Quick benchmark
 ```
+
+---
+
+## Module Inventory (99 source files, ~39K lines)
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `bhe-encode.ts` | 711 | P0: Microsoft BHE FSM deterministic encoding |
+| `gungnir.ts` | 724 | P1: Hash-based single-read recovery |
+| `dna-aeon.ts` | 785 | P3: Arithmetic coding + CRC sync markers |
+| `yinyang.ts` | 489 | P6: Yin-Yang high-density coding |
+| `ads-density.ts` | 314 | P5: Adaptive density tuning (ADS Codex) |
+| `dt4dds-simulate.ts` | 856 | P4: Parametric wetlab simulation |
+| `constraints.ts` | 560 | RLL + GC rotating codebooks |
+| `compress.ts` | 437 | Tiered compression router |
+| `addressing.ts` | 758 | BLAKE3 content-derived addressing |
+| `stream.ts` | 269 | Streaming encode/decode |
+| `lsm-journal.ts` | 503 | LAB-DB LSM-tree journal |
+| `archive.ts` | 603 | .hlx binary archive format |
+| `codec.ts` | 1383 | Main encode pipeline |
+| `decode.ts` | 2269 | Strategy cascade decode engine |
+| `types.ts` | 751 | Core types, configs, channel presets |
+| `pack.ts` | 366 | 2-bit pack, Hamming, rolling hash |
+| + 83 more | — | LDPC, convolutional, RS, fountain, holographic, etc. |
 
 ---
 
@@ -377,11 +441,16 @@ npm run test:coverage # Coverage report
 3. Goldman et al. — *Towards practical, high-capacity DNA data storage*, Nature (2013)
 4. HEDGES — *DNA error correction for next-generation sequencing*, Bioinformatics (2020)
 5. Press et al. — *Holographic DNA data storage*, Physical Review Letters (2020)
-6. Völkel et al. — *DNA-Aeon: resilient arithmetic coding for DNA storage*, Bioinformatics (2025)
+6. Welzel et al. — *DNA-Aeon: resilient arithmetic coding for DNA storage*, Nature Comms (2023)
 7. Preuss et al. — *Real-world Nanopore DNA storage*, Nature Scientific Reports (2026)
-8. LANL ADS Codex — *Adaptive density system for DNA storage* (2024)
+8. LANL ADS Codex — *Adaptive density system for DNA storage* (2021)
 9. Yi Ding et al. — *SOTA DNA storage density*, 2024
 10. Microsoft BHE — *Balanced Homopolymer Elimination FSM*, 2023
+11. Khabbaz et al. — *DNA-MGC+ versatile codec*, arXiv:2603.14527 (2026)
+12. Banal-Schilling — *DNA storage approaching info-theoretic ceiling*, arXiv:2604.20810 (2026)
+13. Haghighat & Duman — *Half-Marker Codes for DNA*, IEEE Trans. Comms. (2025)
+14. Zhang et al. — *DNA-BP: GC-Balanced Polar Codes*, Briefings in Bioinformatics (2025)
+15. Gimpel et al. — *Comparison of SOTA ECC for DNA storage*, Nature Comms (2026)
 
 ---
 
