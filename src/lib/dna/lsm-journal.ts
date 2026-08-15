@@ -46,6 +46,16 @@ export interface LsmJournalOptions {
   maxL1Runs?: number;
 }
 
+/** Result of an L1→L2 compaction. */
+export interface CompactionResult {
+  /** Total entries that were merged across all L1 runs + existing L2. */
+  entriesMerged: number;
+  /** Entries removed due to tombstones or deduplication. */
+  entriesDeleted: number;
+  /** Number of L1 runs that were compacted. */
+  runsCompacted: number;
+}
+
 /** A batch of mutations ready for synthesis (DNA oligo production). */
 export interface SynthesisBatch {
   /** Unique batch ID. */
@@ -94,6 +104,9 @@ const DEFAULT_COMPACTION_TRIGGER = 0.75;
 
 /** Default max L1 sorted runs before L1→L2 compaction. */
 const DEFAULT_MAX_L1_RUNS = 4;
+
+/** Sentinel value for tombstone entries (delete markers). Valid bases are 0-3. */
+export const TOMBSTONE = 0xFF;
 
 /** Size of a serialized journal entry in bytes: 4 + 4 + 1 + 8 = 17 bytes (padded to 16 with packing). */
 const ENTRY_SERIALIZED_SIZE = 16;
@@ -219,6 +232,26 @@ export class LsmJournal {
   }
 
   // -------------------------------------------------------------------------
+  // Delete (tombstone)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mark a key as deleted by appending a tombstone entry.
+   * Tombstones are resolved during L1→L2 compaction.
+   *
+   * @param blockId    Block ID to delete.
+   * @param bitOffset  Bit offset within the block.
+   */
+  delete(blockId: number, bitOffset: number): void {
+    this.append({
+      blockId,
+      bitOffset,
+      newBase: TOMBSTONE,
+      timestamp: Date.now(),
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Flush (L0 → L1 compaction)
   // -------------------------------------------------------------------------
 
@@ -274,7 +307,8 @@ export class LsmJournal {
     for (let i = this.l0.length - 1; i >= 0; i--) {
       const e = this.l0[i];
       if (e.blockId === blockId && e.bitOffset === bitOffset) {
-        return e.newBase;
+        // Tombstone means deleted — stop searching lower levels.
+        return e.newBase === TOMBSTONE ? undefined : e.newBase;
       }
     }
 
@@ -282,7 +316,7 @@ export class LsmJournal {
     for (let i = this.l1Runs.length - 1; i >= 0; i--) {
       const entry = this.l1Runs[i].get(blockId, bitOffset);
       if (entry !== undefined) {
-        return entry.newBase;
+        return entry.newBase === TOMBSTONE ? undefined : entry.newBase;
       }
     }
 
@@ -290,7 +324,7 @@ export class LsmJournal {
     if (this.l2 !== null) {
       const entry = this.l2.get(blockId, bitOffset);
       if (entry !== undefined) {
-        return entry.newBase;
+        return entry.newBase === TOMBSTONE ? undefined : entry.newBase;
       }
     }
 
@@ -310,14 +344,19 @@ export class LsmJournal {
   getSynthesisQueue(): SynthesisBatch[] {
     const batches: SynthesisBatch[] = [];
 
-    // Group L0 entries into batches (all pending mutations need synthesis).
-    if (this.l0.length === 0) {
+    // Collect all pending mutations: L0 buffer + L1 runs not yet compacted to L2.
+    const pending: JournalEntry[] = [...this.l0];
+    for (const run of this.l1Runs) {
+      pending.push(...run.entries);
+    }
+
+    if (pending.length === 0) {
       return batches;
     }
 
     // Create batches grouped by blockId (each block maps to one or more oligos).
     const byBlock = new Map<number, JournalEntry[]>();
-    for (const entry of this.l0) {
+    for (const entry of pending) {
       let list = byBlock.get(entry.blockId);
       if (!list) {
         list = [];
@@ -348,34 +387,69 @@ export class LsmJournal {
 
   /**
    * Trigger L1→L2 compaction during low-traffic window.
-   * Merges all L1 sorted runs into a single L2 run.
-   * After compaction, L1 is empty and L2 contains all historical entries.
+   * Merges all L1 sorted runs into a single L2 run:
+   *   1. Collect all entries from L1 runs + existing L2
+   *   2. Deduplicate by (blockId, bitOffset) — keep only the latest (highest timestamp)
+   *   3. Remove tombstoned entries (delete markers) entirely
+   *   4. Sort result by (blockId, bitOffset)
+   *   5. Replace L1 runs with the merged L2 run
+   *
+   * @returns Compaction statistics.
    */
-  compact(): void {
+  compact(): CompactionResult {
+    const runsCompacted = this.l1Runs.length;
+
     if (this.l1Runs.length === 0 && this.l2 === null) {
-      return;
+      return { entriesMerged: 0, entriesDeleted: 0, runsCompacted: 0 };
     }
 
-    // Merge all L1 runs and existing L2 into a new L2.
-    const merged = new SortedRun();
-
-    // Insert all L2 entries first (oldest).
+    // Step 1: Collect all entries from L1 runs + existing L2.
+    const allEntries: JournalEntry[] = [];
     if (this.l2 !== null) {
-      for (const entry of this.l2.entries) {
-        merged.insert(entry);
+      allEntries.push(...this.l2.entries);
+    }
+    for (const run of this.l1Runs) {
+      allEntries.push(...run.entries);
+    }
+
+    const entriesMerged = allEntries.length;
+
+    // Step 2: Deduplicate by (blockId, bitOffset) — keep only the latest timestamp.
+    // We use a map keyed by "blockId:bitOffset" to pick the newest entry per key.
+    const latestByKey = new Map<string, JournalEntry>();
+    for (const entry of allEntries) {
+      const key = `${entry.blockId}:${entry.bitOffset}`;
+      const existing = latestByKey.get(key);
+      if (!existing || entry.timestamp > existing.timestamp) {
+        latestByKey.set(key, entry);
       }
     }
 
-    // Insert all L1 entries (newer, overwrites older L2 entries via last-write-wins).
-    for (const run of this.l1Runs) {
-      for (const entry of run.entries) {
-        merged.insert(entry);
+    // Step 3: Remove tombstoned entries (delete markers) entirely.
+    let entriesDeleted = 0;
+    const surviving: JournalEntry[] = [];
+    for (const entry of latestByKey.values()) {
+      if (entry.newBase === TOMBSTONE) {
+        entriesDeleted++;
+      } else {
+        surviving.push(entry);
       }
+    }
+
+    // Step 4: Sort surviving entries by (blockId, bitOffset).
+    surviving.sort((a, b) => a.blockId - b.blockId || a.bitOffset - b.bitOffset);
+
+    // Step 5: Build new L2 sorted run and replace L1 runs.
+    const merged = new SortedRun();
+    for (const entry of surviving) {
+      merged.insert(entry);
     }
 
     this.l2 = merged;
     this.l1Runs = [];
     this.l2CompactionCount++;
+
+    return { entriesMerged, entriesDeleted, runsCompacted };
   }
 
   // -------------------------------------------------------------------------

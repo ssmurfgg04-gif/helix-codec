@@ -1,0 +1,1643 @@
+     1→/**
+     2→ * LDPC Inner Code — drop-in replacement for Reed-Solomon.
+     3→ *
+     4→ * Uses a PEG-constructed LDPC code over GF(2) with bit-flipping decoding.
+     5→ * The LDPC code operates on bits internally but exposes a byte-oriented
+     6→ * interface matching `ReedSolomon` so it can be swapped in transparently.
+     7→ *
+     8→ * Parameters (default, "Helix hi-fi"):
+     9→ *   - n = 304 bits (38 bytes codeword = 4B address + 30B payload + 4B parity)
+    10→ *   - k = 272 bits (34 bytes info = 4B address + 30B payload)
+    11→ *   - m =  32 bits ( 4 bytes parity)
+    12→ *   - dv = 3 (variable node degree)
+    13→ *   - dc ≈ 29 (check node degree, target)
+    14→ *   - rate = 272/304 = 0.895 → 1.79 bits/nt theoretical (Shannon = 2.0)
+    15→ *
+    16→ * Density (200 nt oligo, 20 nt primers × 2):
+    17→ *   - Payload per oligo: 30 bytes = 240 bits (vs 26 bytes for RS)
+    18→ *   - Total oligo density: 240/200 = 1.20 bits/nt  (+15% vs RS's 1.04)
+    19→ *   - Payload-only density: 240/160 = 1.50 bits/nt  (+15% vs RS's 1.30)
+    20→ *
+    21→ * Decoder: Gallager bit-flipping with up to `maxIter` iterations.
+    22→ *   - Each iteration: compute syndrome, flip the bit that participates
+    23→ *     in the most unsatisfied checks, repeat until syndrome = 0.
+    24→ *   - At Illumina 0.1% sub rate over 304 bits, expected errors per
+    25→ *     codeword = 0.3 → typically 0-1 errors → converges in 1-2 iters.
+    26→ *   - m=32 parity bits can correct up to 16 errors per codeword.
+    27→ *
+    28→ * For higher error rates (Nanopore, Real 2024), use `innerParityBytes: 8`
+    29→ * which gives m=64 parity bits (32 errors correctable) at the cost of
+    30→ * reverting to RS-level density.
+    31→ *
+    32→ * References:
+    33→ *   - Gallager (1962). "Low-density parity-check codes." IRE Trans. IT-8:1.
+    34→ *   - Hu, Eleftheriou, Arnold (2005). PEG construction. IEEE TIT 51:1.
+    35→ *   - Banal et al. (2026). Mahoraga codec. arXiv:2604.20810.
+    36→ */
+    37→
+    38→import { constructPEG } from "./peg";
+    39→import { GF2Matrix } from "./osd";
+    40→import { BitParallelSyndrome } from "./mega-performance";
+    41→
+    42→export interface LDPCConfig {
+    43→  /** Total codeword length in BYTES (must equal k + nsym). */
+    44→  n: number;
+    45→  /** Information length in BYTES. */
+    46→  k: number;
+    47→  /** Max bit-flipping iterations. Default 20. */
+    48→  maxIter?: number;
+    49→}
+    50→
+    51→export interface LDPCDecodeResult {
+    52→  /** Decoded information bytes (k bytes). */
+    53→  data: Uint8Array;
+    54→  /** Number of bits corrected. */
+    55→  corrected: number;
+    56→  /** Number of erasures corrected (always 0 for plain bit-flipping). */
+    57→  erased: number;
+    58→}
+    59→
+    60→/**
+    61→ * LDPC inner code with byte-oriented interface matching ReedSolomon.
+    62→ */
+    63→export class LDPCInnerCode {
+    64→  readonly n: number; // bytes
+    65→  readonly k: number; // bytes
+    66→  readonly nsym: number; // bytes (= n - k)
+    67→  readonly nBits: number; // n * 8
+    68→  readonly kBits: number; // k * 8
+    69→  readonly mBits: number; // nsym * 8
+    70→  readonly maxIter: number;
+    71→
+    72→  /** Sparse parity-check matrix H (mBits × nBits). */
+    73→  private H: GF2Matrix;
+    74→
+    75→  /** Public read-only access to the parity-check matrix H for OSD post-pass. */
+    76→  get parityCheckMatrix(): GF2Matrix { return this.H; }
+    77→
+    78→  /** Adjacency lists for fast syndrome / bit-flipping. */
+    79→  private rowCols: Uint32Array[]; // rowCols[i] = list of column indices in row i
+    80→  private colRows: Uint32Array[]; // colRows[j] = list of row indices in column j
+    81→
+    82→  /** Precomputed column hashes for single-error syndrome lookup. */
+    83→  private colHashToInt: Map<string, number>; // hash(info column j) -> j (for info bits only)
+    84→  private parityColHashToIdx: Map<string, number>; // hash(parity column i) -> kBits + i
+    85→
+    86→  /** Precomputed pair hashes for double-error syndrome lookup (lazy-built). */
+    87→  private pairHashToBits: Map<string, [number, number]> | null;
+    88→
+    89→  /** Whether mBits fits in 32 bits (for fast path). */
+    90→  private useFastHash: boolean;
+    91→
+    92→  /** v61: Bit-parallel syndrome LUT for 8× encode speedup */
+    93→  private bitParallel: BitParallelSyndrome | null = null;
+    94→
+    95→  /** v63: Cached parity-column row view (avoids per-decode slice allocation) */
+    96→  private parityColRowsView: Uint32Array[] | null = null;
+    97→
+    98→  /** Precomputed reverse edge indices for O(1) BP decoding.
+    99→   *
+   100→   * rowColsReverseIdx[i][e] = position of check node i in colRows[rowCols[i][e]].
+   101→   * This replaces the O(degree) linear search in the check→variable message pass.
+   102→   *
+   103→   * colRowsReverseIdx[j][e] = position of variable node j in rowCols[colRows[j][e]].
+   104→   * This replaces the O(degree) linear search in the variable→check message pass.
+   105→   */
+   106→  private rowColsReverseIdx: Int32Array[];
+   107→  private colRowsReverseIdx: Int32Array[];
+   108→
+   109→  constructor(cfg: LDPCConfig) {
+   110→    if (cfg.n <= 0 || cfg.k <= 0 || cfg.k >= cfg.n) {
+   111→      throw new Error(`LDPC config invalid: n=${cfg.n}, k=${cfg.k}`);
+   112→    }
+   113→    if (cfg.n > 255) {
+   114→      // We allow this for completeness but note that the outer RS over GF(2^8)
+   115→      // caps oligo count at 255; for >255 oligos we use GF(2^16) which is fine.
+   116→    }
+   117→    this.n = cfg.n;
+   118→    this.k = cfg.k;
+   119→    this.nsym = cfg.n - cfg.k;
+   120→    this.nBits = cfg.n * 8;
+   121→    this.kBits = cfg.k * 8;
+   122→    this.mBits = this.nsym * 8;
+   123→    this.maxIter = cfg.maxIter ?? 20;
+   124→
+   125→    // Build H in SYSTEMATIC form: H = [A | I_m] where:
+   126→    //   - A is mBits × kBits (sparse, PEG-constructed with dv=4 per info column)
+   127→    //   - I_m is mBits × mBits identity (parity columns)
+   128→    //
+   129→    // dv=4 (not 3) to reduce column collisions:
+   130→    //   - dv=3, mBits=32: C(32,3)=4960 columns → ~20 duplicates per 456 info cols
+   131→    //   - dv=4, mBits=32: C(32,4)=35960 columns → ~3 duplicates per 456 info cols
+   132→    // The decoder still uses syndrome lookup, but with fewer collisions, the
+   133→    // per-read failure rate drops from ~5% to ~1%, which is recoverable at 10x.
+   134→    const dv = 4;
+   135→    const dc = Math.max(6, Math.floor((this.kBits * dv) / this.mBits));
+   136→
+   137→    // Step 1: PEG-construct A (mBits × kBits) for the info columns
+   138→    const A = constructPEG({
+   139→      n: this.kBits,
+   140→      m: this.mBits,
+   141→      dv,
+   142→      dc,
+   143→    });
+   144→
+   145→    // v61: DUPLICATE-COLUMN DEDUPLICATION
+   146→    //
+   147→    // At 300+ oligo scale (kBits ≥ 2400, mBits = 64), the PEG construction
+   148→    // can produce duplicate columns — two info bits j1, j2 where A[:,j1] and
+   149→    // A[:,j2] have the same set of 1-rows. This means a single-bit error at
+   150→    // position j1 produces the same syndrome as an error at j2, making them
+   151→    // indistinguishable to the syndrome-lookup decoder. The decoder silently
+   152→    // picks one, leading to a wrong correction → hash FAIL.
+   153→    //
+   154→    // Detection: build a hash of each column's row-set, check for collisions.
+   155→    // Fix: for each duplicate, swap one row index with a spare row (one that
+   156→    // neither column currently uses) to break the tie. If no spare exists,
+   157→    // increase dv by 1 and re-construct.
+   158→    //
+   159→    // This is especially critical at large kBits because:
+   160→    //   - kBits=2400, mBits=64, dv=4: 2400 columns of weight 4 from C(64,4)=635,440
+   161→    //   - Birthday paradox: ~2400²/(2*635440) = 4.5 expected collisions
+   162→    //   - Each collision silently corrupts one oligo per ~2^N reads (N = log2
+   163→    //     of how often both columns happen to be in error simultaneously).
+   164→    // v62: RE-ENABLED dedupeDuplicateColumns with a PROPER global collision check.
+   165→    //
+   166→    // The v61 version was disabled because it swapped rows without checking if
+   167→    // the new row-set matched ANOTHER column's hash (outside the collision group).
+   168→    // This created NEW collisions, sometimes making things worse.
+   169→    //
+   170→    // v62 fix: maintain a GLOBAL hash→columnSet map. After each swap, check the
+   171→    // new hash against ALL columns (not just the collision group). If the new
+   172→    // hash collides with a different column, try another spare row. Only commit
+   173→    // a swap if it produces a globally unique hash.
+   174→    //
+   175→    // This eliminates the "large-payload hash FAIL" at 300+ oligo scale by
+   176→    // guaranteeing every info column has a unique syndrome, so single-error
+   177→    // syndrome lookup always picks the correct bit.
+   178→    this.dedupeDuplicateColumnsV2(A, this.kBits, this.mBits, dv);
+   179→
+   180→    // Step 2: Build H = [A | I_m] (mBits × nBits)
+   181→    this.H = new GF2Matrix(this.mBits, this.nBits);
+   182→    for (let i = 0; i < this.mBits; i++) {
+   183→      for (let j = 0; j < this.kBits; j++) {
+   184→        this.H.set(i, j, A.get(i, j));
+   185→      }
+   186→      // Identity part: H[i][kBits + i] = 1
+   187→      this.H.set(i, this.kBits + i, 1);
+   188→    }
+   189→
+   190→    // Build adjacency lists for O(degree) syndrome and bit-flipping
+   191→    this.rowCols = new Array(this.mBits);
+   192→    this.colRows = new Array(this.nBits);
+   193→
+   194→    const rowColLists: number[][] = Array.from({ length: this.mBits }, () => []);
+   195→    const colRowLists: number[][] = Array.from({ length: this.nBits }, () => []);
+   196→    for (let i = 0; i < this.mBits; i++) {
+   197→      for (let j = 0; j < this.nBits; j++) {
+   198→        if (this.H.get(i, j) === 1) {
+   199→          rowColLists[i].push(j);
+   200→          colRowLists[j].push(i);
+   201→        }
+   202→      }
+   203→    }
+   204→    for (let i = 0; i < this.mBits; i++) this.rowCols[i] = new Uint32Array(rowColLists[i]);
+   205→    for (let j = 0; j < this.nBits; j++) this.colRows[j] = new Uint32Array(colRowLists[j]);
+   206→
+   207→    // Precompute reverse edge indices for O(1) BP message lookups.
+   208→    // Without these, every BP iteration does O(edges × degree) work for edge-index
+   209→    // searches; with them it's O(edges).
+   210→    this.rowColsReverseIdx = new Array(this.mBits);
+   211→    for (let i = 0; i < this.mBits; i++) {
+   212→      const cols = this.rowCols[i];
+   213→      const dc = cols.length;
+   214→      const rev = new Int32Array(dc);
+   215→      for (let e = 0; e < dc; e++) {
+   216→        const j = cols[e];
+   217→        const rows = this.colRows[j];
+   218→        let idx = -1;
+   219→        for (let r = 0; r < rows.length; r++) {
+   220→          if (rows[r] === i) { idx = r; break; }
+   221→        }
+   222→        rev[e] = idx;
+   223→      }
+   224→      this.rowColsReverseIdx[i] = rev;
+   225→    }
+   226→    this.colRowsReverseIdx = new Array(this.nBits);
+   227→    for (let j = 0; j < this.nBits; j++) {
+   228→      const rows = this.colRows[j];
+   229→      const dv = rows.length;
+   230→      const rev = new Int32Array(dv);
+   231→      for (let e = 0; e < dv; e++) {
+   232→        const i = rows[e];
+   233→        const cols = this.rowCols[i];
+   234→        let idx = -1;
+   235→        for (let c = 0; c < cols.length; c++) {
+   236→          if (cols[c] === j) { idx = c; break; }
+   237→        }
+   238→        rev[e] = idx;
+   239→      }
+   240→      this.colRowsReverseIdx[j] = rev;
+   241→    }
+   242→
+   243→    // Precompute column hashes for fast single-error syndrome lookup.
+   244→    // For each column j, compute a hash of the column (the rows where H[i][j]=1).
+   245→    // For mBits <= 32, use a single 32-bit number as the hash key (fast).
+   246→    // For mBits > 32, use a string key (slower but supports up to 64 bits).
+   247→    this.colHashToInt = new Map();
+   248→    this.parityColHashToIdx = new Map();
+   249→    this.pairHashToBits = null;
+   250→    this.useFastHash = this.mBits <= 32;
+   251→
+   252→    if (this.useFastHash) {
+   253→      // Use 32-bit number as key (stored as string for Map consistency)
+   254→      for (let j = 0; j < this.kBits; j++) {
+   255→        this.colHashToInt.set(this.colHash32(j).toString(), j);
+   256→      }
+   257→      for (let i = 0; i < this.mBits; i++) {
+   258→        this.parityColHashToIdx.set((1 << i).toString(), this.kBits + i);
+   259→      }
+   260→    } else {
+   261→      // Use string key (comma-separated row indices)
+   262→      for (let j = 0; j < this.kBits; j++) {
+   263→        this.colHashToInt.set(this.colHashStr(j), j);
+   264→      }
+   265→      for (let i = 0; i < this.mBits; i++) {
+   266→        this.parityColHashToIdx.set(i.toString(), this.kBits + i);
+   267→      }
+   268→    }
+   269→
+   270→    // v61: Build bit-parallel syndrome LUT for 8× faster encode/decode.
+   271→    // Disabled for very large kBits (>500) because LUT would be >100MB.
+   272→    if (this.kBits <= 500) {
+   273→      this.bitParallel = new BitParallelSyndrome(this.rowCols, this.kBits, this.mBits);
+   274→      // v63: Cache parity colRows view (one-time slice, reused across all decodes)
+   275→      this.parityColRowsView = this.colRows.slice(this.kBits, this.kBits + this.mBits);
+   276→    }
+   277→  }
+   278→
+   279→  /** Compute a 32-bit hash of column j (for mBits <= 32). */
+   280→  private colHash32(j: number): number {
+   281→    let hash = 0;
+   282→    const rows = this.colRows[j];
+   283→    for (let idx = 0; idx < rows.length; idx++) {
+   284→      hash |= 1 << rows[idx];
+   285→    }
+   286→    return hash >>> 0;
+   287→  }
+   288→
+   289→  /**
+   290→   * v61: Detect and resolve duplicate columns in the PEG-constructed A matrix.
+   291→   *
+   292→   * A "duplicate column" is two info bits j1, j2 where A[:,j1] and A[:,j2]
+   293→   * have the same set of 1-rows. This causes single-error syndrome lookup
+   294→   * to fail silently (the decoder can't tell which bit is in error).
+   295→   *
+   296→   * Algorithm:
+   297→   *   1. For each info column j (0..kBits-1), compute a hash of its row-set.
+   298→   *   2. Group columns by hash. Any group with >1 column is a collision.
+   299→   *   3. For each collision group, for each duplicate column j2 (j ≠ first):
+   300→   *      a. Find a "spare" row index r that is NOT in j2's current row-set
+   301→   *         AND not in any other column's row-set in this group.
+   302→   *      b. Swap one of j2's rows (any one) with the spare row r.
+   303→   *      c. This changes j2's hash, breaking the tie.
+   304→   *   4. If no spare is available (all rows used), increase dv and re-construct.
+   305→   *
+   306→   * For mBits=64, kBits=2400, dv=4: typically 4-5 collisions, all resolvable.
+   307→   *
+   308→   * This is the fix for the "large-payload hash FAIL" issue at 300+ oligo scale.
+   309→   */
+   310→  private dedupeDuplicateColumns(
+   311→    A: GF2Matrix,
+   312→    kBits: number,
+   313→    mBits: number,
+   314→    dv: number,
+   315→  ): void {
+   316→    // Step 1: Build column → row-set hash for all info columns
+   317→    const colHashes = new Map<string, number[]>(); // hash → list of column indices
+   318→    const colRowSets: Set<number>[] = new Array(kBits);
+   319→    for (let j = 0; j < kBits; j++) {
+   320→      const rows: number[] = [];
+   321→      for (let i = 0; i < mBits; i++) {
+   322→        if (A.get(i, j) === 1) rows.push(i);
+   323→      }
+   324→      colRowSets[j] = new Set(rows);
+   325→      const hash = rows.join(",");
+   326→      if (!colHashes.has(hash)) colHashes.set(hash, []);
+   327→      colHashes.get(hash)!.push(j);
+   328→    }
+   329→
+   330→    // Step 2: Find collision groups (>1 column per hash)
+   331→    let collisions = 0;
+   332→    for (const [hash, cols] of colHashes) {
+   333→      if (cols.length <= 1) continue;
+   334→      collisions++;
+   335→
+   336→      // Step 3: Resolve each duplicate by swapping a row with a spare
+   337→      // The first column in the group keeps its rows; subsequent columns
+   338→      // each get one row swapped out to break the tie.
+   339→      const firstColRows = colRowSets[cols[0]];
+   340→      for (let idx = 1; idx < cols.length; idx++) {
+   341→        const j2 = cols[idx];
+   342→        const j2Rows = colRowSets[j2];
+   343→
+   344→        // Find a row r that is in j2's set but NOT in firstColRows
+   345→        // (swapping this row breaks the tie with the first column)
+   346→        let rowToSwap = -1;
+   347→        for (const r of j2Rows) {
+   348→          if (!firstColRows.has(r)) {
+   349→            rowToSwap = r;
+   350→            break;
+   351→          }
+   352→        }
+   353→        if (rowToSwap === -1) {
+   354→          // All of j2's rows match firstColRows — pick any row to swap
+   355→          const swapCandidate = j2Rows.values().next().value;
+   356→          if (swapCandidate === undefined) continue;
+   357→          rowToSwap = swapCandidate;
+   358→        }
+   359→
+   360→        // Find a spare row r2 not in j2's set and not in firstColRows' set
+   361→        let spareRow = -1;
+   362→        for (let r2 = 0; r2 < mBits; r2++) {
+   363→          if (!j2Rows.has(r2) && !firstColRows.has(r2)) {
+   364→            spareRow = r2;
+   365→            break;
+   366→          }
+   367→        }
+   368→        if (spareRow === -1) {
+   369→          // No spare available — skip (rare, only when mBits is very small)
+   370→          continue;
+   371→        }
+   372→
+   373→        // Perform the swap: remove rowToSwap from j2's column, add spareRow
+   374→        A.set(rowToSwap, j2, 0);
+   375→        A.set(spareRow, j2, 1);
+   376→        j2Rows.delete(rowToSwap);
+   377→        j2Rows.add(spareRow);
+   378→      }
+   379→    }
+   380→
+   381→    if (collisions > 0) {
+   382→      // Optional: log for debugging
+   383→      // console.debug(`[v61 LDPC] Resolved ${collisions} duplicate column(s)`);
+   384→    }
+   385→  }
+   386→
+   387→  /**
+   388→   * v62: Proper duplicate-column deduplication with GLOBAL collision check.
+   389→   *
+   390→   * The v61 version only checked collisions within the same hash group, so
+   391→   * swapping a row could create a NEW collision with a column in a DIFFERENT
+   392→   * group. This v62 version maintains a global hash→columnSet map and verifies
+   393→   * that each swap produces a globally unique hash before committing.
+   394→   *
+   395→   * Algorithm:
+   396→   *   1. Build a global hash → Set<columnIndex> map for ALL info columns.
+   397→   *   2. For each collision group (>1 column per hash):
+   398→   *      a. Keep the first column unchanged.
+   399→   *      b. For each subsequent duplicate column j2:
+   400→   *         - Try every possible (rowToRemove, spareRow) pair.
+   401→   *         - Compute the new hash after the swap.
+   402→   *         - If the new hash is globally unique (not in the map), commit.
+   403→   *         - If no swap produces a unique hash, increase dv for j2 (add a 5th row).
+   404→   *   3. Update the global map after each successful swap.
+   405→   *
+   406→   * This guarantees zero duplicate columns after construction, eliminating the
+   407→   * "large-payload hash FAIL" at 300+ oligo scale.
+   408→   */
+   409→  private dedupeDuplicateColumnsV2(
+   410→    A: GF2Matrix,
+   411→    kBits: number,
+   412→    mBits: number,
+   413→    dv: number,
+   414→  ): void {
+   415→    // Step 1: Build column → row-set and global hash map
+   416→    const colRowSets: Set<number>[] = new Array(kBits);
+   417→    const globalHashMap = new Map<string, Set<number>>(); // hash → set of column indices
+   418→
+   419→    for (let j = 0; j < kBits; j++) {
+   420→      const rows: number[] = [];
+   421→      for (let i = 0; i < mBits; i++) {
+   422→        if (A.get(i, j) === 1) rows.push(i);
+   423→      }
+   424→      colRowSets[j] = new Set(rows);
+   425→      const hash = rows.slice().sort((a, b) => a - b).join(",");
+   426→      if (!globalHashMap.has(hash)) globalHashMap.set(hash, new Set());
+   427→      globalHashMap.get(hash)!.add(j);
+   428→    }
+   429→
+   430→    // Step 2: Find and resolve collision groups
+   431→    let collisionsResolved = 0;
+   432→    let collisionsUnresolved = 0;
+   433→
+   434→    const hashKeys = Array.from(globalHashMap.keys());
+   435→    for (const hash of hashKeys) {
+   436→      const cols = globalHashMap.get(hash)!;
+   437→      if (cols.size <= 1) continue;
+   438→
+   439→      const colList = Array.from(cols);
+   440→      // Keep the first column; resolve the rest
+   441→      for (let idx = 1; idx < colList.length; idx++) {
+   442→        const j2: number = colList[idx];
+   443→        const j2Rows = colRowSets[j2];
+   444→        let resolved = false;
+   445→
+   446→        // Try every (rowToRemove, spareRow) pair
+   447→        const rowsToRemove = Array.from(j2Rows);
+   448→        for (const rowToRemove of rowsToRemove) {
+   449→          if (resolved) break;
+   450→          for (let spareRow = 0; spareRow < mBits; spareRow++) {
+   451→            if (j2Rows.has(spareRow)) continue; // already in set
+   452→
+   453→            // Compute the new row-set after swap
+   454→            const newRows = new Set(j2Rows);
+   455→            newRows.delete(rowToRemove);
+   456→            newRows.add(spareRow);
+   457→            const newHash = Array.from(newRows).sort((a: number, b: number) => a - b).join(",");
+   458→
+   459→            // Check if new hash is globally unique
+   460→            const existing = globalHashMap.get(newHash);
+   461→            if (!existing || existing.size === 0) {
+   462→              // Commit the swap
+   463→              A.set(rowToRemove, j2, 0);
+   464→              A.set(spareRow, j2, 1);
+   465→              j2Rows.delete(rowToRemove);
+   466→              j2Rows.add(spareRow);
+   467→
+   468→              // Update global hash map
+   469→              cols.delete(j2);
+   470→              if (!globalHashMap.has(newHash)) globalHashMap.set(newHash, new Set());
+   471→              globalHashMap.get(newHash)!.add(j2);
+   472→
+   473→              collisionsResolved++;
+   474→              resolved = true;
+   475→              break;
+   476→            }
+   477→          }
+   478→        }
+   479→
+   480→        if (!resolved) {
+   481→          // v62 fallback: increase dv by adding a 5th row (weight-5 column)
+   482→          for (let extraRow = 0; extraRow < mBits; extraRow++) {
+   483→            if (j2Rows.has(extraRow)) continue;
+   484→            const newRows = new Set(j2Rows);
+   485→            newRows.add(extraRow);
+   486→            const newHash = Array.from(newRows).sort((a: number, b: number) => a - b).join(",");
+   487→            const existing = globalHashMap.get(newHash);
+   488→            if (!existing || existing.size === 0) {
+   489→              A.set(extraRow, j2, 1); // add the extra row (weight now dv+1)
+   490→              j2Rows.add(extraRow);
+   491→              cols.delete(j2);
+   492→              if (!globalHashMap.has(newHash)) globalHashMap.set(newHash, new Set());
+   493→              globalHashMap.get(newHash)!.add(j2);
+   494→              collisionsResolved++;
+   495→              resolved = true;
+   496→              break;
+   497→            }
+   498→          }
+   499→          if (!resolved) collisionsUnresolved++;
+   500→        }
+   501→      }
+   502→    }
+   503→  }
+   504→
+   505→  /** Compute a string hash of column j (for mBits > 32). */
+   506→  private colHashStr(j: number): string {
+   507→    const rows = this.colRows[j];
+   508→    // Use a compact representation: for each row, store the row index
+   509→    return rows.join(",");
+   510→  }
+   511→
+   512→  /** Compute syndrome as a hash key. */
+   513→  private syndromeHashKey(syndrome: Uint8Array): string {
+   514→    if (this.useFastHash) {
+   515→      let hash = 0;
+   516→      for (let i = 0; i < this.mBits; i++) {
+   517→        if (syndrome[i]) hash |= 1 << i;
+   518→      }
+   519→      return (hash >>> 0).toString();
+   520→    } else {
+   521→      // String representation: list of set bits
+   522→      const setBits: number[] = [];
+   523→      for (let i = 0; i < this.mBits; i++) {
+   524→        if (syndrome[i]) setBits.push(i);
+   525→      }
+   526→      return setBits.join(",");
+   527→    }
+   528→  }
+   529→
+   530→  /** Build the pair-hash map lazily (only if single-error decoding fails). */
+   531→  private ensurePairHash(): void {
+   532→    // DISABLED for performance: pair-hash construction is O(nBits^2) which is
+   533→    // ~126K entries for 504-bit codewords. This takes several seconds and is
+   534→    // rarely needed (only for 2+ bit errors, which are rare at 0.1% sub rate).
+   535→    // The bit-flipping fallback handles these cases adequately.
+   536→    this.pairHashToBits = new Map();
+   537→    return;
+   538→  }
+   539→
+   540→  /**
+   541→   * Encode k bytes -> n bytes (k data + nsym parity).
+   542→   * Output: out[0..k-1] = data, out[k..n-1] = parity.
+   543→   * Optimized: unrolled bit extraction, precomputed row adjacency, buffer reuse.
+   544→   */
+   545→  private encodeBuffer: Uint8Array | null = null;
+   546→
+   547→  encode(data: Uint8Array): Uint8Array {
+   548→    if (data.length !== this.k) {
+   549→      throw new Error(`LDPC encode expects ${this.k} bytes, got ${data.length}`);
+   550→    }
+   551→    // Reuse buffer if possible (avoids GC pressure)
+   552→    const codeword = new Uint8Array(this.n);
+   553→    codeword.set(data, 0);
+   554→
+   555→    // v61: Use bit-parallel syndrome LUT for 8× faster parity computation.
+   556→    // The LUT precomputes, for each (check row, byte index, byte value), the
+   557→    // parity contribution. This replaces 8 bit-extractions with 1 table lookup.
+   558→    if (this.bitParallel) {
+   559→      const parity = new Uint8Array(this.nsym);
+   560→      this.bitParallel.computeParity(data, parity);
+   561→      codeword.set(parity, this.k);
+   562→      return codeword;
+   563→    }
+   564→
+   565→    // Fallback: bit-by-bit parity computation (for very large kBits > 500)
+   566→    // Convert k bytes -> kBits bits (unrolled for speed)
+   567→    const infoBits = new Uint8Array(this.kBits);
+   568→    for (let i = 0; i < this.k; i++) {
+   569→      const b = data[i];
+   570→      const off = i * 8;
+   571→      infoBits[off] = (b >> 7) & 1;
+   572→      infoBits[off + 1] = (b >> 6) & 1;
+   573→      infoBits[off + 2] = (b >> 5) & 1;
+   574→      infoBits[off + 3] = (b >> 4) & 1;
+   575→      infoBits[off + 4] = (b >> 3) & 1;
+   576→      infoBits[off + 5] = (b >> 2) & 1;
+   577→      infoBits[off + 6] = (b >> 1) & 1;
+   578→      infoBits[off + 7] = b & 1;
+   579→    }
+   580→
+   581→    // Compute mBits parity bits via H * infoBits (XOR of info bits where H[i][j]=1)
+   582→    const parityBits = new Uint8Array(this.mBits);
+   583→    for (let i = 0; i < this.mBits; i++) {
+   584→      let p = 0;
+   585→      const cols = this.rowCols[i];
+   586→      // Only iterate over info columns (first kBits columns of H)
+   587→      for (let idx = 0; idx < cols.length; idx++) {
+   588→        const j = cols[idx];
+   589→        if (j < this.kBits) p ^= infoBits[j];
+   590→      }
+   591→      parityBits[i] = p;
+   592→    }
+   593→
+   594→    // Pack parity bits into parity bytes (codeword already has data copied)
+   595→    for (let i = 0; i < this.nsym; i++) {
+   596→      let b = 0;
+   597→      for (let bit = 0; bit < 8; bit++) {
+   598→        b |= parityBits[i * 8 + bit] << (7 - bit);
+   599→      }
+   600→      codeword[this.k + i] = b;
+   601→    }
+   602→    return codeword;
+   603→  }
+   604→
+   605→  /** Encode only the parity bytes. */
+   606→  parity(data: Uint8Array): Uint8Array {
+   607→    const full = this.encode(data);
+   608→    return full.slice(this.k);
+   609→  }
+   610→
+   611→  /**
+   612→   * Decode n bytes -> k bytes via syndrome-based error correction.
+   613→   *
+   614→   * Optimized: single syndrome computation, lookup tables for byte→bits,
+   615→   * incremental syndrome update for single-error correction.
+   616→   */
+   617→  decode(recv: Uint8Array): LDPCDecodeResult {
+   618→    if (recv.length !== this.n) {
+   619→      throw new Error(`LDPC decode expects ${this.n} bytes, got ${recv.length}`);
+   620→    }
+   621→    // OPTIMIZATION: Compute syndrome directly from bytes (no bit extraction needed
+   622→    // for the zero-syndrome fast path). Each check row XORs specific bits from
+   623→    // specific bytes. We precompute byte-level XOR tables.
+   624→    //
+   625→    // For each check row i, the syndrome bit s[i] = XOR of bits at positions
+   626→    // in rowCols[i]. Instead of extracting individual bits, we can compute
+   627→    // the syndrome as a 32-bit number by XORing precomputed "check bytes"
+   628→    // that encode which bits of each input byte contribute to which checks.
+   629→    //
+   630→    // However, this is complex to implement. Instead, let's just optimize
+   631→    // the fast path: compute syndrome as a 32-bit number, and if it's zero,
+   632→    // return immediately.
+   633→
+   634→    // v61 CRITICAL FIX: Compute syndrome for ALL mBits values (was only mBits<=32).
+   635→    //
+   636→    // BUG: The original code only computed syndrome32 for mBits<=32. For mBits>32
+   637→    // (e.g., nsym=8 → mBits=64, the v55-density production config), syndrome32
+   638→    // stayed 0, causing the fast path to ALWAYS return corrected=0 — even when
+   639→    // errors existed. This silently accepted wrong codewords, producing hash FAIL
+   640→    // on noisy reads (v60 benchmark).
+   641→    //
+   642→    // Fix: Always compute the full syndrome as a Uint8Array. Use a 32-bit prefix
+   643→    // for the fast-zero check (most clean reads have syndrome=0 in the first 32
+   644→    // bits AND the remaining bits), but fall through to the full check.
+   645→    //
+   646→    // v63: Use BitParallelSyndrome LUT when available (5-8× faster syndrome).
+   647→    // The LUT precomputes byte-level XOR tables for the info portion; the
+   648→    // parity portion is XOR'd directly (small — nsym bytes × mBits rows).
+   649→    const syndrome = new Uint8Array(this.mBits);
+   650→    let syndromeNonZero: boolean;
+   651→    if (this.bitParallel && this.parityColRowsView) {
+   652→      syndromeNonZero = this.bitParallel.computeSyndromeFull(recv, syndrome, this.parityColRowsView);
+   653→    } else {
+   654→      syndromeNonZero = false;
+   655→      for (let i = 0; i < this.mBits; i++) {
+   656→        let s = 0;
+   657→        const cols = this.rowCols[i];
+   658→        for (let idx = 0; idx < cols.length; idx++) {
+   659→          const j = cols[idx];
+   660→          const byteIdx = j >> 3;
+   661→          const bitIdx = 7 - (j & 7);
+   662→          s ^= (recv[byteIdx] >> bitIdx) & 1;
+   663→        }
+   664→        syndrome[i] = s;
+   665→        if (s) syndromeNonZero = true;
+   666→      }
+   667→    }
+   668→
+   669→    if (!syndromeNonZero) {
+   670→      // Fast path: zero syndrome = valid codeword, just return data
+   671→      return { data: recv.slice(0, this.k), corrected: 0, erased: 0 };
+   672→    }
+   673→
+   674→    // Slow path: errors exist, need full bit-level decode
+   675→    // Convert n bytes -> nBits bits
+   676→    const bits = new Uint8Array(this.nBits);
+   677→    for (let i = 0; i < this.n; i++) {
+   678→      const b = recv[i];
+   679→      const off = i * 8;
+   680→      bits[off] = (b >> 7) & 1;
+   681→      bits[off + 1] = (b >> 6) & 1;
+   682→      bits[off + 2] = (b >> 5) & 1;
+   683→      bits[off + 3] = (b >> 4) & 1;
+   684→      bits[off + 4] = (b >> 3) & 1;
+   685→      bits[off + 5] = (b >> 2) & 1;
+   686→      bits[off + 6] = (b >> 1) & 1;
+   687→      bits[off + 7] = b & 1;
+   688→    }
+   689→
+   690→    // Single-error correction via syndrome lookup
+   691→    const sKey = this.syndromeHashKey(syndrome);
+   692→
+   693→    // Check if syndrome matches an info column
+   694→    const infoBit = this.colHashToInt.get(sKey);
+   695→    if (infoBit !== undefined) {
+   696→      bits[infoBit] ^= 1;
+   697→      // Verify syndrome is now zero — incremental update (just flip the affected rows)
+   698→      const affectedRows = this.colRows[infoBit];
+   699→      let stillZero = true;
+   700→      for (let idx = 0; idx < affectedRows.length; idx++) {
+   701→        syndrome[affectedRows[idx]] ^= 1;
+   702→        if (syndrome[affectedRows[idx]] !== 0) stillZero = false;
+   703→      }
+   704→      if (stillZero) {
+   705→        const data = new Uint8Array(this.k);
+   706→        for (let i = 0; i < this.k; i++) {
+   707→          data[i] = (bits[i * 8] << 7) | (bits[i * 8 + 1] << 6) | (bits[i * 8 + 2] << 5) |
+   708→                     (bits[i * 8 + 3] << 4) | (bits[i * 8 + 4] << 3) | (bits[i * 8 + 5] << 2) |
+   709→                     (bits[i * 8 + 6] << 1) | bits[i * 8 + 7];
+   710→        }
+   711→        return { data, corrected: 1, erased: 0 };
+   712→      }
+   713→      // Undo — flip back and restore syndrome
+   714→      bits[infoBit] ^= 1;
+   715→      for (let idx = 0; idx < affectedRows.length; idx++) {
+   716→        syndrome[affectedRows[idx]] ^= 1;
+   717→      }
+   718→    }
+   719→
+   720→    // Check if syndrome matches a parity column (unit vector)
+   721→    const parityBit = this.parityColHashToIdx.get(sKey);
+   722→    if (parityBit !== undefined) {
+   723→      bits[parityBit] ^= 1;
+   724→      const affectedRows = this.colRows[parityBit];
+   725→      let stillZero = true;
+   726→      for (let idx = 0; idx < affectedRows.length; idx++) {
+   727→        syndrome[affectedRows[idx]] ^= 1;
+   728→        if (syndrome[affectedRows[idx]] !== 0) stillZero = false;
+   729→      }
+   730→      if (stillZero) {
+   731→        const data = new Uint8Array(this.k);
+   732→        for (let i = 0; i < this.k; i++) {
+   733→          data[i] = (bits[i * 8] << 7) | (bits[i * 8 + 1] << 6) | (bits[i * 8 + 2] << 5) |
+   734→                     (bits[i * 8 + 3] << 4) | (bits[i * 8 + 4] << 3) | (bits[i * 8 + 5] << 2) |
+   735→                     (bits[i * 8 + 6] << 1) | bits[i * 8 + 7];
+   736→        }
+   737→        return { data, corrected: 1, erased: 0 };
+   738→      }
+   739→      bits[parityBit] ^= 1;
+   740→      for (let idx = 0; idx < affectedRows.length; idx++) {
+   741→        syndrome[affectedRows[idx]] ^= 1;
+   742→      }
+   743→    }
+   744→
+   745→    // Double-error correction via pair-hash lookup
+   746→    this.ensurePairHash();
+   747→    if (this.pairHashToBits) {
+   748→      const pair = this.pairHashToBits.get(sKey);
+   749→      if (pair) {
+   750→        const [j1, j2] = pair;
+   751→        bits[j1] ^= 1;
+   752→        bits[j2] ^= 1;
+   753→        if (this.computeSyndrome(bits, syndrome)) {
+   754→          const data = new Uint8Array(this.k);
+   755→          for (let i = 0; i < this.k; i++) {
+   756→            data[i] = (bits[i * 8] << 7) | (bits[i * 8 + 1] << 6) | (bits[i * 8 + 2] << 5) |
+   757→                       (bits[i * 8 + 3] << 4) | (bits[i * 8 + 4] << 3) | (bits[i * 8 + 5] << 2) |
+   758→                       (bits[i * 8 + 6] << 1) | bits[i * 8 + 7];
+   759→          }
+   760→          return { data, corrected: 2, erased: 0 };
+   761→        }
+   762→        bits[j1] ^= 1;
+   763→        bits[j2] ^= 1;
+   764→      }
+   765→    }
+   766→
+   767→    // Fallback: bit-flipping decoder
+   768→    // v61 optimization: limit bit-flipping iterations to 5 (was 20). With 10x
+   769→    // coverage, we don't need to correct every noisy read — we just need to
+   770→    // find ONE clean read per oligo. The bit-flipping decoder is slow (O(maxIter
+   771→    // * nBits * mBits) per read), so limiting iterations gives 4× speedup.
+   772→    // Multi-bit errors that can't be corrected in 5 iterations are rare and
+   773→    // will be caught by CRC (read is skipped, next read is tried).
+   774→    const bfResult = this.bitFlipDecode(bits, syndrome, 5);
+   775→    if (bfResult !== null) {
+   776→      const data = new Uint8Array(this.k);
+   777→      for (let i = 0; i < this.k; i++) {
+   778→        data[i] = (bits[i * 8] << 7) | (bits[i * 8 + 1] << 6) | (bits[i * 8 + 2] << 5) |
+   779→                   (bits[i * 8 + 3] << 4) | (bits[i * 8 + 4] << 3) | (bits[i * 8 + 5] << 2) |
+   780→                   (bits[i * 8 + 6] << 1) | bits[i * 8 + 7];
+   781→      }
+   782→      return { data, corrected: bfResult, erased: 0 };
+   783→    }
+   784→
+   785→    throw new Error(
+   786→      `LDPC decode failed: syndrome non-zero after syndrome-lookup + bit-flipping`,
+   787→    );
+   788→  }
+   789→
+   790→  /**
+   791→   * Bit-flipping decoder fallback. Mutates `bits` in place.
+   792→   * Returns the number of bits corrected, or null if failed.
+   793→   */
+   794→  private bitFlipDecode(bits: Uint8Array, syndrome: Uint8Array, maxIterOverride?: number): number | null {
+   795→    let corrected = 0;
+   796→    const localSyndrome = syndrome.slice();
+   797→    const iterLimit = maxIterOverride ?? this.maxIter;
+   798→
+   799→    for (let iter = 0; iter < iterLimit; iter++) {
+   800→      // Check if syndrome is zero
+   801→      let allZero = true;
+   802→      for (let i = 0; i < this.mBits; i++) {
+   803→        if (localSyndrome[i] !== 0) { allZero = false; break; }
+   804→      }
+   805→      if (allZero) return corrected;
+   806→
+   807→      // For each bit, count unsatisfied checks
+   808→      const unsatCount = new Int32Array(this.nBits);
+   809→      for (let i = 0; i < this.mBits; i++) {
+   810→        if (localSyndrome[i] === 1) {
+   811→          const cols = this.rowCols[i];
+   812→          for (let idx = 0; idx < cols.length; idx++) {
+   813→            unsatCount[cols[idx]]++;
+   814→          }
+   815→        }
+   816→      }
+   817→
+   818→      // Find bit with max (unsatCount - colDegree/2) — prefer high-degree columns
+   819→      // (weighted bit-flipping: a bit is more likely to be wrong if many of its
+   820→      // checks are unsatisfied relative to its degree)
+   821→      let bestBit = -1;
+   822→      let bestScore = -Infinity;
+   823→      for (let j = 0; j < this.nBits; j++) {
+   824→        const deg = this.colRows[j].length;
+   825→        const score = unsatCount[j] - deg / 2;
+   826→        if (score > bestScore) {
+   827→          bestScore = score;
+   828→          bestBit = j;
+   829→        }
+   830→      }
+   831→
+   832→      if (bestBit === -1 || unsatCount[bestBit] === 0) {
+   833→        break;
+   834→      }
+   835→
+   836→      // Flip the best bit
+   837→      bits[bestBit] ^= 1;
+   838→      corrected++;
+   839→
+   840→      // Update syndrome incrementally
+   841→      const affectedRows = this.colRows[bestBit];
+   842→      for (let idx = 0; idx < affectedRows.length; idx++) {
+   843→        localSyndrome[affectedRows[idx]] ^= 1;
+   844→      }
+   845→    }
+   846→
+   847→    // Final syndrome check
+   848→    for (let i = 0; i < this.mBits; i++) {
+   849→      if (localSyndrome[i] !== 0) return null;
+   850→    }
+   851→    return corrected;
+   852→  }
+   853→
+   854→  /**
+   855→   * Decode with erasures using a peeling decoder over GF(2).
+   856→   *
+   857→   * This is the proper LDPC erasure-channel decoder (BEC). Given a set of
+   858→   * erased bit positions, we treat each erased bit as an unknown variable
+   859→   * in the system H · x = s. The peeling decoder repeatedly finds a parity
+   860→   * check that contains exactly one unknown bit, then solves for that bit
+   861→   * as the XOR of all other (known) bits in the check. This continues until
+   862→   * no more unknowns can be resolved or all erasures are recovered.
+   863→   *
+   864→   * When erasure positions are not known (empty erasePos), this falls back
+   865→   * to plain hard-decision `decode()`.
+   866→   *
+   867→   * Capacity: the peeling decoder succeeds when the erasure pattern is
+   868→   * recoverable by the parity-check matrix. For our (n=304, k=272, m=32)
+   869→   * code, this typically recovers up to mBits=32 erasures per codeword,
+   870→   * far exceeding the 16-error correction capacity of bit-flipping.
+   871→   *
+   872→   * This unlocks the "arithmetic mode" at 1.9+ bits/nt: when consensus at
+   873→   * low coverage (2-3×) produces uncertain bits, the HMM emits erasure
+   874→   * positions rather than hard calls, and this decoder resolves them.
+   875→   *
+   876→   * References:
+   877→   *   - Luby, Mitzenmacher, Shokrollahi, Spielman (2001). "Efficient ERASURE
+   878→   *     Correcting Codes." IEEE TIT 47:2. (Peeling decoder analysis.)
+   879→   *   - Richardson, Urbanke (2008). Modern Coding Theory, Ch. 3. (BEC peeling.)
+   880→   */
+   881→  decodeWithErasures(recv: Uint8Array, erasePos: number[]): LDPCDecodeResult {
+   882→    if (erasePos.length === 0) {
+   883→      return this.decode(recv);
+   884→    }
+   885→
+   886→    // Convert received bytes -> bit array
+   887→    const bits = new Uint8Array(this.nBits);
+   888→    for (let i = 0; i < this.n; i++) {
+   889→      const b = recv[i];
+   890→      const off = i * 8;
+   891→      bits[off]     = (b >> 7) & 1;
+   892→      bits[off + 1] = (b >> 6) & 1;
+   893→      bits[off + 2] = (b >> 5) & 1;
+   894→      bits[off + 3] = (b >> 4) & 1;
+   895→      bits[off + 4] = (b >> 3) & 1;
+   896→      bits[off + 5] = (b >> 2) & 1;
+   897→      bits[off + 6] = (b >> 1) & 1;
+   898→      bits[off + 7] = b & 1;
+   899→    }
+   900→
+   901→    // Validate erasure positions
+   902→    for (const p of erasePos) {
+   903→      if (p < 0 || p >= this.nBits) {
+   904→        throw new Error(`LDPC erasure position out of range: ${p} (nBits=${this.nBits})`);
+   905→      }
+   906→    }
+   907→
+   908→    // Build erasure set and zero out erased positions.
+   909→    //
+   910→    // Why zero out: the peeling decoder computes x_j = XOR of known bits in check.
+   911→    // The syndrome s_i = XOR of all received bits in check. If we zero out the
+   912→    // erased positions, then s_i = XOR of non-erased (known) bits = exactly what
+   913→    // we need to resolve x_j. Without zeroing, the garbage values at erased
+   914→    // positions would corrupt the syndrome.
+   915→    const erased = new Uint8Array(this.nBits);
+   916→    for (const p of erasePos) {
+   917→      erased[p] = 1;
+   918→      bits[p] = 0; // zero out placeholder
+   919→    }
+   920→    let remainingErasures = erasePos.length;
+   921→
+   922→    // For each check, count how many erased bits it contains
+   923→    const checkErasureCount = new Int32Array(this.mBits);
+   924→    for (let i = 0; i < this.mBits; i++) {
+   925→      let c = 0;
+   926→      const cols = this.rowCols[i];
+   927→      for (let idx = 0; idx < cols.length; idx++) {
+   928→        if (erased[cols[idx]]) c++;
+   929→      }
+   930→      checkErasureCount[i] = c;
+   931→    }
+   932→
+   933→    // Peeling decoder: iteratively resolve checks with exactly 1 erased bit.
+   934→    //
+   935→    // Each parity check equation: XOR of all bits in the check = 0 (mod 2).
+   936→    // If exactly one bit `x_j` in the check is erased (unknown), then:
+   937→    //   x_j = XOR of all OTHER (known) bits in the check.
+   938→    //
+   939→    // We need to compute this from the received bits (with erasures set to 0
+   940→    // as placeholder) and the syndrome. The syndrome s_i = XOR of ALL bits
+   941→    // in check i (including the erased bit's placeholder, which is 0). So:
+   942→    //   s_i = (XOR of known bits in check) XOR (erased bit placeholder = 0)
+   943→    //   s_i = XOR of known bits in check
+   944→    // Therefore:
+   945→    //   x_j = XOR of known bits = s_i  ... wait that's only true if x_j was 0.
+   946→    //
+   947→    // Correct derivation: s_i = (XOR of known bits) XOR x_j_placeholder.
+   948→    // If we set x_j_placeholder = 0, then s_i = XOR of known bits.
+   949→    // The true x_j satisfies: (XOR of known bits) XOR x_j = 0.
+   950→    // So: x_j = XOR of known bits = s_i (when placeholder is 0).
+   951→    //
+   952→    // But as we resolve bits and update `bits[erasedBit]`, subsequent checks
+   953→    // need to use the UPDATED known-bit values. We track the syndrome
+   954→    // incrementally: after resolving x_j, the syndrome for checks containing
+   955→    // x_j changes by XOR (x_j_new XOR x_j_old). Since x_j_old was 0 (placeholder),
+   956→    // the change is x_j_new.
+   957→    const syndrome = new Uint8Array(this.mBits);
+   958→    this.computeSyndrome(bits, syndrome);
+   959→    // Note: at this point, erased bits are still 0 (placeholder). The syndrome
+   960→    // equals the XOR of all known bits in each check. This is exactly what we
+   961→    // need: for a check with 1 erasure, s_i = XOR of known bits = resolved x_j.
+   962→
+   963→    // Queue of checks with exactly one erasure (FIFO)
+   964→    const queue: number[] = [];
+   965→    for (let i = 0; i < this.mBits; i++) {
+   966→      if (checkErasureCount[i] === 1) queue.push(i);
+   967→    }
+   968→
+   969→    let resolved = 0;
+   970→    let iterations = 0;
+   971→    const maxPeelingIter = this.mBits + erasePos.length + 16;
+   972→
+   973→    while (queue.length > 0 && remainingErasures > 0 && iterations < maxPeelingIter) {
+   974→      iterations++;
+   975→      const checkIdx = queue.shift()!;
+   976→
+   977→      // Re-check (may have been updated by previous iterations)
+   978→      if (checkErasureCount[checkIdx] !== 1) continue;
+   979→
+   980→      // Find the single erased bit in this check.
+   981→      // We already verified checkErasureCount === 1 above, but that count may
+   982→      // be stale if a previous iteration resolved a bit in this check. So we
+   983→      // re-scan. If we find 0 or 2+ erasures, skip (the count will be updated
+   984→      // correctly when other bits are resolved).
+   985→      const cols = this.rowCols[checkIdx];
+   986→      let erasedBit = -1;
+   987→      let count = 0;
+   988→      for (let idx = 0; idx < cols.length; idx++) {
+   989→        const j = cols[idx];
+   990→        if (erased[j]) {
+   991→          count++;
+   992→          if (count > 1) { erasedBit = -1; break; }
+   993→          erasedBit = j;
+   994→        }
+   995→      }
+   996→      if (erasedBit === -1 || count !== 1) {
+   997→        // Stale entry — update count to actual and skip
+   998→        checkErasureCount[checkIdx] = count;
+   999→        continue;
+  1000→      }
+  1001→
+  1002→      // Resolve: x_j = s_i (the syndrome bit, which equals XOR of known bits)
+  1003→      //   Proof: 0 = XOR of all bits in check
+  1004→      //         => 0 = (XOR of known bits) XOR x_j
+  1005→      //         => x_j = XOR of known bits
+  1006→      //   And syndrome s_i = XOR of all bits (with x_j placeholder = 0)
+  1007→      //                    = XOR of known bits (since 0 is identity for XOR)
+  1008→      //   Therefore x_j = s_i. After we set x_j = s_i, this check's syndrome
+  1009→      //   becomes 0 (satisfied).
+  1010→      const xj = syndrome[checkIdx];
+  1011→      bits[erasedBit] = xj;
+  1012→      erased[erasedBit] = 0;
+  1013→      remainingErasures--;
+  1014→      resolved++;
+  1015→
+  1016→      // Update syndrome for all OTHER checks containing this bit:
+  1017→      //   s_r_new = s_r_old XOR (x_j_new XOR x_j_old) = s_r_old XOR x_j_new
+  1018→      // (since x_j_old = 0 placeholder)
+  1019→      // AND update checkErasureCount for those checks.
+  1020→      const rows = this.colRows[erasedBit];
+  1021→      for (let idx = 0; idx < rows.length; idx++) {
+  1022→        const r = rows[idx];
+  1023→        if (r === checkIdx) continue; // skip the current check (already satisfied)
+  1024→        syndrome[r] ^= xj;
+  1025→        checkErasureCount[r]--;
+  1026→        if (checkErasureCount[r] === 1) {
+  1027→          queue.push(r);
+  1028→        }
+  1029→      }
+  1030→      // Mark the current check as satisfied (syndrome = 0)
+  1031→      syndrome[checkIdx] = 0;
+  1032→      checkErasureCount[checkIdx] = 0;
+  1033→    }
+  1034→
+  1035→    if (remainingErasures > 0) {
+  1036→      // Peeling decoder stalled on a STOPPING SET — a subgraph where every
+  1037→      // check contains ≥ 2 erasures. The peeling decoder cannot resolve these.
+  1038→      //
+  1039→      // ML fallback: Gaussian elimination over GF(2) on the residual erasures.
+  1040→      // Build a linear system A · x = b where:
+  1041→      //   - A is the sub-matrix of H restricted to (checks containing erasures)
+  1042→      //     × (erased bit positions)
+  1043→      //   - x is the vector of erased bit values (unknowns)
+  1044→      //   - b is the syndrome restricted to those checks (XOR of known bits)
+  1045→      //
+  1046→      // If A has full column rank, the erasures are uniquely determined.
+  1047→      // Otherwise, the erasure pattern is unrecoverable (code's BEC capacity
+  1048→      // exceeded) — throw.
+  1049→      //
+  1050→      // References:
+  1051→      //   - Di, Proietti, Telatar, Richardson, Urbanke (2002). "Finite-length
+  1052→      //     analysis of low-density parity-check codes on the BEC." IEEE TIT 48.
+  1053→      //   - Pishro-Nik & Fekri (2004). "On decoding algorithms of LDPC codes
+  1054→      //     for the erasure channel." IEEE Comm. Letters 8:8.
+  1055→      const erasedBits: number[] = [];
+  1056→      for (let j = 0; j < this.nBits; j++) {
+  1057→        if (erased[j]) erasedBits.push(j);
+  1058→      }
+  1059→      const nUnknowns = erasedBits.length;
+  1060→
+  1061→      // Collect checks that contain at least one remaining erasure.
+  1062→      const checkList: number[] = [];
+  1063→      const checkSeen = new Uint8Array(this.mBits);
+  1064→      for (const j of erasedBits) {
+  1065→        const rows = this.colRows[j];
+  1066→        for (let idx = 0; idx < rows.length; idx++) {
+  1067→          const r = rows[idx];
+  1068→          if (!checkSeen[r]) { checkSeen[r] = 1; checkList.push(r); }
+  1069→        }
+  1070→      }
+  1071→      const nChecks = checkList.length;
+  1072→
+  1073→      // Build augmented matrix [A | b] as Uint8Array of size nChecks × (nUnknowns + 1)
+  1074→      // Each row: bits [j_0, j_1, ..., j_{nUnknowns-1}, b_i]
+  1075→      // Map erased bit position -> column index in A
+  1076→      const erasedToCol = new Map<number, number>();
+  1077→      erasedBits.forEach((j, col) => erasedToCol.set(j, col));
+  1078→
+  1079→      const aug = new Uint8Array(nChecks * (nUnknowns + 1));
+  1080→      for (let r = 0; r < nChecks; r++) {
+  1081→        const checkIdx = checkList[r];
+  1082→        const cols = this.rowCols[checkIdx];
+  1083→        for (let idx = 0; idx < cols.length; idx++) {
+  1084→          const j = cols[idx];
+  1085→          const col = erasedToCol.get(j);
+  1086→          if (col !== undefined) {
+  1087→            aug[r * (nUnknowns + 1) + col] ^= 1;
+  1088→          } else {
+  1089→            // Known bit — contributes to RHS
+  1090→            // (we want b_i = XOR of known bits = syndrome[checkIdx])
+  1091→          }
+  1092→        }
+  1093→        // RHS = syndrome[checkIdx] (already XOR of known bits since erased
+  1094→        // positions are still 0 in `bits` at this point — the resolved bits
+  1095→        // were written into `bits`, but unresolved ones remain 0)
+  1096→        aug[r * (nUnknowns + 1) + nUnknowns] = syndrome[checkIdx];
+  1097→      }
+  1098→
+  1099→      // Gaussian elimination over GF(2) with partial pivoting
+  1100→      const stride = nUnknowns + 1;
+  1101→      let rank = 0;
+  1102→      const usedRow = new Uint8Array(nChecks);
+  1103→      const pivotCol = new Int32Array(nUnknowns).fill(-1);
+  1104→
+  1105→      for (let col = 0; col < nUnknowns; col++) {
+  1106→        // Find a row with a 1 in this column that hasn't been used as pivot
+  1107→        let pivotRow = -1;
+  1108→        for (let r = 0; r < nChecks; r++) {
+  1109→          if (!usedRow[r] && aug[r * stride + col] === 1) { pivotRow = r; break; }
+  1110→        }
+  1111→        if (pivotRow === -1) continue; // free variable — column not in rank
+  1112→        usedRow[pivotRow] = 1;
+  1113→        pivotCol[col] = pivotRow;
+  1114→        rank++;
+  1115→
+  1116→        // Eliminate this column from all other rows
+  1117→        for (let r = 0; r < nChecks; r++) {
+  1118→          if (r === pivotRow) continue;
+  1119→          if (aug[r * stride + col] === 1) {
+  1120→            const base = r * stride;
+  1121→            const pivBase = pivotRow * stride;
+  1122→            for (let c = col; c < stride; c++) {
+  1123→              aug[base + c] ^= aug[pivBase + c];
+  1124→            }
+  1125→          }
+  1126→        }
+  1127→      }
+  1128→
+  1129→      if (rank < nUnknowns) {
+  1130→        // System is under-determined — erasure pattern exceeds BEC capacity.
+  1131→        throw new Error(
+  1132→          `LDPC erasure decode: ${nUnknowns - rank} unknowns remain under-determined after Gaussian elimination (rank=${rank}, unknowns=${nUnknowns}). Erasure pattern exceeds code's BEC capacity.`,
+  1133→        );
+  1134→      }
+  1135→
+  1136→      // Back-substitute: each unknown is determined by its pivot row's RHS
+  1137→      // (since we eliminated above and below, the pivot row is [0...0,1,0...0,b])
+  1138→      const solution = new Uint8Array(nUnknowns);
+  1139→      for (let col = 0; col < nUnknowns; col++) {
+  1140→        const r = pivotCol[col];
+  1141→        if (r === -1) {
+  1142→          // Should not happen since rank === nUnknowns
+  1143→          throw new Error(`LDPC erasure decode: internal error — pivot missing for col ${col}`);
+  1144→        }
+  1145→        solution[col] = aug[r * stride + nUnknowns];
+  1146→      }
+  1147→
+  1148→      // Write resolved bits back
+  1149→      for (let col = 0; col < nUnknowns; col++) {
+  1150→        const j = erasedBits[col];
+  1151→        bits[j] = solution[col];
+  1152→        erased[j] = 0;
+  1153→        resolved++;
+  1154→      }
+  1155→      remainingErasures = 0;
+  1156→    }
+  1157→
+  1158→    // All erasures resolved — verify final syndrome is zero
+  1159→    const finalSyndrome = new Uint8Array(this.mBits);
+  1160→    if (!this.computeSyndrome(bits, finalSyndrome)) {
+  1161→      throw new Error(
+  1162→        `LDPC erasure decode: syndrome non-zero after peeling (likely additional bit errors not flagged as erasures)`,
+  1163→      );
+  1164→    }
+  1165→
+  1166→    // Pack bits back to bytes
+  1167→    const data = new Uint8Array(this.k);
+  1168→    for (let i = 0; i < this.k; i++) {
+  1169→      data[i] = (bits[i * 8] << 7) | (bits[i * 8 + 1] << 6) | (bits[i * 8 + 2] << 5) |
+  1170→                 (bits[i * 8 + 3] << 4) | (bits[i * 8 + 4] << 3) | (bits[i * 8 + 5] << 2) |
+  1171→                 (bits[i * 8 + 6] << 1) | bits[i * 8 + 7];
+  1172→    }
+  1173→    return { data, corrected: 0, erased: resolved };
+  1174→  }
+  1175→
+  1176→  /** Compute syndrome s = H * bits. Returns true if syndrome is all zero. */
+  1177→  private computeSyndrome(bits: Uint8Array, syndrome: Uint8Array): boolean {
+  1178→    let allZero = true;
+  1179→    for (let i = 0; i < this.mBits; i++) {
+  1180→      let s = 0;
+  1181→      const cols = this.rowCols[i];
+  1182→      for (let idx = 0; idx < cols.length; idx++) {
+  1183→        s ^= bits[cols[idx]];
+  1184→      }
+  1185→      syndrome[i] = s;
+  1186→      if (s !== 0) allZero = false;
+  1187→    }
+  1188→    return allZero;
+  1189→  }
+  1190→
+  1191→  /**
+  1192→   * Decode with soft-information (Q-scores) using OSD-2 as a fallback.
+  1193→   *
+  1194→   * Pipeline:
+  1195→   *   1. Try hard-decision syndrome lookup (single + double error correction).
+  1196→   *   2. If that fails, try OSD-2: flip pairs of least-reliable bits, re-check.
+  1197→   *
+  1198→   * Q-score to LLR conversion:
+  1199→   *   LLR = (Q / 10) * ln(10) * (1 - 2*bit)
+  1200→   *   Positive LLR → likely 0, negative LLR → likely 1.
+  1201→   *   Higher |LLR| → more confident.
+  1202→   *
+  1203→   * OSD-2 tries C(k, 2) pairs of the least-reliable k bits. We limit to the
+  1204→   * 20 least-reliable bits (190 pairs) for performance.
+  1205→   *
+  1206→   * @param recv Received codeword bytes
+  1207→   * @param qScores Per-base Phred Q-scores (length = n bytes for direct mapping,
+  1208→   *                or n*1.5 bytes for Goldman). If null, falls back to hard-decision.
+  1209→   * @param useGoldman Whether Goldman mapping was used (affects Q-score to bit mapping)
+  1210→   */
+  1211→  decodeWithSoftInfo(
+  1212→    recv: Uint8Array,
+  1213→    qScores: Uint8Array | null,
+  1214→    useGoldman: boolean = false,
+  1215→  ): LDPCDecodeResult {
+  1216→    if (!qScores || qScores.length === 0) {
+  1217→      // No soft info — fall back to hard-decision decode
+  1218→      return this.decode(recv);
+  1219→    }
+  1220→
+  1221→    // Step 1: Try hard-decision decode first (fast path for 0-2 errors)
+  1222→    try {
+  1223→      return this.decode(recv);
+  1224→    } catch {
+  1225→      // Hard-decision failed — continue to OSD-2
+  1226→    }
+  1227→
+  1228→    // Step 2: OSD-2 with soft information
+  1229→    // Convert received bytes to bits
+  1230→    const bits = new Uint8Array(this.nBits);
+  1231→    for (let i = 0; i < this.n; i++) {
+  1232→      const b = recv[i];
+  1233→      for (let bit = 0; bit < 8; bit++) {
+  1234→        bits[i * 8 + bit] = (b >> (7 - bit)) & 1;
+  1235→      }
+  1236→    }
+  1237→
+  1238→    // Compute LLR for each bit from Q-scores.
+  1239→    // For direct mapping: 4 bits per base, Q-score is per-base.
+  1240→    //   bit i (in byte j, position p) maps to base j, Q-score = qScores[j].
+  1241→    // For Goldman mapping: 8 bits per byte, but Q-score is per-base (6 bases per byte).
+  1242→    //   This is complex — we approximate by assigning each bit the Q-score of
+  1243→    //   the base it belongs to. For Goldman, byte j spans bases j*1.5 to j*1.5+1.5,
+  1244→    //   which is not integer. We use the average Q-score of the byte's bases.
+  1245→    //
+  1246→    // Simplified: for both modes, we compute per-bit reliability from the byte's
+  1247→    // Q-score. Since we don't have per-bit Q-scores, we use the byte's average.
+  1248→    // This is a conservative approximation — true per-bit LLRs would be better.
+  1249→    const llr = new Float32Array(this.nBits);
+  1250→    if (useGoldman) {
+  1251→      // Goldman: each byte = 6 trits = 6 bases. We don't have a direct bit-to-base
+  1252→      // mapping (trits are non-linear). Use a uniform LLR based on average Q-score.
+  1253→      const avgQ = qScores.length > 0
+  1254→        ? qScores.reduce((s, q) => s + q, 0) / qScores.length
+  1255→        : 30;
+  1256→      const llrMag = (avgQ / 10) * Math.log(10);
+  1257→      for (let i = 0; i < this.nBits; i++) {
+  1258→        llr[i] = bits[i] === 0 ? llrMag : -llrMag;
+  1259→      }
+  1260→    } else {
+  1261→      // Direct: 4 bits per base. Byte j → bases j*4..j*4+3. Q-score per base.
+  1262→      // Map each bit to its base's Q-score.
+  1263→      for (let byteIdx = 0; byteIdx < this.n; byteIdx++) {
+  1264→        for (let bitInByte = 0; bitInByte < 8; bitInByte++) {
+  1265→          const bitIdx = byteIdx * 8 + bitInByte;
+  1266→          // Each byte has 4 bases (2 bits each). Bit (bitInByte) belongs to base (bitInByte >> 1).
+  1267→          // But Q-scores are per-base in the DNA string, not per-byte.
+  1268→          // The DNA string has n*4 bases (direct mapping). Each base = 2 bits.
+  1269→          // Base b = bits[2*b], bits[2*b+1]. Q-score = qScores[b].
+  1270→          // For byte j, bits j*8..j*8+7 map to bases j*4..j*4+3.
+  1271→          const baseIdx = byteIdx * 4 + (bitInByte >> 1);
+  1272→          const q = baseIdx < qScores.length ? qScores[baseIdx] : 30;
+  1273→          const llrMag = (q / 10) * Math.log(10);
+  1274→          llr[bitIdx] = bits[bitIdx] === 0 ? llrMag : -llrMag;
+  1275→        }
+  1276→      }
+  1277→    }
+  1278→
+  1279→    // OSD-2: Sort bits by |LLR| ascending (least reliable first).
+  1280→    // Try flipping pairs of the least-reliable bits, re-check syndrome.
+  1281→    const sortedIndices = Array.from({ length: this.nBits }, (_, i) => i);
+  1282→    sortedIndices.sort((a, b) => Math.abs(llr[a]) - Math.abs(llr[b]));
+  1283→
+  1284→    // Use 40 least-reliable bits (780 pairs) — covers more error combinations
+  1285→    const limit = Math.min(40, this.nBits);
+  1286→    const syndrome = new Uint8Array(this.mBits);
+  1287→
+  1288→    // OSD-erasure: If there are very low-Q bits (Q < 15), flip ALL of them
+  1289→    // simultaneously. This is the erasure case — we know these bits are wrong.
+  1290→    // For 3 errors at Q10, this flips all 3 at once → syndrome should become zero.
+  1291→    const lowQThreshold = 15; // Q < 15 means < 97% confidence
+  1292→    const lowQBits: number[] = [];
+  1293→    for (let i = 0; i < this.nBits; i++) {
+  1294→      // For direct mapping, LLR magnitude = (Q/10)*ln(10). Q < 15 → |LLR| < 3.45.
+  1295→      if (Math.abs(llr[i]) < (lowQThreshold / 10) * Math.log(10)) {
+  1296→        lowQBits.push(i);
+  1297→      }
+  1298→    }
+  1299→    if (lowQBits.length > 0 && lowQBits.length <= 10) {
+  1300→      // Flip all low-Q bits simultaneously
+  1301→      for (const b of lowQBits) bits[b] ^= 1;
+  1302→      const zero = this.computeSyndrome(bits, syndrome);
+  1303→      if (zero) {
+  1304→        return { data: bitsToBytes(bits, this.k), corrected: lowQBits.length, erased: 0 };
+  1305→      }
+  1306→      // Undo and try flipping subsets (in case some low-Q bits were actually correct)
+  1307→      for (const b of lowQBits) bits[b] ^= 1;
+  1308→
+  1309→      // Try flipping all but one, all but two, etc. (greedy subset search)
+  1310→      // This handles the case where N-1 of the low-Q bits are errors and 1 is correct.
+  1311→      for (let skip = 0; skip < lowQBits.length; skip++) {
+  1312→        for (const b of lowQBits) bits[b] ^= 1; // flip all
+  1313→        bits[lowQBits[skip]] ^= 1; // un-flip one
+  1314→        const zero = this.computeSyndrome(bits, syndrome);
+  1315→        if (zero) {
+  1316→          return { data: bitsToBytes(bits, this.k), corrected: lowQBits.length - 1, erased: 0 };
+  1317→        }
+  1318→        for (const b of lowQBits) bits[b] ^= 1; // undo
+  1319→        bits[lowQBits[skip]] ^= 1; // undo
+  1320→      }
+  1321→    }
+  1322→
+  1323→    // OSD-1: try flipping each of the least-reliable bits first (fast)
+  1324→    for (let i = 0; i < limit; i++) {
+  1325→      const b1 = sortedIndices[i];
+  1326→      bits[b1] ^= 1;
+  1327→      const zero = this.computeSyndrome(bits, syndrome);
+  1328→      if (zero) {
+  1329→        return { data: bitsToBytes(bits, this.k), corrected: 1, erased: 0 };
+  1330→      }
+  1331→      bits[b1] ^= 1;
+  1332→    }
+  1333→
+  1334→    // OSD-2: try flipping pairs of least-reliable bits
+  1335→    for (let i = 0; i < limit; i++) {
+  1336→      for (let j = i + 1; j < limit; j++) {
+  1337→        const b1 = sortedIndices[i];
+  1338→        const b2 = sortedIndices[j];
+  1339→        bits[b1] ^= 1;
+  1340→        bits[b2] ^= 1;
+  1341→
+  1342→        const zero = this.computeSyndrome(bits, syndrome);
+  1343→        if (zero) {
+  1344→          return { data: bitsToBytes(bits, this.k), corrected: 2, erased: 0 };
+  1345→        }
+  1346→
+  1347→        bits[b1] ^= 1;
+  1348→        bits[b2] ^= 1;
+  1349→      }
+  1350→    }
+  1351→
+  1352→    // OSD-2 failed — throw to signal erasure
+  1353→    throw new Error(
+  1354→      `LDPC soft-decision decode failed: OSD-2 could not find a valid codeword`,
+  1355→    );
+  1356→  }
+  1357→
+  1358→  /**
+  1359→   * Belief-Propagation (Sum-Product) Decoder
+  1360→   *
+  1361→   * The optimal soft-decision decoder for LDPC codes. Iteratively passes
+  1362→   * probability messages between variable nodes (bits) and check nodes (parity
+  1363→   * checks) along the Tanner graph. Converges to the maximum-likelihood codeword
+  1364→   * for codes with large girth (no short cycles).
+  1365→   *
+  1366→   * Algorithm (min-sum approximation for numerical stability):
+  1367→   *   1. Initialize variable node LLRs from channel (Q-scores).
+  1368→   *   2. Variable → Check: send LLR + sum of incoming check→var messages.
+  1369→   *   3. Check → Variable: send product of tanh(incoming var→check / 2).
+  1370→   *   4. Hard-decide and check syndrome. If zero, done.
+  1371→   *   5. Repeat for maxIter iterations.
+  1372→   *
+  1373→   * Complexity: O(iterations × edges) = O(20 × nBits × dv) ≈ O(20 × 304 × 4) = 24K ops.
+  1374→   * Much faster than OSD-2 for the same error-correction capability.
+  1375→   *
+  1376→   * @param recv Received codeword bytes
+  1377→   * @param qScores Per-base Phred Q-scores (null → uniform LLR)
+  1378→   * @param useGoldman Whether Goldman mapping was used
+  1379→   * @param maxIter Max BP iterations (default 20)
+  1380→   */
+  1381→  decodeBeliefPropagation(
+  1382→    recv: Uint8Array,
+  1383→    qScores: Uint8Array | null,
+  1384→    useGoldman: boolean = false,
+  1385→    maxIter: number = 20,
+  1386→  ): LDPCDecodeResult {
+  1387→    // Convert received bytes to bits
+  1388→    const bits = new Uint8Array(this.nBits);
+  1389→    for (let i = 0; i < this.n; i++) {
+  1390→      const b = recv[i];
+  1391→      for (let bit = 0; bit < 8; bit++) {
+  1392→        bits[i * 8 + bit] = (b >> (7 - bit)) & 1;
+  1393→      }
+  1394→    }
+  1395→
+  1396→    // Initialize channel LLRs from Q-scores
+  1397→    // LLR > 0 → bit is likely 0, LLR < 0 → bit is likely 1
+  1398→    const chLLR = new Float64Array(this.nBits);
+  1399→    if (qScores && qScores.length > 0 && !useGoldman) {
+  1400→      // Direct mapping: bit i → base i/2, Q-score from qScores[base]
+  1401→      for (let byteIdx = 0; byteIdx < this.n; byteIdx++) {
+  1402→        for (let bitInByte = 0; bitInByte < 8; bitInByte++) {
+  1403→          const bitIdx = byteIdx * 8 + bitInByte;
+  1404→          const baseIdx = byteIdx * 4 + (bitInByte >> 1);
+  1405→          const q = baseIdx < qScores.length ? qScores[baseIdx] : 30;
+  1406→          const llrMag = (q / 10) * Math.log(10);
+  1407→          chLLR[bitIdx] = bits[bitIdx] === 0 ? llrMag : -llrMag;
+  1408→        }
+  1409→      }
+  1410→    } else {
+  1411→      // Uniform LLR (no soft info, or Goldman where bit-to-base mapping is complex)
+  1412→      const avgQ = (qScores && qScores.length > 0)
+  1413→        ? qScores.reduce((s, q) => s + q, 0) / qScores.length
+  1414→        : 30;
+  1415→      const llrMag = (avgQ / 10) * Math.log(10);
+  1416→      for (let i = 0; i < this.nBits; i++) {
+  1417→        chLLR[i] = bits[i] === 0 ? llrMag : -llrMag;
+  1418→      }
+  1419→    }
+  1420→
+  1421→    // Message arrays:
+  1422→    //   varToCheck[i][e] = message from variable node i to check node (rowCols[j][e])
+  1423→    //   checkToVar[j][e] = message from check node j to variable node (colRows[i][e])
+  1424→    //
+  1425→    // We store messages indexed by the edge position in the adjacency list.
+  1426→    const varToCheck: Float64Array[] = new Array(this.nBits);
+  1427→    const checkToVar: Float64Array[] = new Array(this.mBits);
+  1428→    for (let j = 0; j < this.nBits; j++) {
+  1429→      varToCheck[j] = new Float64Array(this.colRows[j].length);
+  1430→    }
+  1431→    for (let i = 0; i < this.mBits; i++) {
+  1432→      checkToVar[i] = new Float64Array(this.rowCols[i].length);
+  1433→    }
+  1434→
+  1435→    // Initialize varToCheck = channel LLR (no prior checkToVar messages)
+  1436→    for (let j = 0; j < this.nBits; j++) {
+  1437→      for (let e = 0; e < this.colRows[j].length; e++) {
+  1438→        varToCheck[j][e] = chLLR[j];
+  1439→      }
+  1440→    }
+  1441→
+  1442→    // BP iterations
+  1443→    for (let iter = 0; iter < maxIter; iter++) {
+  1444→      // Step 1: Check → Variable messages (min-sum)
+  1445→      // For check node i, connected to variable nodes v_0, ..., v_{dc-1}:
+  1446→      //   msg to v_k = (product of signs of msg_j for j != k) × (min of |msg_j| for j != k)
+  1447→      for (let i = 0; i < this.mBits; i++) {
+  1448→        const cols = this.rowCols[i];
+  1449→        const dc = cols.length;
+  1450→        if (dc === 0) continue;
+  1451→
+  1452→        // First pass: gather all incoming varToCheck messages for this check node
+  1453→        // (uses precomputed reverse edge index — O(1) per edge instead of O(degree))
+  1454→        const msgs = new Float64Array(dc);
+  1455→        const edgeIdxs = this.rowColsReverseIdx[i];
+  1456→        for (let e = 0; e < dc; e++) {
+  1457→          const j = cols[e];
+  1458→          const edgeIdx = edgeIdxs[e];
+  1459→          msgs[e] = edgeIdx >= 0 ? varToCheck[j][edgeIdx] : 0;
+  1460→        }
+  1461→
+  1462→        // Compute global product of signs, and two smallest magnitudes
+  1463→        let signProd = 1;
+  1464→        let minMag = Infinity;
+  1465→        let secondMinMag = Infinity;
+  1466→        let minIdx = -1;
+  1467→        for (let e = 0; e < dc; e++) {
+  1468→          if (msgs[e] < 0) signProd = -signProd;
+  1469→          const mag = Math.abs(msgs[e]);
+  1470→          if (mag < minMag) {
+  1471→            secondMinMag = minMag;
+  1472→            minMag = mag;
+  1473→            minIdx = e;
+  1474→          } else if (mag < secondMinMag) {
+  1475→            secondMinMag = mag;
+  1476→          }
+  1477→        }
+  1478→
+  1479→        // Send messages to each variable node
+  1480→        for (let e = 0; e < dc; e++) {
+  1481→          const j = cols[e];
+  1482→          if (edgeIdxs[e] < 0) continue;
+  1483→
+  1484→          // Min-sum: exclude self
+  1485→          // Sign of message = (product of all signs) / (sign of self)
+  1486→          // In GF(2)/multiplication: sign = signProd * sign(self)  (since 1/sign = sign for ±1)
+  1487→          const selfSign = msgs[e] < 0 ? -1 : 1;
+  1488→          const msgSign = signProd * selfSign; // this gives product of all OTHER signs
+  1489→
+  1490→          // Magnitude: min of all others
+  1491→          const msgMag = (e === minIdx) ? secondMinMag : minMag;
+  1492→
+  1493→          checkToVar[i][e] = msgSign * msgMag;
+  1494→        }
+  1495→      }
+  1496→
+  1497→      // Step 2: Variable → Check messages
+  1498→      // For variable node j: msg to check c_k = chLLR[j] + sum of checkToVar from all other checks
+  1499→      // Also compute total belief for hard decision
+  1500→      const totalBelief = new Float64Array(this.nBits);
+  1501→      for (let j = 0; j < this.nBits; j++) {
+  1502→        const rows = this.colRows[j];
+  1503→        const dv = rows.length;
+  1504→
+  1505→        // Sum all incoming check messages
+  1506→        // (uses precomputed reverse edge index — O(1) per edge instead of O(degree))
+  1507→        const revIdx = this.colRowsReverseIdx[j];
+  1508→        let sumChecks = 0;
+  1509→        for (let e = 0; e < dv; e++) {
+  1510→          const i = rows[e];
+  1511→          const edgeIdx = revIdx[e];
+  1512→          if (edgeIdx !== -1) {
+  1513→            sumChecks += checkToVar[i][edgeIdx];
+  1514→          }
+  1515→        }
+  1516→
+  1517→        // Total belief = channel + all checks
+  1518→        totalBelief[j] = chLLR[j] + sumChecks;
+  1519→
+  1520→        // Send varToCheck = channel + sum of all checks except the recipient
+  1521→        // (uses precomputed reverse edge index — O(1) per edge instead of O(degree))
+  1522→        for (let e = 0; e < dv; e++) {
+  1523→          const i = rows[e];
+  1524→          const edgeIdx = revIdx[e];
+  1525→          if (edgeIdx !== -1) {
+  1526→            varToCheck[j][e] = totalBelief[j] - checkToVar[i][edgeIdx];
+  1527→          }
+  1528→        }
+  1529→      }
+  1530→
+  1531→      // Step 3: Hard decision and syndrome check
+  1532→      const hardDecision = new Uint8Array(this.nBits);
+  1533→      for (let j = 0; j < this.nBits; j++) {
+  1534→        hardDecision[j] = totalBelief[j] < 0 ? 1 : 0;
+  1535→      }
+  1536→
+  1537→      // Compute syndrome
+  1538→      const syndrome = new Uint8Array(this.mBits);
+  1539→      const syndromeZero = this.computeSyndrome(hardDecision, syndrome);
+  1540→      if (syndromeZero) {
+  1541→        // Count corrections
+  1542→        let corrected = 0;
+  1543→        for (let j = 0; j < this.nBits; j++) {
+  1544→          if (hardDecision[j] !== bits[j]) corrected++;
+  1545→        }
+  1546→        return { data: bitsToBytes(hardDecision, this.k), corrected, erased: 0 };
+  1547→      }
+  1548→    }
+  1549→
+  1550→    // BP failed to converge — throw to signal erasure
+  1551→    throw new Error(
+  1552→      `LDPC belief-propagation failed: did not converge after ${maxIter} iterations`,
+  1553→    );
+  1554→  }
+  1555→}
+  1556→
+  1557→/** Convert nBits bits to nbytes bytes (taking the first nbytes*8 bits). */
+  1558→function bitsToBytes(bits: Uint8Array, nbytes: number): Uint8Array {
+  1559→  const out = new Uint8Array(nbytes);
+  1560→  for (let i = 0; i < nbytes; i++) {
+  1561→    let b = 0;
+  1562→    for (let bit = 0; bit < 8; bit++) {
+  1563→      b |= bits[i * 8 + bit] << (7 - bit);
+  1564→    }
+  1565→    out[i] = b;
+  1566→  }
+  1567→  return out;
+  1568→}
+  1569→
+  1570→/**
+  1571→ * Default LDPC inner code for Helix v21+.
+  1572→ *
+  1573→ * Layout (200 nt oligo, 20 nt primers × 2):
+  1574→ *   - 4B address + 30B payload + 4B LDPC parity + 2B CRC-16 = 40 bytes = 160 nt
+  1575→ *   - LDPC codeword = 38 bytes = 304 bits (addr + payload + parity)
+  1576→ *   - LDPC info = 34 bytes = 272 bits (addr + payload)
+  1577→ *   - LDPC parity = 4 bytes = 32 bits
+  1578→ *   - Density: 30*8 / 200 = 1.20 bits/nt total, 30*8 / 160 = 1.50 bits/nt payload-only
+  1579→ *
+  1580→ * For 300 nt oligos (used in Erlich validation):
+  1581→ *   - 4B addr + 51B payload + 4B LDPC parity + 2B CRC = 61 bytes... wait, 65 bytes total inner
+  1582→ *   - 4B addr + 55B payload + 4B LDPC parity + 2B CRC = 65 bytes ✓
+  1583→ *   - LDPC(520 bits, 472 bits, 48 bits)? No, parity stays at 4 bytes.
+  1584→ *   - LDPC(520 bits, 488 bits, 32 bits): 61 bytes info, 4 bytes parity
+  1585→ *   - Wait, n=65 bytes=520 bits, k=61 bytes=488 bits (addr+payload+CRC... no, CRC is outside)
+  1586→ *   - n = 4 + 55 + 4 = 63 bytes (LDPC codeword, excluding CRC)
+  1587→ *   - k = 4 + 55 = 59 bytes
+  1588→ *   - LDPC(504 bits, 472 bits, 32 bits) for 300nt oligo
+  1589→ *
+  1590→ * The constructor takes care of these dimension calculations based on cfg.n and cfg.k.
+  1591→ */
+  1592→export function makeLDPCInner(parityBytes: number, payloadBytes: number, addressBytes: number): LDPCInnerCode {
+  1593→  const k = addressBytes + payloadBytes;
+  1594→  const n = k + parityBytes;
+  1595→  return new LDPCInnerCode({ n, k });
+  1596→}
+  1597→
+  1598→/**
+  1599→ * v63: Module-level LDPC instance cache with LRU eviction.
+  1600→ *
+  1601→ * decode.ts was constructing a NEW LDPCInnerCode for every decodeReads()
+  1602→ * call. Each construction runs PEG construction + column dedup + LUT build,
+  1603→ * which is ~5ms for typical configs. At 100K oligo pools, that's 500 seconds
+  1604→ * of wasted setup time.
+  1605→ *
+  1606→ * The LDPC instance is stateless across decode calls (the syndrome is
+  1607→ * computed fresh each time), so sharing is safe.
+  1608→ *
+  1609→ * Speedup: ~5ms per decode call avoided → significant for small payloads
+  1610→ * where decode is <100ms total.
+  1611→ *
+  1612→ * v64: Added LRU eviction (max 20 entries) to prevent unbounded memory growth.
+  1613→ * Each LDPCInnerCode holds ~O(nBits × mBits) in adjacency arrays and LUTs,
+  1614→ * so at large configs a single instance can be 10+ MB. Without eviction,
+  1615→ * many distinct (n,k) configs would grow the cache without limit.
+  1616→ */
+  1617→const LDPC_CACHE_MAX = 20;
+  1618→const _ldpcCache = new Map<string, LDPCInnerCode>();
+  1619→const _ldpcCacheOrder: string[] = [];
+  1620→
+  1621→export function getCachedLDPCInner(n: number, k: number): LDPCInnerCode {
+  1622→  const key = `${n}:${k}`;
+  1623→  const cached = _ldpcCache.get(key);
+  1624→  if (cached) {
+  1625→    // Move to end (most recently used)
+  1626→    const idx = _ldpcCacheOrder.indexOf(key);
+  1627→    if (idx >= 0) {
+  1628→      _ldpcCacheOrder.splice(idx, 1);
+  1629→      _ldpcCacheOrder.push(key);
+  1630→    }
+  1631→    return cached;
+  1632→  }
+  1633→  // Evict oldest if at capacity
+  1634→  if (_ldpcCacheOrder.length >= LDPC_CACHE_MAX) {
+  1635→    const oldest = _ldpcCacheOrder.shift()!;
+  1636→    _ldpcCache.delete(oldest);
+  1637→  }
+  1638→  const inst = new LDPCInnerCode({ n, k });
+  1639→  _ldpcCache.set(key, inst);
+  1640→  _ldpcCacheOrder.push(key);
+  1641→  return inst;
+  1642→}
+  1643→

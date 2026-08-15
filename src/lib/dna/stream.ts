@@ -69,9 +69,48 @@ export async function* createChunkIterator(
   let offset = 0;
   while (offset < data.length) {
     const end = Math.min(offset + chunkSize, data.length);
-    // Use subarray to avoid copying (caller must not modify in-place).
     yield data.subarray(offset, end);
     offset = end;
+  }
+}
+
+/**
+ * Create an async iterable from a Node.js ReadableStream or web ReadableStream.
+ * Enables true streaming encode/decode from files without loading entire file into RAM.
+ * Peak memory is O(chunkSize).
+ *
+ * @param stream  A ReadableStream (web) or Node.js readable stream.
+ * @param chunkSize  Maximum bytes per buffer hint (default: 64KB).
+ * @yields Uint8Array chunks read from the stream.
+ */
+export async function* createStreamIterator(
+  stream: AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>,
+  chunkSize: number = 65536,
+): AsyncIterable<Uint8Array> {
+  if (chunkSize <= 0) {
+    throw new Error(`chunkSize must be > 0, got ${chunkSize}`);
+  }
+
+  // Web ReadableStream
+  if (typeof ReadableStream !== 'undefined' && stream instanceof ReadableStream) {
+    const reader = (stream as ReadableStream<Uint8Array>).getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length > 0) yield value;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return;
+  }
+
+  // Async iterable (Node.js readable stream)
+  for await (const chunk of stream as AsyncIterable<Uint8Array>) {
+    if (chunk && chunk.length > 0) {
+      yield chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as unknown as ArrayBuffer);
+    }
   }
 }
 

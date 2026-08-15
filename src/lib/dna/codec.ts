@@ -302,7 +302,7 @@ export async function encodeFile(
   // v62: For arithmetic-v2, the LDPC codeword does NOT include the address.
   //   Normal mode:    innerK = addressBytes + payloadBytes, innerN = innerK + parity
   //   Arithmetic-v2:  innerK = payloadBytes (NO address),   innerN = innerK + parity
-  const useArithmeticV2 = (cfg.mappingMode ?? "direct") === "arithmetic";
+  const useArithmeticV2 = (cfg.mappingMode ?? "constrained") === "arithmetic";
   const innerK = useArithmeticV2
     ? layout.payloadBytes
     : layout.addressBytes + layout.payloadBytes;
@@ -368,10 +368,12 @@ export async function encodeFile(
       gcMax: cfg.constraints.gcMax,
       maxHomopolymer: cfg.constraints.maxHomopolymer,
     };
-    const useGoldman = (cfg.mappingMode ?? "direct") === "goldman";
-    const useConstrained = (cfg.mappingMode ?? "direct") === "constrained";
-    const useSrt = (cfg.mappingMode ?? "direct") === "srt";
-    const useArithmetic = (cfg.mappingMode ?? "direct") === "arithmetic";
+    const useGoldman = (cfg.mappingMode ?? "constrained") === "goldman";
+    const useConstrained = (cfg.mappingMode ?? "constrained") === "constrained";
+    const useSrt = (cfg.mappingMode ?? "constrained") === "srt";
+    const useArithmetic = (cfg.mappingMode ?? "constrained") === "arithmetic";
+    const useBHE = (cfg.mappingMode ?? "constrained") === "bhe";
+    const useYYC = (cfg.mappingMode ?? "constrained") === "yinyang";
     let seed = 0;
     let dna = "";
     let attempts = 0;
@@ -556,6 +558,51 @@ export async function encodeFile(
       bestDna = dna;
       bestSeed = 0;
       bestSatisfied = true;
+    } else if (useBHE) {
+      // BHE FSM deterministic encoding — zero retries, guaranteed constraints.
+      // Uses the full bhe-encode.ts module with BigInt variable-base conversion.
+      const { bheEncode } = await import('./bhe-encode');
+      const address = rawAddress.slice();
+      address[3] = 0;
+      const whitenedAddress = whitenAddress(address);
+      const rsData = new Uint8Array(innerK);
+      rsData.set(whitenedAddress, 0);
+      rsData.set(payload, layout.addressBytes);
+      const rsCodeword = useLDPC && innerLdpcReal
+        ? innerLdpcReal.encode(rsData)
+        : innerRsReal.encode(rsData);
+      const crc = crc16Bytes(rsCodeword);
+      const innerBlock = new Uint8Array(totalNtBytes(layout));
+      innerBlock.set(rsCodeword, 0);
+      innerBlock.set(crc, rsCodeword.length);
+      // BHE encode: deterministic, no homopolymers > maxRun
+      const bheResult = bheEncode(innerBlock, { maxRun: cfg.constraints.maxHomopolymer, enforceGC: true, gcMin: cfg.constraints.gcMin, gcMax: cfg.constraints.gcMax });
+      dna = bheResult.dna;
+      bestDna = dna;
+      bestSeed = 0;
+      bestSatisfied = true;
+    } else if (useYYC) {
+      // YYC Yin-Yang high-density encoding — 2 bits/nt with rotating rule matrix.
+      // Deterministic, no homopolymers, ~50% GC by construction.
+      const { yycEncode } = await import('./yinyang');
+      const address = rawAddress.slice();
+      address[3] = 0;
+      const whitenedAddress = whitenAddress(address);
+      const rsData = new Uint8Array(innerK);
+      rsData.set(whitenedAddress, 0);
+      rsData.set(payload, layout.addressBytes);
+      const rsCodeword = useLDPC && innerLdpcReal
+        ? innerLdpcReal.encode(rsData)
+        : innerRsReal.encode(rsData);
+      const crc = crc16Bytes(rsCodeword);
+      const innerBlock = new Uint8Array(totalNtBytes(layout));
+      innerBlock.set(rsCodeword, 0);
+      innerBlock.set(crc, rsCodeword.length);
+      const yycResult = yycEncode(innerBlock, { ruleSet: 2 });
+      dna = yycResult.dna;
+      bestDna = dna;
+      bestSeed = 0;
+      bestSatisfied = true;
     } else {
       // Direct 2-bit mapping with constraint screening + seed retries.
       // Optimized: precompute the non-changing parts, only re-encode the changed parts.
@@ -713,7 +760,7 @@ export async function encodeFile(
     innerRS: { n: innerN, k: innerK },
     innerCode: useLDPC ? "ldpc" : "rs",
     ldpcDecoder: cfg.ldpcDecoder as "hard" | "osd" | "bp" | "auto" | undefined,
-    mappingMode: (cfg.mappingMode ?? "direct") as "direct" | "goldman" | "constrained" | "srt" | "arithmetic",
+    mappingMode: (cfg.mappingMode ?? "constrained") as "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang",
     goldmanMode: (cfg.goldmanMode ?? "fast") as "fast" | "dense",
     outerRS: { n: outerN, k: outerK },
     parityOligos: parityCount,
@@ -942,7 +989,7 @@ export async function encodeToCanonical(
     ? new ReedSolomon216({ n: innerRsN, k: layout.addressBytes + layout.payloadBytes })
     : new ReedSolomon({ n: innerRsN, k: layout.addressBytes + layout.payloadBytes });
 
-  const useArithmeticV2 = (cfg.mappingMode ?? "direct") === "arithmetic";
+  const useArithmeticV2 = (cfg.mappingMode ?? "constrained") === "arithmetic";
   const innerK = useArithmeticV2
     ? layout.payloadBytes
     : layout.addressBytes + layout.payloadBytes;
@@ -1039,7 +1086,7 @@ export async function encodeToCanonical(
     innerRS: { n: innerN, k: innerK },
     innerCode: useLDPC ? "ldpc" : "rs",
     ldpcDecoder: cfg.ldpcDecoder as "hard" | "osd" | "bp" | "auto" | undefined,
-    mappingMode: (cfg.mappingMode ?? "direct") as "direct" | "goldman" | "constrained" | "srt" | "arithmetic",
+    mappingMode: (cfg.mappingMode ?? "constrained") as "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang",
     goldmanMode: (cfg.goldmanMode ?? "fast") as "fast" | "dense",
     outerRS: { n: outerN, k: outerK },
     parityOligos: parityCount,
@@ -1082,11 +1129,11 @@ export function canonicalToSynthesis(
 ): EncodedFile {
   const layout = computeLayoutAuto(cfg);
   const { fwd, rev } = getPrimers(cfg);
-  const useArithmeticV2 = (cfg.mappingMode ?? "direct") === "arithmetic";
-  const useGoldman = (cfg.mappingMode ?? "direct") === "goldman";
-  const useConstrained = (cfg.mappingMode ?? "direct") === "constrained";
-  const useSrt = (cfg.mappingMode ?? "direct") === "srt";
-  const useArithmetic = (cfg.mappingMode ?? "direct") === "arithmetic";
+  const useArithmeticV2 = (cfg.mappingMode ?? "constrained") === "arithmetic";
+  const useGoldman = (cfg.mappingMode ?? "constrained") === "goldman";
+  const useConstrained = (cfg.mappingMode ?? "constrained") === "constrained";
+  const useSrt = (cfg.mappingMode ?? "constrained") === "srt";
+  const useArithmetic = (cfg.mappingMode ?? "constrained") === "arithmetic";
 
   const constraints = {
     gcMin: cfg.constraints.gcMin,

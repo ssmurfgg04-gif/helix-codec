@@ -44,8 +44,8 @@ export interface CodecMetadata {
   innerCode: "rs" | "ldpc";
   /** LDPC decoder mode ("hard", "osd", "bp", or "auto"). */
   ldpcDecoder?: "hard" | "osd" | "bp" | "auto";
-  /** DNA mapping mode ("direct", "goldman", "constrained", "srt", or "arithmetic"). */
-  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic";
+  /** DNA mapping mode. */
+  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang";
   /** Goldman trit packing mode ("fast" or "dense"). Only used when mappingMode="goldman". */
   goldmanMode?: "fast" | "dense";
   /** Outer RS config (across oligos). */
@@ -145,7 +145,7 @@ export interface CodecConfig {
    * Default: "constrained" (since v23.0). Best of both worlds: full 2.0 bits/nt
    * density AND homopolymer-free without screening.
    */
-  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic";
+  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang";
   /**
    * Goldman trit packing mode (only used when mappingMode === "goldman"):
    *   - "fast"  — 1 byte → 6 trits (3^6=729>256). Density 1.333 bits/nt. Simple.
@@ -298,7 +298,7 @@ export const DEFAULT_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 4,
   outerParityRatio: 0.1,
   constraints: {
@@ -335,7 +335,7 @@ export const NANOPORE_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 4,
   outerParityRatio: 0.5, // 5× more parity for IDS recovery
   constraints: {
@@ -361,7 +361,7 @@ export const PACBIO_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 4,
   outerParityRatio: 0.4,
   constraints: {
@@ -466,7 +466,7 @@ export function computeLayout(cfg: CodecConfig): OligoLayout {
 
   if (innerNt % modUnit !== 0) {
     throw new Error(
-      `inner nt length ${innerNt} must be divisible by ${modUnit} (got oligoLength=${cfg.oligoLength}, primerLen=${cfg.primerLength}, mappingMode=${cfg.mappingMode ?? "direct"}, goldmanMode=${cfg.goldmanMode ?? "fast"})`,
+      `inner nt length ${innerNt} must be divisible by ${modUnit} (got oligoLength=${cfg.oligoLength}, primerLen=${cfg.primerLength}, mappingMode=${cfg.mappingMode ?? "constrained"}, goldmanMode=${cfg.goldmanMode ?? "fast"})`,
     );
   }
 
@@ -741,7 +741,7 @@ export function computeLayoutAuto(cfg: CodecConfig): OligoLayout {
     return computeLayoutConv(cfg);
   }
   // v62: arithmetic mode uses the v2 layout (address outside arithmetic stream)
-  if ((cfg.mappingMode ?? "direct") === "arithmetic") {
+  if ((cfg.mappingMode ?? "constrained") === "arithmetic") {
     return computeLayoutArithmeticV2(cfg);
   }
   return computeLayout(cfg);

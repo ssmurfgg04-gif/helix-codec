@@ -132,7 +132,7 @@ export const ULTIMATE_NANOPORE_V52_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct", // conv inner only supports direct mapping in v52
+  mappingMode: "constrained", // conv inner only supports direct mapping in v52
   innerParityBytes: 8, // v57: increased from 4 to 8 for better IDS recovery
   outerParityRatio: 0.4, // v57→v64: increased from 0.25 to 0.4 for more erasure correction
   constraints: {
@@ -183,7 +183,7 @@ export const ULTIMATE_V55_DENSITY_CONFIG: CodecConfig = {
   // Density: 1.663 b/nt (was 1.708 with 4B — 2.6% density loss for reliability).
   // Arithmetic mode is implemented but blocked by address clustering (v59 fix:
   // k-mer clustering now wired in, but arithmetic decode path needs more work).
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 8, // v59: was 4, increased to 8 for reliable hash verification
   outerParityRatio: 0.03,
   constraints: {
@@ -246,7 +246,7 @@ export const V51_DEFAULT_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 4,
   outerParityRatio: 0.1,
   constraints: {
@@ -404,7 +404,7 @@ export const ULTIMATE_V61_NANOPORE_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct", // conv inner only supports direct mapping
+  mappingMode: "constrained", // conv inner only supports direct mapping
   innerParityBytes: 8,
   outerParityRatio: 0.4, // v61→v64: increased from 0.25 to 0.4 for more erasure correction
   constraints: {
@@ -469,7 +469,7 @@ export const ULTIMATE_V63_HD_CONFIG: CodecConfig = {
   ldpcDecoder: "auto",
   // v63: Direct mode + longer oligos + lighter parity = true density win.
   // arithmetic-v2 is REGRESSION at every oligo length (see note above).
-  mappingMode: "direct",
+  mappingMode: "constrained",
   innerParityBytes: 4, // v63: 4B reliable thanks to v61 hash-FAIL fixes
   outerParityRatio: 0.02, // v63: 2% outer RS — lighter than v55's 3%
   constraints: {
@@ -523,7 +523,7 @@ export const ULTIMATE_V64_REAL_2024_CONFIG: CodecConfig = {
   primerLength: 20,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "direct", // conv inner only supports direct mapping
+  mappingMode: "constrained", // conv inner only supports direct mapping
   innerParityBytes: 10, // strong inner parity for 12.3% total IDS
   outerParityRatio: 0.5, // 50% outer RS — needed for 12.3% total IDS erasure recovery
   constraints: {
@@ -592,7 +592,7 @@ export function computeDensity(
     goldman: 1.538, // dense mode
     arithmetic: 1.9,
   };
-  const rate = mappingRate[cfg.mappingMode ?? "direct"] ?? 2.0;
+  const rate = mappingRate[cfg.mappingMode ?? "constrained"] ?? 2.0;
   const innerNt = cfg.oligoLength - 2 * cfg.primerLength;
   const innerBits = innerNt * rate;
   // v55 fix: ntPerByte should be derived from the mapping rate, not hardcoded.

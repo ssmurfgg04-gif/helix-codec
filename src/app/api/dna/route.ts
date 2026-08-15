@@ -234,15 +234,12 @@ export async function POST(req: NextRequest) {
       default:
         return NextResponse.json({ ok: false, error: `Unknown op: ${op}` }, { status: 400 });
     }
-  } catch (e) {
-    console.error("DNA API error:", e);
-    const isDev = process.env.NODE_ENV !== 'production';
+  } catch (error) {
+    console.error("DNA API error:", error);
+    const message = process.env.NODE_ENV === 'development' && error instanceof Error
+      ? error.message : 'Internal error';
     return NextResponse.json(
-      { 
-        ok: false, 
-        error: (e as Error).message,
-        ...(isDev && { stack: (e as Error).stack }),
-      },
+      { ok: false, error: message },
       { status: 500 },
     );
   }

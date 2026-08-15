@@ -1596,7 +1596,7 @@ export function makeLDPCInner(parityBytes: number, payloadBytes: number, address
 }
 
 /**
- * v63: Module-level LDPC instance cache with LRU eviction.
+ * Module-level LDPC instance cache with LRU eviction.
  *
  * decode.ts was constructing a NEW LDPCInnerCode for every decodeReads()
  * call. Each construction runs PEG construction + column dedup + LUT build,
@@ -1609,34 +1609,32 @@ export function makeLDPCInner(parityBytes: number, payloadBytes: number, address
  * Speedup: ~5ms per decode call avoided → significant for small payloads
  * where decode is <100ms total.
  *
- * v64: Added LRU eviction (max 20 entries) to prevent unbounded memory growth.
+ * LRU eviction (max MAX_CACHE_SIZE entries) prevents unbounded memory growth.
  * Each LDPCInnerCode holds ~O(nBits × mBits) in adjacency arrays and LUTs,
  * so at large configs a single instance can be 10+ MB. Without eviction,
  * many distinct (n,k) configs would grow the cache without limit.
+ *
+ * Uses Map's insertion-order guarantee: first key is the oldest entry.
+ * On cache hit, the entry is deleted and re-inserted to move it to the end.
  */
-const LDPC_CACHE_MAX = 20;
+const MAX_CACHE_SIZE = 32;
 const _ldpcCache = new Map<string, LDPCInnerCode>();
-const _ldpcCacheOrder: string[] = [];
 
 export function getCachedLDPCInner(n: number, k: number): LDPCInnerCode {
   const key = `${n}:${k}`;
   const cached = _ldpcCache.get(key);
   if (cached) {
-    // Move to end (most recently used)
-    const idx = _ldpcCacheOrder.indexOf(key);
-    if (idx >= 0) {
-      _ldpcCacheOrder.splice(idx, 1);
-      _ldpcCacheOrder.push(key);
-    }
+    // Move to end (most recently used) by re-inserting
+    _ldpcCache.delete(key);
+    _ldpcCache.set(key, cached);
     return cached;
   }
-  // Evict oldest if at capacity
-  if (_ldpcCacheOrder.length >= LDPC_CACHE_MAX) {
-    const oldest = _ldpcCacheOrder.shift()!;
+  // Evict oldest (first key in Map iteration order) if at capacity
+  if (_ldpcCache.size >= MAX_CACHE_SIZE) {
+    const oldest = _ldpcCache.keys().next().value!;
     _ldpcCache.delete(oldest);
   }
   const inst = new LDPCInnerCode({ n, k });
   _ldpcCache.set(key, inst);
-  _ldpcCacheOrder.push(key);
   return inst;
 }
