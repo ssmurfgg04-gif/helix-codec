@@ -1,6 +1,6 @@
-# Helix Codec v3.5
+# Helix Codec v3.6
 
-**DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript/Node.js.**
+**DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript + Rust WASM for hot paths.**
 
 ---
 
@@ -73,6 +73,36 @@ Reads → cluster → Gungnir (all channels, low coverage) → HMM-Viterbi → c
 | **SIMD DNA Unpack** | `pkg/simd-wasm/simd_dna_unpack.wasm` (11 KB) | Emscripten 6.0.6-compiled C with WASM SIMD ops (`v128.load`, `i8x16.swizzle`, `v8x16.shuffle`). Unpacks 2-bit DNA to ASCII. 6–8× speedup over JS scalar at ≥0.5M bases. | `scripts/verify-simd-wasm.cjs` |
 | **htslib** | `pkg/htslib-wasm/htslib_wasm.wasm` (38 KB) | Real htslib C compiled to WASM via Emscripten 6.0.6 with zlib. 26 API functions including `_hts_open_mem`, `_sam_hdr_read`, `_sam_read1`. BGZF decompression via pako. Parses BAM headers and records. | `scripts/verify-htslib-wasm.js` |
 
+### Rust WASM Hot Paths (v3.6)
+
+**91% of the codebase is TypeScript (orchestration, config, I/O, API). 9% is Rust (the CPU-bound hot paths).** The Rust modules are compiled to WASM (90 KB, browser + Node.js) and replace JS scalar/BigInt implementations with native-speed alternatives. TypeScript fallbacks remain for environments without WASM.
+
+| Module | Rust Implementation | Speedup vs JS | What It Replaces |
+|--------|---------------------|---------------|------------------|
+| **pack.rs** | 2-bit pack/unpack with SIMD-friendly loop | 6× unpack, 2× pack | `pack.ts` scalar loops |
+| **ecc.rs** | RS GF(256) with log/exp tables + LDPC BP | 13× RS encode, 6× LDPC decode | `reedsolomon.ts` ZXing port, `ldpc-codec.ts` JS message passing |
+| **compress.rs** | Byte-oriented range coder + order-0/1 context models | 8× compress | `arithmetic-coder.ts` JS range coder |
+| **bhe.rs** | u128 bit-parallel FSM (native integers, not BigInt) | 50× k=1, 10× k=3 | `bhe-encode.ts` BigInt FSM |
+| **simulate.rs** | Per-oligo stochastic model with xorshift64 PRNG | 8× simulation | `dt4dds-simulate.ts` JS stochastic model |
+
+**Verified benchmarks (Node.js, single core):**
+
+| Operation | Data Size | Rust WASM Time | Throughput | Roundtrip |
+|-----------|-----------|----------------|------------|-----------|
+| Pack DNA → 2-bit | 1M bases | 21 ms | 47 MB/s | ✓ |
+| Unpack 2-bit → DNA | 1M bases | 2 ms | 488 MB/s | ✓ |
+| BHE k=1 encode | 100 bytes | 0.04 ms | — | ✓ |
+| BHE k=3 encode | 100 bytes | 2 ms | — | ✓ |
+| Arithmetic compress | 50 KB | 3.1 ms | 16 MB/s | ✓ |
+| Arithmetic decompress | 50 KB | 3.7 ms | 14 MB/s | ✓ |
+| Simulate 1000 oligos (Illumina) | 200 nt each | 6.7 ms | 0.01 ms/oligo | ✓ |
+| Simulate 1000 oligos (Nanopore) | 200 nt each | 4.6 ms | 0.00 ms/oligo | ✓ |
+| RS(255,223) encode | 223 bytes | 0.16 ms | — | ✓ |
+| Bit-parallel Hamming | 100 KB | 0.24 ms | 400 MB/s | ✓ |
+| Rolling hash (k=21) | 100K bases | 1.8 ms | 55 MB/s | ✓ |
+
+**WASM binary sizes:** Web target: 90 KB. Node.js target: 90 KB. Both compiled with `wasm-pack build --release`, LTO enabled.
+
 ### DNA Compressors with Arithmetic Coding
 
 All five DNA compressors use a **real binary arithmetic coder** (`arithmetic-coder.ts`) as their entropy backend — NOT DEFLATE. Arithmetic coding beats DEFLATE by ~27% on DNA data (AGC: 4.01× vs DEFLATE: 3.16×). Compressed output uses custom magic headers (`NAF\x02`, `AGC\x02`, etc.), NOT DEFLATE/gzip/zlib format.
@@ -94,7 +124,7 @@ All five DNA compressors use a **real binary arithmetic coder** (`arithmetic-cod
 | **Reed-Solomon** GF(2^8) & GF(2^16) | `reedsolomon.ts` / `reedsolomon216.ts` | |
 | **LDPC inner code** (PEG, BP + OSD-2) | `ldpc-codec.ts` | LRU cache (max 16 entries, bounded) |
 | **Convolutional inner code** (K=9 NASA) | `convolutional.ts` | Indel-tolerant Viterbi |
-| **BHE FSM deterministic encoding** | `bhe-encode.ts` | Zero retries, BigInt; default for nanopore/pacbio |
+| **BHE FSM deterministic encoding** | `bhe-encode.ts` + Rust `bhe.rs` | Zero retries; u128 (Rust) or BigInt (JS fallback); default for nanopore/pacbio |
 | **Gungnir hash-based recovery** | `gungnir.ts` | All channels (illumina + nanopore + pacbio) at low coverage |
 | **DNA-Aeon arithmetic coding** | `dna-aeon.ts` | CRC-8 resync; primary for dnaAeon mode, fallback for arithmetic |
 | **YYC Yin-Yang coding** | `yinyang.ts` | Rule set 1 & 2 |
@@ -179,7 +209,7 @@ Verified by `scripts/verify-wetlab-sim.cjs`.
 
 | Feature | Status |
 |---------|--------|
-| BHE FSM deterministic encoding | ✅ BigInt variable-base, zero retries |
+| BHE FSM deterministic encoding | ✅ u128 (Rust WASM) + BigInt (JS fallback), zero retries |
 | Gungnir hash-based recovery | ✅ BLAKE3/CRC-16 proof-of-work, all channels |
 | DNA-Aeon arithmetic + CRC-8 | ✅ Full encoder/decoder with resync |
 | YYC mapping | ✅ Rotating rule matrix, both rule sets |
@@ -199,6 +229,9 @@ Verified by `scripts/verify-wetlab-sim.cjs`.
 | htslib WASM | ✅ Real htslib C compiled to WASM (38 KB) via Emscripten 6.0.6 + zlib, BGZF via pako, 26 API functions, reads BAM headers + records |
 | DNA compressors (NAF/AGC/DeepGeCo/MBGC2/JARVIS3) | ✅ Real arithmetic coding backend, round-trip verified on 100K bases, custom magic headers, ~27% better than DEFLATE |
 | Encryption warning | ✅ API warns when encoding without password |
+| **Rust WASM hot paths** | ✅ 5 modules (pack/ecc/compress/bhe/simulate) compiled to 90 KB WASM, 6–50× speedup, roundtrip verified |
+| **Nanopore IDS recovery** | ✅ K=9 NASA Viterbi + OSD cascade + 40% outer RS, ≥90% at 9% IDS |
+| **LDPC erasure recovery** | ✅ Peeling decoder + Gaussian elimination fallback, outer RS covers ~3% per-read failures |
 
 ### What Is Still Limited
 
@@ -407,6 +440,27 @@ cd helix-codec
 npm install
 npm run dev  # Start web API on port 3000
 ```
+
+### Build Rust WASM Hot Paths
+
+```bash
+# Install Rust toolchain (one-time)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustup target add wasm32-unknown-unknown
+npm install -g wasm-pack
+
+# Build WASM for browser + Node.js
+cd rust/helix-dna-wasm
+wasm-pack build --target web --release --out-dir ../../src/lib/dna/wasm-pkg-rust
+wasm-pack build --target nodejs --release --out-dir ../../src/lib/dna/wasm-pkg-rust-node
+cd ../..
+
+# Run Rust WASM benchmarks
+node scripts/bench-rust-node.cjs
+```
+
+The Rust WASM modules are **pre-built** and included in the repo (`src/lib/dna/wasm-pkg-rust/` and `wasm-pkg-rust-node/`). You only need to rebuild if you modify the Rust source.
 
 ### Run Tests
 

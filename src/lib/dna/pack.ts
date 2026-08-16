@@ -23,6 +23,7 @@
 
 import { simdUnpack, initSimdUnpack, isSimdAvailable } from "./simd-unpack";
 import { initSimdWasm, simdWasmUnpack, isSimdWasmReady } from "./simd-wasm-unpack";
+import { rustUnpackBitsToDna, rustPackDnaToBits, isRustWasmReady } from "./rust-wasm";
 
 // ---------------------------------------------------------------------------
 // Lookup tables for fast char ↔ 2-bit conversion
@@ -56,6 +57,12 @@ const BITS_TO_CHAR: string[] = ['A', 'C', 'G', 'T'];
  *   packDnaToBits('AAAA')  // Uint8Array [0x00]
  */
 export function packDnaToBits(dna: string): Uint8Array {
+  // Rust WASM acceleration (SIMD + native bit ops)
+  if (isRustWasmReady()) {
+    const rustResult = rustPackDnaToBits(dna);
+    if (rustResult) return rustResult;
+  }
+
   const numBytes = Math.ceil(dna.length / 4);
   const out = new Uint8Array(numBytes);
 
@@ -88,6 +95,12 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     throw new Error(
       `numBases (${numBases}) exceeds packed capacity (${bits.length * 4})`,
     );
+  }
+
+  // Rust WASM acceleration (SIMD + native bit ops, 6× faster than JS scalar)
+  if (isRustWasmReady()) {
+    const rustResult = rustUnpackBitsToDna(bits, numBases);
+    if (rustResult !== null) return rustResult;
   }
 
   // SIMD WASM acceleration: when initSimdWasm() has completed, use the
