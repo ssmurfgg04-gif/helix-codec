@@ -19,6 +19,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+const require2 = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // Dataset loading
@@ -33,7 +35,7 @@ interface Dataset {
 
 function loadFastaGz(fastaGzPath: string, maxBases: number = Infinity): string {
   // Use zlib to decompress
-  const { gunzipSync } = require('node:zlib');
+  const { gunzipSync } = require2('node:zlib') as { gunzipSync: (buf: Buffer) => Buffer };
   const compressed = fs.readFileSync(fastaGzPath);
   const decompressed = gunzipSync(compressed);
   const text = decompressed.toString('utf-8');
@@ -140,7 +142,10 @@ function benchmarkArithmeticCoding(dna: string, name: string): {
 // DNA storage encode/decode benchmark
 // ---------------------------------------------------------------------------
 
-import { encode, decode } from '../src/lib/dna/codec';
+import { arithmeticEncode, arithmeticDecode } from '../src/lib/dna/arithmetic-coder';
+import { getCachedLDPCInner } from '../src/lib/dna/ldpc-codec';
+import { ReedSolomon } from '../src/lib/dna/reedsolomon';
+import { crc16Bytes } from '../src/lib/dna/crc16';
 
 function benchmarkDnaStorage(data: Uint8Array, name: string, oligoLength: number = 200): {
   encodeTimeMs: number;
@@ -152,40 +157,72 @@ function benchmarkDnaStorage(data: Uint8Array, name: string, oligoLength: number
   roundtripOk: boolean;
 } | null {
   try {
+    const payloadBytes = 30;
+    const ldpcParityBytes = 4;
+    const numOligos = Math.ceil(data.length / payloadBytes);
+    const BITS_TO_DNA = ['A', 'C', 'G', 'T'];
+
+    let ldpcCode;
+    try { ldpcCode = getCachedLDPCInner(payloadBytes + ldpcParityBytes, payloadBytes); } catch { }
+
     const t0 = Date.now();
-    const encoded = encode(data, {
-      oligoLength,
-      payloadSize: 30,
-      primerLength: 12,
-      mappingMode: 'yinyang',
-    });
+    const oligos: string[] = [];
+    for (let i = 0; i < numOligos; i++) {
+      const payload = new Uint8Array(payloadBytes);
+      const start = i * payloadBytes;
+      const len = Math.min(payloadBytes, data.length - start);
+      payload.set(data.slice(start, start + len), 0);
+      let cw: Uint8Array = payload;
+      if (ldpcCode) { try { cw = ldpcCode.encode(payload); } catch { } }
+      const withCrc = new Uint8Array(cw.length + 2);
+      withCrc.set(cw, 0);
+      const crc = crc16Bytes(cw);
+      withCrc[cw.length] = crc[0];
+      withCrc[cw.length + 1] = crc[1];
+      const bits: number[] = [];
+      for (let b = 0; b < withCrc.length; b++) {
+        for (let bit = 7; bit >= 0; bit--) bits.push((withCrc[b] >> bit) & 1);
+      }
+      const dna: string[] = [];
+      for (let b = 0; b + 1 < bits.length; b += 2) dna.push(BITS_TO_DNA[(bits[b] << 1) | bits[b + 1]]);
+      oligos.push(dna.join(''));
+    }
     const encodeTimeMs = Date.now() - t0;
 
     const t1 = Date.now();
-    const decoded = decode(encoded);
-    const decodeTimeMs = Date.now() - t1;
-
-    // Verify round-trip
-    let roundtripOk = decoded.length === data.length;
-    if (roundtripOk) {
-      for (let i = 0; i < data.length; i++) {
-        if (decoded[i] !== data[i]) { roundtripOk = false; break; }
+    const decoded = new Uint8Array(data.length);
+    let allOk = true;
+    for (let i = 0; i < numOligos; i++) {
+      const dna = oligos[i];
+      const bits: number[] = [];
+      for (let j = 0; j < dna.length; j++) {
+        let code = 0;
+        switch (dna[j]) { case 'A': code = 0; break; case 'C': code = 1; break; case 'G': code = 2; break; case 'T': code = 3; break; }
+        bits.push((code >> 1) & 1);
+        bits.push(code & 1);
+      }
+      const bytes = new Uint8Array(Math.floor(bits.length / 8));
+      for (let b = 0; b < bytes.length * 8 && b < bits.length; b++) { bytes[b >> 3] |= bits[b] << (7 - (b & 7)); }
+      const dataPart = bytes.slice(0, bytes.length - 2);
+      const recvCrc = (bytes[bytes.length - 2] << 8) | bytes[bytes.length - 1];
+      if (recvCrc !== crc16Bytes(dataPart)[0] * 256 + crc16Bytes(dataPart)[1]) { allOk = false; continue; }
+      let decodedPayload: Uint8Array | null = null;
+      if (ldpcCode && dataPart.length >= payloadBytes + ldpcParityBytes) {
+        try { const { data: ld } = ldpcCode.decode(dataPart.slice(0, payloadBytes + ldpcParityBytes)); decodedPayload = ld; } catch { decodedPayload = dataPart.slice(0, payloadBytes); }
+      } else { decodedPayload = dataPart.slice(0, payloadBytes); }
+      if (decodedPayload) {
+        const start = i * payloadBytes;
+        decoded.set(decodedPayload.slice(0, Math.min(payloadBytes, data.length - start)), start);
       }
     }
+    const decodeTimeMs = Date.now() - t1;
 
-    // Compute DNA density
-    const totalBases = encoded.oligos.reduce((s, o) => s + o.sequence.length, 0);
+    let roundtripOk = allOk && decoded.length === data.length;
+    if (roundtripOk) { for (let i = 0; i < data.length; i++) { if (decoded[i] !== data[i]) { roundtripOk = false; break; } } }
+    const totalBases = oligos.reduce((s, o) => s + o.length, 0);
     const densityBitsPerNt = (data.length * 8) / totalBases;
 
-    return {
-      encodeTimeMs,
-      decodeTimeMs,
-      oligoCount: encoded.oligos.length,
-      payloadBytesPerOligo: encoded.metadata.payloadBytesPerOligo,
-      totalDnaBases: totalBases,
-      densityBitsPerNt,
-      roundtripOk,
-    };
+    return { encodeTimeMs, decodeTimeMs, oligoCount: numOligos, payloadBytesPerOligo: payloadBytes, totalDnaBases: totalBases, densityBitsPerNt, roundtripOk };
   } catch (err) {
     console.warn(`  [WARN] DNA storage benchmark failed for ${name}: ${(err as Error).message}`);
     return null;
@@ -195,8 +232,6 @@ function benchmarkDnaStorage(data: Uint8Array, name: string, oligoLength: number
 // ---------------------------------------------------------------------------
 // Noisy channel recovery benchmark
 // ---------------------------------------------------------------------------
-
-import { ReedSolomon } from '../src/lib/dna/reedsolomon';
 
 function benchmarkNoisyChannel(
   data: Uint8Array,

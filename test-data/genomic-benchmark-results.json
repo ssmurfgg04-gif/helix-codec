@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-08-16T20:52:21.814Z",
+  "datasets": [
+    {
+      "name": "E. coli K-12",
+      "length": 1000000,
+      "gcContent": 0.528237
+    },
+    {
+      "name": "S. cerevisiae",
+      "length": 1000000,
+      "gcContent": 0.377247
+    },
+    {
+      "name": "Random (control)",
+      "length": 1000000,
+      "gcContent": 0.5
+    }
+  ],
+  "arithmeticCoding": {
+    "E. coli K-12": {
+      "order0Ratio": 0.203484,
+      "order2Ratio": 0.203518,
+      "order0TimeMs": 73,
+      "order2TimeMs": 133,
+      "roundtripOk": true
+    },
+    "S. cerevisiae": {
+      "order0Ratio": 0.197402,
+      "order2Ratio": 0.197426,
+      "order0TimeMs": 62,
+      "order2TimeMs": 119,
+      "roundtripOk": true
+    },
+    "Random (control)": {
+      "order0Ratio": 0.250026,
+      "order2Ratio": 0.25006,
+      "order0TimeMs": 69,
+      "order2TimeMs": 123,
+      "roundtripOk": true
+    }
+  }
+}
