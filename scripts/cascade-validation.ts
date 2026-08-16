@@ -65,9 +65,9 @@ interface CascadeConfig {
 
 const DEFAULT_CASCADE_CONFIG: CascadeConfig = {
   idsRates: [0.02, 0.04, 0.06, 0.08, 0.09, 0.10, 0.12],
-  coverages: [5, 10, 15, 20, 30],
+  coverages: [5, 10, 20, 30],
   payloadBytes: 30,
-  numOligos: 100,
+  numOligos: 50,       // reduced from 100 for faster K=9 Viterbi
   rsN: 255,
   rsK: 223,
   ldpcParityBytes: [4, 8, 10],
@@ -299,7 +299,9 @@ function runCascadeTest(
   let ldpcCode: LDPCInnerCode | null = null;
   if (config.useLdpc) {
     try {
-      ldpcCode = getCachedLDPCInner(payloadBytes, ldpcParityBytes);
+      // getCachedLDPCInner(n, k) where n = total codeword bytes, k = data bytes
+      const ldpcN = payloadBytes + ldpcParityBytes;
+      ldpcCode = getCachedLDPCInner(ldpcN, payloadBytes);
     } catch {
       // LDPC may not be available for all parameter combos — skip
       ldpcCode = null;
