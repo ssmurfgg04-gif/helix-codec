@@ -284,29 +284,200 @@ export function constrainedDnaToBytes(dna: string, maxHomopolymer: number = 3, e
 
 /**
  * Encode bytes to DNA using split constrained mapping.
- * The first `directBytes` use direct mapping, the rest use constrained.
- * This is kept for backward compatibility but is identical to full constrained
- * since the permutation approach has no erasures.
+ * The first `directBytes` use direct 2-bit mapping (no erasures, reliable clustering),
+ * the rest use constrained mapping (homopolymer-free with ~1.1% erasure rate).
+ *
+ * This is critical for correct address extraction during clustering: the address
+ * bytes MUST be direct-mapped so that dnaToBytes() can recover the oligo index.
  */
 export function bytesToSplitConstrainedDna(
   data: Uint8Array,
   maxHomopolymer: number = 3,
-  _directBytes: number = 4,
+  directBytes: number = 4,
 ): string {
-  return bytesToConstrainedDna(data, maxHomopolymer);
+  if (directBytes <= 0) {
+    return bytesToConstrainedDna(data, maxHomopolymer);
+  }
+
+  // Part 1: Direct 2-bit mapping for the first `directBytes` bytes
+  const directDna = bytesToDnaDirect(data.slice(0, directBytes));
+
+  // Part 2: Constrained mapping for the remaining bytes.
+  // We need to seed the constrained encoder's run tracker with the state
+  // left by the direct-mapped region, so it correctly handles homopolymers
+  // that span the boundary.
+  const restData = data.slice(directBytes);
+  const constrainedDna = bytesToConstrainedDnaSeeded(restData, maxHomopolymer, directDna);
+
+  return directDna + constrainedDna;
+}
+
+/**
+ * Direct 2-bit bytes→DNA mapping (same as mapping.bytesToDna but local).
+ */
+function bytesToDnaDirect(data: Uint8Array): string {
+  const BITS_TO_BASE = ["A", "C", "G", "T"];
+  const chars: string[] = new Array(data.length * 4);
+  for (let i = 0; i < data.length; i++) {
+    const byte = data[i];
+    const off = i * 4;
+    chars[off] = BITS_TO_BASE[(byte >> 6) & 0b11];
+    chars[off + 1] = BITS_TO_BASE[(byte >> 4) & 0b11];
+    chars[off + 2] = BITS_TO_BASE[(byte >> 2) & 0b11];
+    chars[off + 3] = BITS_TO_BASE[byte & 0b11];
+  }
+  return chars.join("");
+}
+
+/**
+ * Constrained bytes→DNA mapping, seeded with the run state from a preceding DNA string.
+ * This ensures homopolymer tracking is continuous across the direct/constrained boundary.
+ */
+function bytesToConstrainedDnaSeeded(
+  data: Uint8Array,
+  maxHomopolymer: number,
+  prefixDna: string,
+): string {
+  if (data.length === 0) return "";
+
+  // Initialize run state from the prefix DNA
+  let prev: Base = "A";
+  let runLength = 0;
+  if (prefixDna.length > 0) {
+    prev = prefixDna[prefixDna.length - 1] as Base;
+    // Count trailing run of the same base
+    runLength = 1;
+    for (let i = prefixDna.length - 2; i >= 0; i--) {
+      if (prefixDna[i] === prev) {
+        runLength++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  const parts: string[] = new Array(data.length * 4);
+  for (let i = 0; i < data.length; i++) {
+    const byte = data[i];
+    for (let bitPair = 0; bitPair < 4; bitPair++) {
+      const bits = (byte >> (6 - bitPair * 2)) & 0b11;
+      let base: Base;
+
+      if (runLength >= maxHomopolymer) {
+        const prevIdx = BASE_TO_IDX[prev];
+        base = MAP_4TO3[prevIdx][bits];
+      } else {
+        base = BASES[bits];
+      }
+
+      if (base === prev) {
+        runLength++;
+      } else {
+        runLength = 1;
+        prev = base;
+      }
+
+      parts[i * 4 + bitPair] = base;
+    }
+  }
+  return parts.join("");
 }
 
 /**
  * Decode DNA (split constrained) back to bytes with erasure info.
- * Same as constrainedDnaToBytesWithErasure — no erasures in permutation approach.
+ * The first `directBytes*4` nt use direct 2-bit mapping (no erasures),
+ * the rest use constrained mapping with erasure tracking.
  */
 export function splitConstrainedDnaToBytesWithErasure(
   dna: string,
   maxHomopolymer: number = 3,
-  _directBytes: number = 4,
+  directBytes: number = 4,
   expectedBytes?: number,
 ): { data: Uint8Array; erasures: boolean[] } {
-  return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes);
+  if (directBytes <= 0) {
+    return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes);
+  }
+
+  const numBytes = expectedBytes ?? Math.floor(dna.length / 4);
+  const out = new Uint8Array(numBytes);
+  const erasures = new Array<boolean>(numBytes * 8).fill(false);
+
+  // Part 1: Direct 2-bit decode for the first `directBytes` bytes (no erasures)
+  const directNt = directBytes * 4;
+  for (let i = 0; i < directBytes; i++) {
+    let byte = 0;
+    for (let bitPair = 0; bitPair < 4; bitPair++) {
+      const base = dna[i * 4 + bitPair];
+      const idx = BASE_TO_IDX[base as Base];
+      if (idx === undefined) {
+        throw new Error(`Invalid DNA base at position ${i * 4 + bitPair}`);
+      }
+      byte = (byte << 2) | idx;
+    }
+    out[i] = byte;
+  }
+
+  // Part 2: Constrained decode for the remaining bytes
+  // We need to seed the run tracker with the state from the direct-mapped region.
+  const restDna = dna.slice(directNt);
+  const restBytes = numBytes - directBytes;
+
+  // Initialize run state from the direct-mapped DNA
+  let prev: Base = "A";
+  let runLength = 0;
+  if (directNt > 0) {
+    prev = dna[directNt - 1] as Base;
+    runLength = 1;
+    for (let i = directNt - 2; i >= 0; i--) {
+      if (dna[i] === prev) {
+        runLength++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  for (let i = 0; i < restBytes; i++) {
+    let byte = 0;
+    for (let bitPair = 0; bitPair < 4; bitPair++) {
+      const pos = i * 4 + bitPair;
+      if (pos >= restDna.length) break;
+      const base = restDna[pos] as Base;
+      let msb: number;
+      let lsb: number;
+      const bitIdx = (directBytes + i) * 8 + bitPair * 2;
+
+      if (runLength >= maxHomopolymer) {
+        const possibleCodes = invMap4to3(prev, base);
+        if (possibleCodes.length === 1) {
+          const code = possibleCodes[0];
+          msb = (code >> 1) & 1;
+          lsb = code & 1;
+        } else {
+          const code0 = possibleCodes[0];
+          lsb = code0 & 1;
+          msb = (code0 >> 1) & 1;
+          erasures[bitIdx] = true;
+        }
+      } else {
+        const idx = BASE_TO_IDX[base];
+        msb = (idx >> 1) & 1;
+        lsb = idx & 1;
+      }
+
+      byte = (byte << 2) | (msb << 1) | lsb;
+
+      if (base === prev) {
+        runLength++;
+      } else {
+        runLength = 1;
+        prev = base;
+      }
+    }
+    out[directBytes + i] = byte;
+  }
+
+  return { data: out, erasures };
 }
 
 /**

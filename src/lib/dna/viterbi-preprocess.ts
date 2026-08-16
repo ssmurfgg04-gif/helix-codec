@@ -119,18 +119,81 @@ export function viterbiCorrectRead(
     return read;
   }
 
-  // v60: For now, use the length-only fix (truncate/pad) which preserves the
-  // read's base calls. The real Viterbi path reconstruction
-  // (reconstructReadFromPath) is available but introduces errors at wrong
-  // positions for high-IDS reads, which corrupts the MSA consensus.
+  // v65: Use the REAL Viterbi path reconstruction from profileHmm3.
   //
-  // The MSA consensus (STRATEGY 2.75) handles indels itself via profile-profile
-  // alignment. Pre-correcting reads with the Viterbi path can MISLEAD the MSA
-  // by introducing errors at wrong positions.
+  // The profile HMM computes the optimal alignment of read vs ref, identifying
+  // which read positions are insertions (I), deletions (D), or matches (M).
+  // We reconstruct the read by:
+  //   - M states: keep the read's own base (preserves substitution info)
+  //   - I states: drop the inserted base (excise from read)
+  //   - D states: fill with the reference base (read was missing this base)
   //
-  // TODO: Use the Viterbi path only for the per-read LDPC path (STRATEGY 1),
-  // not for the MSA path. This requires splitting the preprocessing into
-  // "MSA-mode" (length-only fix) and "per-read-mode" (Viterbi reconstruction).
+  // This is the HEDGES approach: fix indels (length errors) at the RIGHT
+  // position, then leave substitution correction to the LDPC inner code.
+  //
+  // Previously (v60-v64), we used the length-only fix (truncate/pad) which
+  // just chopped/padded at the END of the read — losing information about
+  // WHERE the indel occurred. This caused ~12% IDS recovery because the
+  // LDPC decoder got misaligned bits (an insertion at position 50 shifts
+  // all subsequent bits by 1, which the LDPC treats as many substitution
+  // errors rather than one indel).
+  //
+  // The real Viterbi path fixes the alignment at the correct position,
+  // so the LDPC decoder sees at most 1 substitution per indel (the base
+  // that was inserted or the substitution at the deletion site).
+  try {
+    const result = forwardBackward3(
+      read.sequence,
+      ref,
+      read.quality,
+      cfg.hmmParams,
+      cfg.hmmBandWidth,
+    );
+
+    if (result.path.length > 0) {
+      const correctedSeq = reconstructReadFromPath(read.sequence, ref, result.path);
+
+      // Sanity check: corrected length should match ref length
+      if (correctedSeq.length === ref.length) {
+        // Build corrected quality array
+        // For M states: keep the read's quality at that position
+        // For D states (filled from ref): assign a moderate quality
+        // For I states (dropped): skip
+        const readQ = read.quality ?? new Uint8Array(read.sequence.length).fill(20);
+        const correctedQ = new Uint8Array(ref.length).fill(20); // default Q20
+        let outPos = 0;
+        for (const step of result.path) {
+          if (step.state === 'M' && step.readPos >= 0 && step.readPos < readQ.length) {
+            if (outPos < ref.length) {
+              correctedQ[outPos] = readQ[step.readPos];
+            }
+            outPos++;
+          } else if (step.state === 'D') {
+            // Deletion filled from ref: moderate quality (Q15)
+            if (outPos < ref.length) {
+              correctedQ[outPos] = 15;
+            }
+            outPos++;
+          }
+          // I states: skip (don't increment outPos)
+        }
+
+        return {
+          ...read,
+          sequence: correctedSeq,
+          quality: correctedQ,
+        };
+      }
+
+      // If corrected length doesn't match ref (shouldn't happen with proper
+      // path reconstruction), fall through to length-only fix
+    }
+  } catch {
+    // HMM failed (e.g., numerical underflow, pathological alignment)
+    // Fall through to length-only fix
+  }
+
+  // Fallback: length-only fix (truncate/pad)
   return lengthOnlyFix(read, ref);
 }
 

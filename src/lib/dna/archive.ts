@@ -46,6 +46,11 @@
 
 import { crc32 } from './crc32';
 import * as pako from 'pako';
+import {
+  serializeMTArchive,
+  deserializeMTArchive,
+  DnaMTArchive,
+} from './dna-mt-archive';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,6 +83,9 @@ const BGZF_SUBFIELD_LEN = 2; // 2 bytes for block size
 
 /** Default block size (max uncompressed data per block). */
 export const DEFAULT_BLOCK_SIZE = 65536; // 64 KiB (same as BGZF default)
+
+/** DNA-MT archive magic bytes: ".dmt" */
+export const DMT_MAGIC = new Uint8Array([0x2E, 0x64, 0x6D, 0x74]);
 
 // ---------------------------------------------------------------------------
 // Interfaces
@@ -600,4 +608,86 @@ export async function validateHlxArchive(archive: HlxArchive): Promise<boolean> 
   }
 
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// DNA-MT archive support (alternative format)
+// ---------------------------------------------------------------------------
+
+/** Union type for any supported archive format. */
+export type AnyArchive = HlxArchive | DnaMTArchive;
+
+/** Archive format identifier. */
+export type ArchiveFormat = 'hlx' | 'dnamt';
+
+/**
+ * Detect the archive format from magic bytes.
+ *
+ * @param data Raw archive bytes
+ * @returns Format identifier
+ * @throws Error if the format is not recognized
+ */
+export function detectArchiveFormat(data: Uint8Array): ArchiveFormat {
+  if (data.length < 4) {
+    throw new Error('Data too short to detect archive format');
+  }
+
+  // Check for .hlx magic
+  if (
+    data[0] === HLX_MAGIC[0] && data[1] === HLX_MAGIC[1] &&
+    data[2] === HLX_MAGIC[2] && data[3] === HLX_MAGIC[3]
+  ) {
+    return 'hlx';
+  }
+
+  // Check for .dmt magic
+  if (
+    data[0] === DMT_MAGIC[0] && data[1] === DMT_MAGIC[1] &&
+    data[2] === DMT_MAGIC[2] && data[3] === DMT_MAGIC[3]
+  ) {
+    return 'dnamt';
+  }
+
+  throw new Error(
+    `Unknown archive format: magic bytes [${data[0].toString(16)}, ${data[1].toString(16)}, ${data[2].toString(16)}, ${data[3].toString(16)}]`,
+  );
+}
+
+/**
+ * Read an archive in any supported format (auto-detects .hlx vs .dmt).
+ *
+ * @param data Raw archive bytes
+ * @returns Parsed archive (either HlxArchive or DnaMTArchive)
+ * @throws Error if the format is not recognized or the data is invalid
+ */
+export function readAnyArchive(data: Uint8Array): AnyArchive {
+  const format = detectArchiveFormat(data);
+  if (format === 'hlx') {
+    return readHlxArchive(data);
+  }
+  return deserializeMTArchive(data);
+}
+
+/**
+ * Write a DNA-MT archive to binary format.
+ *
+ * Convenience wrapper that delegates to dna-mt-archive's serializeMTArchive.
+ *
+ * @param archive DNA-MT archive
+ * @returns Binary representation
+ */
+export function writeMTArchive(archive: DnaMTArchive): Uint8Array {
+  return serializeMTArchive(archive);
+}
+
+/**
+ * Read a DNA-MT archive from binary data.
+ *
+ * Convenience wrapper that delegates to dna-mt-archive's deserializeMTArchive.
+ *
+ * @param data Binary archive data
+ * @returns Parsed DNA-MT archive
+ */
+export function readMTArchive(data: Uint8Array): DnaMTArchive {
+  return deserializeMTArchive(data);
 }

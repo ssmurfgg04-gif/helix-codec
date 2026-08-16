@@ -1,6 +1,6 @@
 {
   "name": "helix-codec",
-  "version": "3.0.0",
+  "version": "3.7.0",
   "private": true,
   "type": "module",
   "description": "Production DNA storage codec — Reed-Solomon, LDPC, convolutional, fountain, holographic sharding, content-addressed archives, and peer-leading deterministic encoding (BHE + Gungnir + DNA-Aeon)",
@@ -70,6 +70,7 @@
     "@tanstack/react-query": "^5.82.0",
     "@tanstack/react-table": "^8.21.3",
     "@types/pako": "^3.0.0",
+    "chai": "^6.2.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",

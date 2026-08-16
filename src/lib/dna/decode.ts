@@ -29,6 +29,7 @@ import { LDPCInnerCode, getCachedLDPCInner } from "./ldpc-codec";
 import { verifyCrc16, crc16, crc16Bytes } from "./crc16";
 import { dnaToBytes, bytesToDna, xorWithSeed, gcContent, maxHomopolymerRun, unwhitenAddress, whitenAddress, ADDRESS_WHITENING } from "./mapping";
 import { goldmanDnaToBytes } from "./goldman";
+import { yinyangDecode as yinyangDecodeFn, yinyangEncode as yinyangEncodeFn } from "./yinyang";
 import { constrainedDnaToBytes, constrainedDnaToBytesWithErasure, splitConstrainedDnaToBytesWithErasure } from "./constrained-mapping";
 import { arithmeticDnaToBytesCrc } from "./markov-arithmetic";
 import { dnaAeonDecode, dnaAeonEncode, DNAEeonConfig, DEFAULT_DNA_AEON_CONFIG } from "./dna-aeon";
@@ -203,6 +204,11 @@ function hamming(a: string, b: string): number {
 
 // --- Clustering ---
 
+// Synchronous wrapper for yinyangDecode (used in clustering hot path)
+function yinyangDecodeSync(dna: string, numBytes: number): Uint8Array {
+  return yinyangDecodeFn(dna, numBytes);
+}
+
 interface Cluster {
   index: number;
   reads: SequencingRead[];
@@ -223,6 +229,8 @@ function clusterReads(
   useGoldman: boolean = false,
   goldmanMode: "fast" | "dense" = "fast",
   useConstrained: boolean = false,
+  useYYC: boolean = false,
+  useBHE: boolean = false,
   maxHomopolymer: number = 3,
   expectedDnaLen: number = 0,
   layoutAddressBytes: number = 4,
@@ -255,11 +263,22 @@ function clusterReads(
       } else if (useGoldman) {
         const addressDna = inner.slice(0, addressNt);
         addressBytes = goldmanDnaToBytes(addressDna, "A", goldmanMode);
+      } else if (useYYC) {
+        // Yin-Yang coding: address is yinyang-encoded, not direct-mapped.
+        // Must use yinyangDecode to extract address bytes from the first addressNt bases.
+        const addressDna = inner.slice(0, addressNt);
+        addressBytes = yinyangDecodeSync(addressDna, layoutAddressBytes);
+      } else if (useBHE) {
+        // BHE FSM encoding: fall back to direct mapping for address extraction
+        // (BHE is close to identity for small address regions).
+        const addressDna = inner.slice(0, addressNt);
+        addressBytes = dnaToBytes(addressDna);
       } else if (useConstrained) {
         // Split constrained mode: address uses direct mapping (no erasures).
         const addressDna = inner.slice(0, addressNt);
         addressBytes = dnaToBytes(addressDna);
       } else {
+        // Direct / SRT mapping: address uses direct 2-bit mapping.
         const addressDna = inner.slice(0, addressNt);
         addressBytes = dnaToBytes(addressDna);
       }
@@ -296,6 +315,7 @@ function clusterReads(
 function buildReferenceAddresses(
   oligoCount: number,
   addressBytes: number = 4,
+  mappingMode: string = "direct",
 ): string[] {
   const refs: string[] = new Array(oligoCount);
   for (let idx = 0; idx < oligoCount; idx++) {
@@ -305,7 +325,15 @@ function buildReferenceAddresses(
     rawAddress[2] = idx & 0xff;
     rawAddress[3] = 0; // seed = 0 (the dominant case; screening retries are rare)
     const whitened = whitenAddress(rawAddress);
-    refs[idx] = bytesToDna(whitened);
+    // Use the appropriate encoding for the address region.
+    // For yinyang: address is yinyang-encoded (not direct-mapped).
+    // For constrained: address is direct-mapped (split mode).
+    // For direct/SRT/goldman: address uses direct 2-bit mapping.
+    if (mappingMode === "yinyang") {
+      refs[idx] = yinyangEncodeFn(whitened);
+    } else {
+      refs[idx] = bytesToDna(whitened);
+    }
   }
   return refs;
 }
@@ -352,6 +380,8 @@ function clusterReadsWithKmer(
   useGoldman: boolean = false,
   goldmanMode: "fast" | "dense" = "fast",
   useConstrained: boolean = false,
+  useYYC: boolean = false,
+  useBHE: boolean = false,
   maxHomopolymer: number = 3,
   expectedDnaLen: number = 0,
   layoutAddressBytes: number = 4,
@@ -363,13 +393,14 @@ function clusterReadsWithKmer(
   let discarded = 0;
   let kmerRecovered = 0;
 
-  // Step 1: Pre-compute reference addresses (only for direct mode — Goldman
-  // and constrained have different DNA encodings and would need their own refs).
-  // For non-direct modes, skip k-mer recovery and fall back to exact-only.
+  // Step 1: Pre-compute reference addresses.
+  // For yinyang mode, addresses are yinyang-encoded (not direct-mapped).
+  // For Goldman/constrained modes, skip k-mer recovery (different DNA encodings).
   const useKmerRecovery = !useGoldman && !useConstrained;
+  const mappingMode = useYYC ? "yinyang" : "direct";
   let kmerIndex: Map<number, number[]> | null = null;
   if (useKmerRecovery) {
-    const refs = buildReferenceAddresses(oligoCount, layoutAddressBytes);
+    const refs = buildReferenceAddresses(oligoCount, layoutAddressBytes, mappingMode);
     kmerIndex = buildReferenceKmerIndex(refs, kmerK);
   }
 
@@ -391,21 +422,28 @@ function clusterReadsWithKmer(
     let assignedIdx = -1;
     let addressBytes: Uint8Array;
     try {
-      addressBytes = dnaToBytes(addressDna);
+      // Use appropriate decode for the address region based on mapping mode.
+      if (useYYC) {
+        addressBytes = yinyangDecodeSync(addressDna, layoutAddressBytes);
+      } else {
+        addressBytes = dnaToBytes(addressDna);
+      }
       const unwhitened = unwhitenAddress(addressBytes);
       const idx = (unwhitened[0] << 16) | (unwhitened[1] << 8) | unwhitened[2];
       if (idx >= 0 && idx < oligoCount) {
         // Verify by re-encoding the address and checking Hamming distance.
-        // This catches cases where dnaToBytes succeeds but the address is
+        // This catches cases where decode succeeds but the address is
         // actually corrupted (e.g., 1 substitution that changes the index).
-        const refDna = bytesToDna(whitenAddress(unwhitened));
+        const refDna = useYYC
+          ? yinyangEncodeFn(whitenAddress(unwhitened))
+          : bytesToDna(whitenAddress(unwhitened));
         const dist = hamming(addressDna, refDna);
         if (dist <= 2) {
           assignedIdx = idx;
         }
       }
     } catch {
-      // dnaToBytes failed (e.g., 'N' in address) — fall through to k-mer
+      // Address decode failed (e.g., 'N' in address) — fall through to k-mer
     }
 
     // Step 3: If exact match failed, try k-mer matching with margin filtering
@@ -618,9 +656,9 @@ export async function decodeReads(
   if (useKmerClustering) {
     const r = clusterReadsWithKmer(
       reads, fwdPrimer, revPrimer, addressNt, metadata.oligoCount,
-      useGoldman, goldmanMode, useConstrained, cfg.constraints.maxHomopolymer,
+      useGoldman, goldmanMode, useConstrained, useYYC, useBHE, cfg.constraints.maxHomopolymer,
       expectedDnaLen, layout.addressBytes, layout.totalInnerBytes,
-      5, 3, // k=5, minOverlap=3 — 4^5=1024 possible k-mers, survives 1-2 errors in 16nt
+      5, 3, // k=5, minOverlap=3 -- 4^5=1024 possible k-mers, survives 1-2 errors in 16nt
     );
     clusters = r.clusters;
     discarded = r.discarded;
@@ -631,7 +669,7 @@ export async function decodeReads(
   } else {
     const r = clusterReads(
       reads, fwdPrimer, revPrimer, addressNt, useGoldman, goldmanMode,
-      useConstrained, cfg.constraints.maxHomopolymer,
+      useConstrained, useYYC, useBHE, cfg.constraints.maxHomopolymer,
       expectedDnaLen, layout.addressBytes, layout.totalInnerBytes,
     );
     clusters = r.clusters;
@@ -1145,6 +1183,12 @@ export async function decodeReads(
             constrainedErasures = bitErasures;
           }
         } catch { continue; }
+      } else if (useYYC) {
+        // YYC Yin-Yang decode: alternating rule tables at 2.0 bits/nt
+        try {
+          const { yinyangDecode } = await import('./yinyang');
+          innerBlock = yinyangDecode(dna, layout.totalInnerBytes);
+        } catch { continue; }
       } else {
         try {
           innerBlock = dnaToBytes(dna);
@@ -1399,9 +1443,40 @@ export async function decodeReads(
             }
           }
         } else {
-          const r = innerRs.decode(rsCodeword);
-          decodedData = r.data;
-          corrected = r.corrected;
+          // RS inner code: if we have erasure info from constrained/arithmetic
+          // mapping, use RS erasure decoding (2× correction capacity).
+          const hasByteErasures = constrainedErasures && constrainedErasures.some((e) => e);
+          if (hasByteErasures && useConstrained) {
+            // Convert bit-level erasures to byte-level erasure positions for RS.
+            // Any byte with at least 1 erased bit is marked as an erased byte.
+            const byteErased = new Set<number>();
+            for (let bitIdx = 0; bitIdx < constrainedErasures!.length && bitIdx < innerN * 8; bitIdx++) {
+              if (constrainedErasures![bitIdx]) {
+                byteErased.add(bitIdx >> 3);
+              }
+            }
+            const byteErasePos = Array.from(byteErased).sort((a, b) => a - b);
+            if (byteErasePos.length > 0 && byteErasePos.length <= (innerN - innerK)) {
+              try {
+                const r = innerRs.decodeWithErasures(rsCodeword, byteErasePos);
+                decodedData = r.data;
+                corrected = r.corrected;
+              } catch {
+                // Erasure decode failed — fall back to error-only decode
+                const r = innerRs.decode(rsCodeword);
+                decodedData = r.data;
+                corrected = r.corrected;
+              }
+            } else {
+              const r = innerRs.decode(rsCodeword);
+              decodedData = r.data;
+              corrected = r.corrected;
+            }
+          } else {
+            const r = innerRs.decode(rsCodeword);
+            decodedData = r.data;
+            corrected = r.corrected;
+          }
         }
       } catch {
         // This read has too many errors — skip it, try next read
@@ -1917,9 +1992,11 @@ export async function decodeReads(
           return decodedIndex === oligoIdx;
         };
 
-        // Run OSD-2 (maxOrder=2 is a good tradeoff: O(k²) candidates, ~2ms)
+        // v65: Run OSD cascade. For nanopore (high-IDS), use OSD-3 (O(k³) but
+        // handles the hardest cases). For other channels, OSD-2 is sufficient.
+        const osdMaxOrder = (channel === "nanopore" || channel === "pacbio") ? 3 : 2;
         const osdResult = osdDecode(llr, H, crcAndAddrCheck, {
-          maxOrder: 2,
+          maxOrder: osdMaxOrder,
           k: innerK * 8,
         });
 

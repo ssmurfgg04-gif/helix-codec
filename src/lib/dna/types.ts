@@ -45,7 +45,7 @@ export interface CodecMetadata {
   /** LDPC decoder mode ("hard", "osd", "bp", or "auto"). */
   ldpcDecoder?: "hard" | "osd" | "bp" | "auto";
   /** DNA mapping mode. */
-  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon";
+  mappingMode: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon" | "dnamt";
   /** Goldman trit packing mode ("fast" or "dense"). Only used when mappingMode="goldman". */
   goldmanMode?: "fast" | "dense";
   /** Outer RS config (across oligos). */
@@ -145,7 +145,7 @@ export interface CodecConfig {
    * Default: "constrained" (since v23.0). Best of both worlds: full 2.0 bits/nt
    * density AND homopolymer-free without screening.
    */
-  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon";
+  mappingMode?: "direct" | "goldman" | "constrained" | "srt" | "arithmetic" | "bhe" | "yinyang" | "dnaAeon" | "dnamt";
   /**
    * Goldman trit packing mode (only used when mappingMode === "goldman"):
    *   - "fast"  — 1 byte → 6 trits (3^6=729>256). Density 1.333 bits/nt. Simple.
@@ -305,13 +305,13 @@ export interface CodecConfig {
 }
 
 export const DEFAULT_CONFIG: CodecConfig = {
-  // Direct mapping with maxHomopolymer=3 (proven, reliable).
+  // Yin-Yang coding at 2.0 bits/nt — no homopolymers by construction.
   // Encode speed optimized via LDPC unrolled bit operations.
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12, // shorter primers → more payload space
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "constrained",
+  mappingMode: "yinyang", // 2.0 bits/nt, homopolymer-free
   innerParityBytes: 4,
   outerParityRatio: 0.1,
   constraints: {
@@ -346,11 +346,11 @@ export const DEFAULT_CONFIG: CodecConfig = {
  */
 export const NANOPORE_CONFIG: CodecConfig = {
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12, // shorter primers → more payload space
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "constrained",
-  innerParityBytes: 4,
+  mappingMode: "yinyang", // 2.0 bits/nt, homopolymer-free
+  innerParityBytes: 10, // v65: 10B (80 bits) inner parity for 9% IDS — can correct ~40 bit errors per codeword
   outerParityRatio: 0.5, // 5× more parity for IDS recovery
   constraints: {
     gcMin: 0.4,
@@ -373,11 +373,11 @@ export const NANOPORE_CONFIG: CodecConfig = {
  */
 export const PACBIO_CONFIG: CodecConfig = {
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12, // shorter primers → more payload space
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "constrained",
-  innerParityBytes: 4,
+  mappingMode: "yinyang", // 2.0 bits/nt, homopolymer-free
+  innerParityBytes: 8, // v65: 8B (64 bits) inner parity for indel-heavy PacBio channel
   outerParityRatio: 0.4,
   constraints: {
     gcMin: 0.4,
@@ -409,7 +409,7 @@ export const PACBIO_CONFIG: CodecConfig = {
 export const NANOPORE_SHORT_CONFIG: CodecConfig = {
   ...NANOPORE_CONFIG,
   oligoLength: 150, // shorter oligo → fewer indels per oligo
-  primerLength: 15, // shorter primers to preserve payload space
+  primerLength: 12, // shorter primers to preserve payload space
 };
 
 /**
@@ -423,16 +423,16 @@ export function resolveConfig(cfg: Partial<CodecConfig>): CodecConfig {
   switch (channel) {
     case 'nanopore':
       base = NANOPORE_CONFIG;
-      // BHE deterministic encoding is preferred for noisy channels
-      // (no seed-retry, guaranteed constraint satisfaction)
+      // YYC is deterministic, homopolymer-free, and 2.0 bits/nt —
+      // preferred for noisy channels (no seed-retry needed)
       if (cfg.mappingMode === undefined) {
-        base = { ...base, mappingMode: "bhe" };
+        base = { ...base, mappingMode: "yinyang" };
       }
       break;
     case 'pacbio':
       base = PACBIO_CONFIG;
       if (cfg.mappingMode === undefined) {
-        base = { ...base, mappingMode: "bhe" };
+        base = { ...base, mappingMode: "yinyang" };
       }
       break;
     default:
@@ -489,9 +489,42 @@ export function computeLayout(cfg: CodecConfig): OligoLayout {
   }
 
   if (innerNt % modUnit !== 0) {
-    throw new Error(
-      `inner nt length ${innerNt} must be divisible by ${modUnit} (got oligoLength=${cfg.oligoLength}, primerLen=${cfg.primerLength}, mappingMode=${cfg.mappingMode ?? "constrained"}, goldmanMode=${cfg.goldmanMode ?? "fast"})`,
-    );
+    // Instead of throwing, round down innerNt to the nearest multiple of modUnit.
+    // This happens when oligoLength - 2*primerLength is not divisible by 4 (or 6, or 26).
+    // The unused nt at the end of the inner region are simply padding.
+    const adjustedInnerNt = Math.floor(innerNt / modUnit) * modUnit;
+    if (adjustedInnerNt < modUnit) {
+      throw new Error(
+        `inner nt length ${innerNt} too small after rounding to multiple of ${modUnit} (got oligoLength=${cfg.oligoLength}, primerLen=${cfg.primerLength}, mappingMode=${cfg.mappingMode ?? "constrained"}, goldmanMode=${cfg.goldmanMode ?? "fast"})`,
+      );
+    }
+    // Replace innerNt with the adjusted value for all downstream calculations
+    const effectiveInnerNt = adjustedInnerNt;
+    const totalInnerBytesAdjusted = cfg.mappingMode === "goldman" && cfg.goldmanMode === "dense"
+      ? (effectiveInnerNt * 5) / 26
+      : effectiveInnerNt / ntPerByte;
+
+    const addressBytes = 4;
+    const crcBytes = 2;
+    const innerParityBytes = cfg.innerParityBytes;
+    let payloadBytes = totalInnerBytesAdjusted - addressBytes - innerParityBytes - crcBytes;
+    if (payloadBytes <= 0) {
+      throw new Error(
+        `oligoLength ${cfg.oligoLength} too small: payload would be ${payloadBytes} bytes`,
+      );
+    }
+    if (payloadBytes % 2 === 1) {
+      payloadBytes -= 1;
+    }
+    return {
+      primerLen: cfg.primerLength,
+      addressBytes,
+      payloadBytes,
+      innerParityBytes,
+      crcBytes,
+      totalInnerBytes: totalInnerBytesAdjusted,
+      convEncodedBytes: 0,
+    };
   }
 
   // totalInnerBytes = innerNt / ntPerByte
@@ -611,10 +644,12 @@ export function computeLayoutConv(cfg: CodecConfig): OligoLayout {
   }
   // direct mapping only (conv inner is currently only supported with direct mapping)
   const ntPerByte = 4;
-  if (innerNt % ntPerByte !== 0) {
-    throw new Error(`inner nt length ${innerNt} must be divisible by ${ntPerByte}`);
+  // Round down to nearest multiple of 4 if not divisible
+  const effectiveInnerNt = Math.floor(innerNt / ntPerByte) * ntPerByte;
+  if (effectiveInnerNt < ntPerByte) {
+    throw new Error(`inner nt length ${innerNt} too small after rounding to multiple of ${ntPerByte}`);
   }
-  const totalInnerBytes = innerNt / ntPerByte;
+  const totalInnerBytes = effectiveInnerNt / ntPerByte;
   const addressBytes = 4;
   const crcBytes = 2;
   const innerParityBytes = cfg.innerParityBytes;

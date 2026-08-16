@@ -40,6 +40,7 @@ import { bytesToDna, dnaToBytes, satisfiesConstraints, xorWithSeed, gcContent, m
 import { bytesToGoldmanDna, goldmanDnaToBytes } from "./goldman";
 import { bytesToConstrainedDna, constrainedDnaToBytes, bytesToSplitConstrainedDna, splitConstrainedDnaToBytesWithErasure } from "./constrained-mapping";
 import { bytesToSrtDna } from "./srt-constrained";
+import { yinyangEncode, yinyangDecode as yinyangDecodeFn, yinyangDnaLength } from "./yinyang";
 import { bytesToArithmeticDna, bytesToArithmeticDnaBlocked, bytesToArithmeticDnaCrc } from "./markov-arithmetic";
 import { interleaveCodewords, deinterleaveCodewords } from "./interleaving";
 import {
@@ -591,9 +592,8 @@ export async function encodeFile(
       bestSeed = 0;
       bestSatisfied = true;
     } else if (useYYC) {
-      // YYC Yin-Yang high-density encoding — 2 bits/nt with rotating rule matrix.
-      // Deterministic, no homopolymers, ~50% GC by construction.
-      const { yinyangEncode } = await import('./yinyang');
+      // YYC Yin-Yang high-density encoding — 2 bits/nt with alternating rule tables.
+      // Deterministic, no seed retry needed.
       const address = rawAddress.slice();
       address[3] = 0;
       const whitenedAddress = whitenAddress(address);
@@ -1341,6 +1341,7 @@ export function canonicalToSynthesis(
   const useConstrained = (cfg.mappingMode ?? "constrained") === "constrained";
   const useSrt = (cfg.mappingMode ?? "constrained") === "srt";
   const useArithmetic = (cfg.mappingMode ?? "constrained") === "arithmetic";
+  const useYYC = (cfg.mappingMode ?? "constrained") === "yinyang";
 
   const constraints = {
     gcMin: cfg.constraints.gcMin,
@@ -1366,6 +1367,10 @@ export function canonicalToSynthesis(
       // SRT constrained mapping
       dna = bytesToSrtDna(block.innerBytes, cfg.constraints.maxHomopolymer, totalNtBytes(layout) * 4);
       seed = 0;
+    } else if (useYYC) {
+      // YYC Yin-Yang high-density encoding — 2.0 bits/nt with alternating rule tables
+      dna = yinyangEncode(block.innerBytes);
+      seed = 0; // YYC is deterministic, no seed retry needed
     } else {
       // Direct 2-bit mapping with constraint screening + seed retries
       let bestDna = "";

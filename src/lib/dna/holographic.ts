@@ -293,11 +293,9 @@ export function holographicUnshuffle(
 ): Uint8Array {
   const total = data.length;
   const perm = buildPermutation(total);
-  const invPerm = new Uint32Array(total);
-  for (let i = 0; i < total; i++) invPerm[perm[i]] = i;
   const out = new Uint8Array(total);
   for (let i = 0; i < total; i++) {
-    out[i] = data[invPerm[i]];  // Fixed: use invPerm, not perm
+    out[i] = data[perm[i]];
   }
   return out;
 }

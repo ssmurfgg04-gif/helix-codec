@@ -332,3 +332,92 @@ impl PackResult {
         self.error.clone()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Batch unpack — multiple packed arrays in a single WASM call
+// ---------------------------------------------------------------------------
+
+/// Unpack multiple packed DNA arrays in a single WASM call.
+///
+/// This eliminates per-call JS↔WASM boundary overhead, which is the dominant
+/// cost for small arrays (<500K bases). Instead of N separate calls each with
+/// its own malloc/copy/invoke/free cycle, we:
+///   1. Receive all inputs as a single contiguous buffer (`packed_data`)
+///   2. Use `offsets` to locate each individual array within the buffer
+///   3. Use `num_bases` to know how many bases to output per array
+///   4. Write all results into a single contiguous output buffer
+///
+/// The JS wrapper splits the flat output back into individual arrays.
+///
+/// # Arguments
+/// * `packed_data` — All packed arrays concatenated into one flat buffer
+/// * `offsets` — Start offset of each array within `packed_data` (in packed bytes)
+/// * `num_bases` — Number of nucleotides to output for each array
+/// * `total_bases` — Sum of all `num_bases` (pre-computed for output allocation)
+///
+/// # Returns
+/// Flat Vec<u8> of all ASCII results concatenated. JS splits by num_bases.
+#[wasm_bindgen]
+pub fn unpack_batch(
+    packed_data: &[u8],
+    offsets: &[u32],
+    num_bases: &[u32],
+    total_bases: u32,
+) -> Vec<u8> {
+    let n = offsets.len();
+    debug_assert_eq!(num_bases.len(), n, "offsets and num_bases must have same length");
+
+    let mut out = vec![0u8; total_bases as usize];
+    let mut out_pos = 0;
+
+    for i in 0..n {
+        let off = offsets[i] as usize;
+        let nb = num_bases[i] as usize;
+        let num_packed_bytes = (nb + 3) / 4;
+
+        // Bounds check
+        if off + num_packed_bytes > packed_data.len() {
+            // Skip this entry — write zeros
+            out_pos += nb;
+            continue;
+        }
+
+        let mut base_pos = 0;
+
+        // SIMD-friendly loop: 16 packed bytes at a time
+        let mut byte_idx = off;
+        let end = off + num_packed_bytes;
+
+        while byte_idx + 16 <= end && base_pos + 64 <= nb {
+            for j in 0..16 {
+                let byte_val = packed_data[byte_idx + j];
+                let out_off = out_pos + base_pos;
+                out[out_off]     = BITS_TO_ASCII[((byte_val >> 6) & 0x03) as usize];
+                out[out_off + 1] = BITS_TO_ASCII[((byte_val >> 4) & 0x03) as usize];
+                out[out_off + 2] = BITS_TO_ASCII[((byte_val >> 2) & 0x03) as usize];
+                out[out_off + 3] = BITS_TO_ASCII[(byte_val & 0x03) as usize];
+                base_pos += 4;
+            }
+            byte_idx += 16;
+        }
+
+        // Handle remaining packed bytes
+        while byte_idx < end && base_pos < nb {
+            let byte_val = packed_data[byte_idx];
+            for k in 0..4 {
+                if base_pos >= nb {
+                    break;
+                }
+                let shift = 6 - (k << 1);
+                let code = ((byte_val >> shift) & 0x03) as usize;
+                out[out_pos + base_pos] = BITS_TO_ASCII[code];
+                base_pos += 1;
+            }
+            byte_idx += 1;
+        }
+
+        out_pos += nb;
+    }
+
+    out
+}

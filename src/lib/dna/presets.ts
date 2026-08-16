@@ -42,7 +42,7 @@ import type { CodecConfig } from "./types";
  */
 export const ULTIMATE_DENSITY_CONFIG: CodecConfig = {
   oligoLength: 500,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "arithmetic",
@@ -129,7 +129,7 @@ export const ULTIMATE_NANOPORE_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_NANOPORE_V52_CONFIG: CodecConfig = {
   oligoLength: 150, // v65: 300→150nt — reduces per-block indel count from ~27 (9%×300) to ~13.5 (9%×150), keeping it within K=9 Viterbi's maxDrift=15 correction radius
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "constrained", // conv inner only supports direct mapping in v52
@@ -171,7 +171,7 @@ export const ULTIMATE_NANOPORE_V52_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V55_DENSITY_CONFIG: CodecConfig = {
   oligoLength: 700,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   // v59: Direct mode with 8B inner parity (was 4B — caused hash FAIL at 700nt).
@@ -218,7 +218,7 @@ export const ULTIMATE_V55_DENSITY_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V55_OMNI_CONFIG: CodecConfig = {
   oligoLength: 500,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "arithmetic",
@@ -243,7 +243,7 @@ export const ULTIMATE_V55_OMNI_CONFIG: CodecConfig = {
  */
 export const V51_DEFAULT_CONFIG: CodecConfig = {
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "constrained",
@@ -279,7 +279,7 @@ export const V51_DEFAULT_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V59_FAST_ENCODE_CONFIG: CodecConfig = {
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "srt", // SRT: zero screening retries, homopolymer ≤ 3 guaranteed
@@ -308,7 +308,7 @@ export const ULTIMATE_V59_FAST_ENCODE_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V59_HD_FAST_CONFIG: CodecConfig = {
   oligoLength: 700,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "srt", // zero retries
@@ -352,7 +352,7 @@ export const ULTIMATE_V59_HD_FAST_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V61_ARITHMETIC_CONFIG: CodecConfig = {
   oligoLength: 700,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   // v61: Arithmetic-v2 mode (address outside arithmetic stream)
@@ -401,7 +401,7 @@ export const ULTIMATE_V61_ARITHMETIC_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V61_NANOPORE_CONFIG: CodecConfig = {
   oligoLength: 150, // v65: 300→150nt — reduces per-block indel count from ~27 (9%×300) to ~13.5 (9%×150), keeping it within K=9 Viterbi's maxDrift=15 correction radius
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "constrained", // conv inner only supports direct mapping
@@ -464,7 +464,7 @@ export const ULTIMATE_V61_NANOPORE_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V63_HD_CONFIG: CodecConfig = {
   oligoLength: 1100,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   // v63: Direct mode + longer oligos + lighter parity = true density win.
@@ -520,7 +520,7 @@ export const ULTIMATE_V63_MAXDENSITY_CONFIG: CodecConfig = {
  */
 export const ULTIMATE_V64_REAL_2024_CONFIG: CodecConfig = {
   oligoLength: 300,
-  primerLength: 20,
+  primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
   mappingMode: "constrained", // conv inner only supports direct mapping
@@ -591,6 +591,7 @@ export function computeDensity(
     srt: 2.0,
     goldman: 1.538, // dense mode
     arithmetic: 1.9,
+    yinyang: 2.0, // YYC: 2.0 bits/nt, homopolymer-free
   };
   const rate = mappingRate[cfg.mappingMode ?? "constrained"] ?? 2.0;
   const innerNt = cfg.oligoLength - 2 * cfg.primerLength;

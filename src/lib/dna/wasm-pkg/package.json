@@ -1,11 +1,16 @@
 {
   "name": "helix-dna-wasm",
-  "version": "0.2.0",
+  "type": "module",
+  "description": "Helix DNA codec hot paths compiled to WASM with SIMD",
+  "version": "0.1.0",
   "files": [
     "helix_dna_wasm_bg.wasm",
     "helix_dna_wasm.js",
     "helix_dna_wasm.d.ts"
   ],
   "main": "helix_dna_wasm.js",
-  "types": "helix_dna_wasm.d.ts"
+  "types": "helix_dna_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
 }

@@ -592,6 +592,429 @@ export function decompressWithJARVIS3(data: Uint8Array): Uint8Array {
   return out;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// § C++ WASM Compressor Framework
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The five DNA compressors above (NAF, AGC, DeepGeCo, MBGC2, JARVIS3) are
+// TypeScript implementations using arithmetic coding. For higher throughput,
+// compiled C++ WASM compressors can be registered and will be preferred
+// when available.
+//
+// The C++ sources are built with emscripten (see scripts/build-cpp-compressors.sh)
+// and output to src/lib/dna/wasm-pkg/cpp-compressors/.
+//
+// Expected WASM API (exported from each C++ module):
+//   memory:       WebAssembly.Memory  (shared linear memory)
+//   alloc(n):     number             (allocate n bytes, return pointer)
+//   dealloc(p):   void              (free pointer)
+//   compress(p_in, len_in, p_out, p_out_len): number
+//                  (returns compressed length; writes to p_out)
+//   decompress(p_in, len_in, p_out, p_out_len, original_size): number
+//                  (returns decompressed length)
+//   version():    number            (API version, must match WASM_API_VERSION)
+//   name():       number            (pointer to null-terminated name string)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** API version that C++ WASM modules must export to be compatible. */
+const WASM_API_VERSION = 1;
+
+/**
+ * WASM interface that each C++ DNA compressor module must export.
+ */
+interface DnaCompressorWasmExports {
+  memory: WebAssembly.Memory;
+  alloc(n: number): number;
+  dealloc(p: number): void;
+  compress(pIn: number, lenIn: number, pOut: number, pOutLen: number): number;
+  decompress(pIn: number, lenIn: number, pOut: number, pOutLen: number, originalSize: number): number;
+  version(): number;
+  name(): number;
+}
+
+/**
+ * Read a null-terminated string from WASM linear memory.
+ */
+function readWasmString(memory: WebAssembly.Memory, ptr: number): string {
+  const buf = new Uint8Array(memory.buffer);
+  let end = ptr;
+  while (end < buf.length && buf[end] !== 0) end++;
+  return new TextDecoder().decode(buf.slice(ptr, end));
+}
+
+/**
+ * DnaCompressorWasm — wraps a WebAssembly.Instance implementing the
+ * DNA compressor API (compress/decompress via shared linear memory).
+ *
+ * Usage:
+ *   const module = await WebAssembly.compile(wasmBytes);
+ *   const compressor = new DnaCompressorWasm('naf', module);
+ *   const compressed = compressor.compress(data);
+ *   const recovered = compressor.decompress(compressed, data.length);
+ */
+export class DnaCompressorWasm {
+  private instance: WebAssembly.Instance;
+  private exports: DnaCompressorWasmExports;
+  readonly name: string;
+  readonly version: number;
+
+  constructor(name: string, wasmModule: WebAssembly.Module) {
+    this.instance = new WebAssembly.Instance(wasmModule, {
+      env: {
+        // Provide any required imports (abort on allocation failure, etc.)
+        abort: (msgPtr: number) => {
+          throw new Error(`WASM abort: ${readWasmString(this.exports.memory, msgPtr)}`);
+        },
+        // Logger — no-op by default, can be overridden
+        log: () => {},
+      },
+    });
+
+    const exports = this.instance.exports as unknown as DnaCompressorWasmExports;
+
+    // Validate exports
+    if (!exports.memory) throw new Error(`WASM module "${name}" missing memory export`);
+    if (typeof exports.alloc !== 'function') throw new Error(`WASM module "${name}" missing alloc()`);
+    if (typeof exports.dealloc !== 'function') throw new Error(`WASM module "${name}" missing dealloc()`);
+    if (typeof exports.compress !== 'function') throw new Error(`WASM module "${name}" missing compress()`);
+    if (typeof exports.decompress !== 'function') throw new Error(`WASM module "${name}" missing decompress()`);
+    if (typeof exports.version !== 'function') throw new Error(`WASM module "${name}" missing version()`);
+
+    this.exports = exports;
+    this.version = exports.version();
+    this.name = name;
+
+    if (this.version !== WASM_API_VERSION) {
+      throw new Error(
+        `WASM compressor "${name}" has API version ${this.version}, expected ${WASM_API_VERSION}. ` +
+        `Rebuild the C++ sources with the matching API version.`,
+      );
+    }
+
+    // Read the name from WASM memory if available
+    if (typeof exports.name === 'function') {
+      const namePtr = exports.name();
+      const wasmName = readWasmString(exports.memory, namePtr);
+      if (wasmName && wasmName !== name) {
+        // Log a warning but don't throw — the registered name takes precedence
+        console.warn(`WASM compressor registered as "${name}" but self-reports as "${wasmName}"`);
+      }
+    }
+  }
+
+  /**
+   * Compress DNA data using the C++ WASM implementation.
+   *
+   * @param data Input DNA data (ASCII bytes: A, C, G, T, or raw binary)
+   * @returns Compressed data with the same magic header as the TS implementation
+   */
+  compress(data: Uint8Array): Uint8Array {
+    const { memory, alloc, dealloc, compress: wasmCompress } = this.exports;
+
+    // Allocate input buffer in WASM memory
+    const inPtr = alloc(data.length);
+    if (!inPtr) throw new Error(`WASM alloc failed for ${data.length} bytes (compress input)`);
+
+    // Copy input data into WASM memory
+    new Uint8Array(memory.buffer).set(data, inPtr);
+
+    // Allocate output buffer (worst case: same size + header overhead)
+    const maxOutLen = data.length + 1024;  // generous overhead for headers
+    const outPtr = alloc(maxOutLen);
+    if (!outPtr) {
+      dealloc(inPtr);
+      throw new Error(`WASM alloc failed for ${maxOutLen} bytes (compress output)`);
+    }
+
+    try {
+      const compressedLen = wasmCompress(inPtr, data.length, outPtr, maxOutLen);
+      if (compressedLen <= 0) {
+        throw new Error(`WASM compress failed (returned ${compressedLen}) for ${data.length} bytes`);
+      }
+      if (compressedLen > maxOutLen) {
+        throw new Error(`WASM compress wrote ${compressedLen} bytes but output buffer was only ${maxOutLen}`);
+      }
+
+      // Copy result from WASM memory
+      return new Uint8Array(memory.buffer).slice(outPtr, outPtr + compressedLen);
+    } finally {
+      dealloc(inPtr);
+      dealloc(outPtr);
+    }
+  }
+
+  /**
+   * Decompress data using the C++ WASM implementation.
+   *
+   * @param data Compressed data
+   * @param originalSize Expected size of the decompressed output
+   * @returns Decompressed data
+   */
+  decompress(data: Uint8Array, originalSize: number): Uint8Array {
+    const { memory, alloc, dealloc, decompress: wasmDecompress } = this.exports;
+
+    // Allocate input buffer
+    const inPtr = alloc(data.length);
+    if (!inPtr) throw new Error(`WASM alloc failed for ${data.length} bytes (decompress input)`);
+
+    new Uint8Array(memory.buffer).set(data, inPtr);
+
+    // Allocate output buffer
+    const outPtr = alloc(originalSize);
+    if (!outPtr) {
+      dealloc(inPtr);
+      throw new Error(`WASM alloc failed for ${originalSize} bytes (decompress output)`);
+    }
+
+    try {
+      const outLen = wasmDecompress(inPtr, data.length, outPtr, originalSize, originalSize);
+      if (outLen <= 0) {
+        throw new Error(`WASM decompress failed (returned ${outLen}) for ${data.length} bytes`);
+      }
+
+      return new Uint8Array(memory.buffer).slice(outPtr, outPtr + outLen);
+    } finally {
+      dealloc(inPtr);
+      dealloc(outPtr);
+    }
+  }
+
+  /**
+   * Get info about this WASM compressor for diagnostics.
+   */
+  getInfo(): { name: string; version: number; memoryPages: number } {
+    return {
+      name: this.name,
+      version: this.version,
+      memoryPages: this.exports.memory.buffer.byteLength / 65536,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WASM Compressor Registry
+// ---------------------------------------------------------------------------
+
+/**
+ * Global registry of loaded C++ WASM DNA compressors.
+ * Key: compressor name (lowercase, e.g. "naf", "agc", "deepgeco", "mbgc2", "jarvis3")
+ * Value: the DnaCompressorWasm instance
+ */
+const wasmCompressorRegistry = new Map<string, DnaCompressorWasm>();
+
+/**
+ * Register a C++ WASM DNA compressor.
+ *
+ * After registration, the compress router (compress.ts) will prefer the
+ * WASM implementation over the TypeScript arithmetic-coding implementation.
+ *
+ * @param name  Compressor name: "naf", "agc", "deepgeco", "mbgc2", or "jarvis3"
+ * @param wasmModule  A compiled WebAssembly.Module (from WebAssembly.compile)
+ * @returns The DnaCompressorWasm wrapper
+ *
+ * @example
+ *   // Load and register the NAF C++ WASM compressor
+ *   const wasmBytes = await fetch('./wasm-pkg/cpp-compressors/naf.wasm').then(r => r.arrayBuffer());
+ *   const module = await WebAssembly.compile(wasmBytes);
+ *   const compressor = registerDnaCompressorWasm('naf', module);
+ *   const compressed = compressor.compress(dnaData);
+ */
+export function registerDnaCompressorWasm(name: string, wasmModule: WebAssembly.Module): DnaCompressorWasm {
+  const normalized = name.toLowerCase();
+  const compressor = new DnaCompressorWasm(normalized, wasmModule);
+  wasmCompressorRegistry.set(normalized, compressor);
+  return compressor;
+}
+
+/**
+ * Unregister a WASM DNA compressor (revert to TS implementation).
+ */
+export function unregisterDnaCompressorWasm(name: string): boolean {
+  return wasmCompressorRegistry.delete(name.toLowerCase());
+}
+
+/**
+ * Get a registered WASM DNA compressor, or null if not available.
+ */
+export function getDnaCompressorWasm(name: string): DnaCompressorWasm | null {
+  return wasmCompressorRegistry.get(name.toLowerCase()) ?? null;
+}
+
+/**
+ * Check if a WASM DNA compressor is registered for the given name.
+ */
+export function isDnaCompressorWasmAvailable(name: string): boolean {
+  return wasmCompressorRegistry.has(name.toLowerCase());
+}
+
+/**
+ * List all registered WASM DNA compressor names.
+ */
+export function listDnaCompressorWasm(): string[] {
+  return Array.from(wasmCompressorRegistry.keys());
+}
+
+/**
+ * Get info about all registered WASM compressors.
+ */
+export function getWasmCompressorInfo(): { name: string; version: number; memoryPages: number }[] {
+  return Array.from(wasmCompressorRegistry.values()).map(c => c.getInfo());
+}
+
+// ---------------------------------------------------------------------------
+// WASM-aware compress/decompress wrappers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compress with NAF — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function compressWithNAFWasm(data: Uint8Array, level?: number): Uint8Array {
+  const wasm = getDnaCompressorWasm('naf');
+  if (wasm) return wasm.compress(data);
+  return compressWithNAF(data, level);
+}
+
+/**
+ * Decompress NAF — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function decompressWithNAFWasm(data: Uint8Array): Uint8Array {
+  const wasm = getDnaCompressorWasm('naf');
+  if (wasm) {
+    // Extract original size from the NAF header
+    const v = new DataView(data.buffer, data.byteOffset);
+    const dnaLen = v.getUint32(4, true);
+    return wasm.decompress(data, dnaLen > 0 ? dnaLen : v.getUint32(8, true));
+  }
+  return decompressWithNAF(data);
+}
+
+/**
+ * Compress with AGC — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function compressWithAGCWasm(data: Uint8Array, level?: number): Uint8Array {
+  const wasm = getDnaCompressorWasm('agc');
+  if (wasm) return wasm.compress(data);
+  return compressWithAGC(data, level);
+}
+
+/**
+ * Decompress AGC — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function decompressWithAGCWasm(data: Uint8Array): Uint8Array {
+  const wasm = getDnaCompressorWasm('agc');
+  if (wasm) {
+    const v = new DataView(data.buffer, data.byteOffset);
+    const dnaLen = v.getUint32(4, true);
+    return wasm.decompress(data, dnaLen);
+  }
+  return decompressWithAGC(data);
+}
+
+/**
+ * Compress with DeepGeCo — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function compressWithDeepGeCoWasm(data: Uint8Array, level?: number): Uint8Array {
+  const wasm = getDnaCompressorWasm('deepgeco');
+  if (wasm) return wasm.compress(data);
+  return compressWithDeepGeCo(data, level);
+}
+
+/**
+ * Decompress DeepGeCo — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function decompressWithDeepGeCoWasm(data: Uint8Array): Uint8Array {
+  const wasm = getDnaCompressorWasm('deepgeco');
+  if (wasm) {
+    const v = new DataView(data.buffer, data.byteOffset);
+    const dnaLen = v.getUint32(4, true);
+    return wasm.decompress(data, dnaLen);
+  }
+  return decompressWithDeepGeCo(data);
+}
+
+/**
+ * Compress with MBGC2 — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function compressWithMBGC2Wasm(data: Uint8Array, level?: number): Uint8Array {
+  const wasm = getDnaCompressorWasm('mbgc2');
+  if (wasm) return wasm.compress(data);
+  return compressWithMBGC2(data, level);
+}
+
+/**
+ * Decompress MBGC2 — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function decompressWithMBGC2Wasm(data: Uint8Array): Uint8Array {
+  const wasm = getDnaCompressorWasm('mbgc2');
+  if (wasm) {
+    const v = new DataView(data.buffer, data.byteOffset);
+    const dnaLen = v.getUint32(4, true);
+    return wasm.decompress(data, dnaLen);
+  }
+  return decompressWithMBGC2(data);
+}
+
+/**
+ * Compress with JARVIS3 — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function compressWithJARVIS3Wasm(data: Uint8Array, level?: number): Uint8Array {
+  const wasm = getDnaCompressorWasm('jarvis3');
+  if (wasm) return wasm.compress(data);
+  return compressWithJARVIS3(data, level);
+}
+
+/**
+ * Decompress JARVIS3 — uses C++ WASM if registered, otherwise TypeScript.
+ */
+export function decompressWithJARVIS3Wasm(data: Uint8Array): Uint8Array {
+  const wasm = getDnaCompressorWasm('jarvis3');
+  if (wasm) {
+    const v = new DataView(data.buffer, data.byteOffset);
+    const dnaLen = v.getUint32(4, true);
+    return wasm.decompress(data, dnaLen);
+  }
+  return decompressWithJARVIS3(data);
+}
+
+/**
+ * Bulk-load all C++ WASM DNA compressors from a directory.
+ * Intended for Node.js use — reads .wasm files from the filesystem.
+ *
+ * @param dirPath  Directory containing naf.wasm, agc.wasm, etc.
+ * @returns Array of registered compressor names
+ *
+ * @example
+ *   // In Node.js startup:
+ *   const names = await loadAllWasmCompressors('./src/lib/dna/wasm-pkg/cpp-compressors');
+ *   console.log('Loaded WASM compressors:', names);
+ */
+export async function loadAllWasmCompressors(dirPath: string): Promise<string[]> {
+  const COMPRESSOR_NAMES = ['naf', 'agc', 'deepgeco', 'mbgc2', 'jarvis3'];
+  const loaded: string[] = [];
+
+  try {
+    // Dynamic import for Node.js fs
+    const fs = await import('fs');
+    const path = await import('path');
+
+    for (const name of COMPRESSOR_NAMES) {
+      const wasmPath = path.join(dirPath, `${name}.wasm`);
+      try {
+        const wasmBytes = await fs.promises.readFile(wasmPath);
+        const module = await WebAssembly.compile(wasmBytes);
+        registerDnaCompressorWasm(name, module);
+        loaded.push(name);
+      } catch {
+        // File not found or compile failed — skip, TS fallback will be used
+      }
+    }
+  } catch {
+    // fs module not available (browser) — cannot auto-load from directory
+  }
+
+  return loaded;
+}
+
 // Re-export for compress.ts wiring
 export {
   ArithmeticEncoder,
