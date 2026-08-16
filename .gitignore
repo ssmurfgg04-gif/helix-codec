@@ -10,3 +10,10 @@ wasm-src/*.wasm
 wasm-src/*.js
 wasm-src/*.cjs
 
+
+
+# Test data
+test-data/sparse_100mb.bin
+test-data/nanopore.fastq
+test-ecoli.ts
+wasm-src/libz_wasm.a

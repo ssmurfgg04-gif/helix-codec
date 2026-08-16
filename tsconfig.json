@@ -11,7 +11,7 @@
     "strict": true,
     "noEmit": true,
     "noImplicitAny": false,
-    "bigInt": true,
+    
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",

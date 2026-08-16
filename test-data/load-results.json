@@ -1,0 +1,29 @@
+[
+  {
+    "name": "E. coli K-12",
+    "bases": 4641652,
+    "status": "loaded"
+  },
+  {
+    "name": "Gutenberg text",
+    "bytes": 738046,
+    "status": "loaded"
+  },
+  {
+    "name": "Sparse 100MB",
+    "bytes": 104857600,
+    "nonZeroPct": "1.00",
+    "status": "loaded"
+  },
+  {
+    "name": "Nanopore reads",
+    "reads": 50,
+    "totalBases": 260122,
+    "status": "loaded"
+  },
+  {
+    "name": "DNA Fountain input",
+    "bytes": 305175,
+    "status": "loaded"
+  }
+]

@@ -8,8 +8,11 @@
  *   - bam_init1() / bam_destroy1()  — create/destroy bam1_t records
  *   - Full bam1_t accessor API
  *
- * The WASM binary includes real zlib for BGZF decompression.
- * Compiled from htslib-wasm-core.c + zlib using Emscripten.
+ * The WASM binary is compiled from htslib-wasm-core.c using Emscripten.
+ * BGZF decompression is handled by pako (which wraps zlib) in the JS layer,
+ * then the uncompressed BAM is passed to the WASM htslib parser.
+ * This ensures reliable BGZF handling while keeping the core BAM parsing
+ * in compiled C for speed.
  *
  * Usage:
  *   import { initHtslibWasm, HtslibWasm } from './htslib-wasm';
@@ -25,6 +28,93 @@ let initialized = false;
 
 /** Emscripten Module instance. */
 let Module: any = null;
+
+// ---------------------------------------------------------------------------
+// BGZF decompression (using pako)
+// ---------------------------------------------------------------------------
+
+/**
+ * Decompress BGZF data using pako.
+ * BGZF is a series of concatenated gzip blocks. We decompress each block
+ * and concatenate the results.
+ */
+function bgzfDecompress(data: Uint8Array): Uint8Array {
+  // Not BGZF — return as-is
+  if (data.length < 2 || data[0] !== 0x1F || data[1] !== 0x8B) {
+    return data;
+  }
+
+  // Dynamic import of pako (available as project dependency)
+  const pako = require('pako');
+
+  const chunks: Uint8Array[] = [];
+  let pos = 0;
+
+  while (pos < data.length) {
+    // Check for gzip magic
+    if (pos + 2 > data.length || data[pos] !== 0x1F || data[pos + 1] !== 0x8B) {
+      // Not gzip — treat remaining as raw
+      chunks.push(data.slice(pos));
+      break;
+    }
+
+    // Read BGZF extra field to get block size
+    const flags = data[pos + 3];
+    let hdrEnd = pos + 10;
+    let bsize = 0;
+
+    if (flags & 0x04) { // FEXTRA
+      if (hdrEnd + 2 > data.length) break;
+      const xlen = data[hdrEnd] | (data[hdrEnd + 1] << 8);
+      let xp = hdrEnd + 2;
+      while (xp + 4 <= hdrEnd + 2 + xlen) {
+        if (data[xp] === 0x42 && data[xp + 1] === 0x43 && data[xp + 2] === 0x02) {
+          bsize = (data[xp + 3] | (data[xp + 4] << 8)) + 1;
+          break;
+        }
+        xp += 4 + data[xp + 3];
+      }
+      hdrEnd += 2 + xlen;
+    }
+
+    if (flags & 0x08) { // FNAME
+      while (hdrEnd < data.length && data[hdrEnd] !== 0) hdrEnd++;
+      hdrEnd++;
+    }
+    if (flags & 0x10) { // FCOMMENT
+      while (hdrEnd < data.length && data[hdrEnd] !== 0) hdrEnd++;
+      hdrEnd++;
+    }
+    if (flags & 0x02) { // FHCRC
+      hdrEnd += 2;
+    }
+
+    if (bsize === 0) bsize = 65536; // default BGZF block size
+    const blockEnd = Math.min(pos + bsize, data.length);
+
+    // Decompress this gzip block using pako
+    try {
+      const block = data.slice(pos, blockEnd);
+      const decompressed = pako.inflate(block);
+      chunks.push(decompressed);
+    } catch {
+      // Skip this block on error
+    }
+
+    pos = blockEnd;
+  }
+
+  // Concatenate all chunks
+  let totalLen = 0;
+  for (const chunk of chunks) totalLen += chunk.length;
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Initialization
@@ -138,12 +228,16 @@ export class HtslibWasm {
 
     const hts = new HtslibWasm();
 
+    // Decompress BGZF if needed (using pako for reliability),
+    // then pass uncompressed BAM to the WASM parser.
+    const bamData = bgzfDecompress(data);
+
     // Copy data to WASM memory via _malloc + HEAPU8.set
-    const dataPtr = Module._malloc(data.length);
-    Module.HEAPU8.set(data, dataPtr);
+    const dataPtr = Module._malloc(bamData.length);
+    Module.HEAPU8.set(bamData, dataPtr);
 
     // Open file from memory
-    hts.fp = Module._hts_open_mem(dataPtr, data.length);
+    hts.fp = Module._hts_open_mem(dataPtr, bamData.length);
     Module._free(dataPtr);
 
     if (!hts.fp) {

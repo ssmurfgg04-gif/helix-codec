@@ -20,10 +20,11 @@
  *   - Forney (1965) for error magnitudes in erasure decoding
  */
 
-// reedsolomon is a CommonJS module (ZXing port). Use dynamic require to avoid
-// Turbopack's strict ESM import checks.
- 
-const rsLib = require("reedsolomon");
+// reedsolomon is a CommonJS module (ZXing port). Use createRequire to avoid
+// ESM/CJS interop issues when running with tsx or other ESM-first tools.
+import { createRequire } from 'node:module';
+const require2 = createRequire(import.meta.url ?? __filename);
+const rsLib = require2("reedsolomon");
 import { gfMul, gfDiv, gfInverse, gfPow } from "./gf256";
 
 export interface RSConfig {

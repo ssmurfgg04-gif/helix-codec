@@ -147,6 +147,13 @@ export async function encodeFile(
   // 2) Encrypt (optional) — after compression since encrypted data is incompressible
   let processedData: Uint8Array = compressed;
   let encryptionSalt: Uint8Array | null = null;
+  if (!cfg.encryptPassword) {
+    console.warn(
+      '[helix-codec] Encoding without encryption. DNA storage data is vulnerable to' +
+      ' unauthorized read/write when stored without encryption. Pass encryptPassword' +
+      ' in the config to enable XChaCha20-Poly1305 authenticated encryption.'
+    );
+  }
   if (cfg.encryptPassword) {
     const { encrypt } = await import("./encryption");
     const salt = new Uint8Array(16);
@@ -895,6 +902,13 @@ export async function encodeToCanonical(
   // 2) Encrypt (optional)
   let processedData: Uint8Array = compressed;
   let encryptionSalt: Uint8Array | null = null;
+  if (!cfg.encryptPassword) {
+    console.warn(
+      '[helix-codec] Encoding without encryption. DNA storage data is vulnerable to' +
+      ' unauthorized read/write when stored without encryption. Pass encryptPassword' +
+      ' in the config to enable XChaCha20-Poly1305 authenticated encryption.'
+    );
+  }
   if (cfg.encryptPassword) {
     const { encrypt } = await import("./encryption");
     const salt = new Uint8Array(16);
