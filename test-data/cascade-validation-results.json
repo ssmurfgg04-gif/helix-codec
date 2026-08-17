@@ -16,7 +16,7 @@
       "avgSubs": 15.6,
       "avgIns": 17.233333333333334,
       "avgDels": 27.933333333333334,
-      "decodeMs": 21428
+      "decodeMs": 6616
     },
     {
       "idsRate": 0.02,
@@ -34,7 +34,7 @@
       "avgSubs": 33.56666666666667,
       "avgIns": 40.2,
       "avgDels": 58.7,
-      "decodeMs": 23714
+      "decodeMs": 7134
     },
     {
       "idsRate": 0.02,
@@ -52,7 +52,7 @@
       "avgSubs": 53.2,
       "avgIns": 60.13333333333333,
       "avgDels": 90.26666666666667,
-      "decodeMs": 22915
+      "decodeMs": 7557
     },
     {
       "idsRate": 0.04,
@@ -70,7 +70,7 @@
       "avgSubs": 30.166666666666668,
       "avgIns": 35.766666666666666,
       "avgDels": 52.43333333333333,
-      "decodeMs": 20269
+      "decodeMs": 6404
     },
     {
       "idsRate": 0.04,
@@ -88,7 +88,7 @@
       "avgSubs": 68.3,
       "avgIns": 78.86666666666666,
       "avgDels": 116.53333333333333,
-      "decodeMs": 15430
+      "decodeMs": 7043
     },
     {
       "idsRate": 0.04,
@@ -106,7 +106,7 @@
       "avgSubs": 98.66666666666667,
       "avgIns": 121.93333333333334,
       "avgDels": 188.66666666666666,
-      "decodeMs": 15884
+      "decodeMs": 7390
     },
     {
       "idsRate": 0.06,
@@ -124,7 +124,7 @@
       "avgSubs": 42.43333333333333,
       "avgIns": 52.3,
       "avgDels": 80.53333333333333,
-      "decodeMs": 13579
+      "decodeMs": 6360
     },
     {
       "idsRate": 0.06,
@@ -142,7 +142,7 @@
       "avgSubs": 94.7,
       "avgIns": 116.73333333333333,
       "avgDels": 176.7,
-      "decodeMs": 16037
+      "decodeMs": 7021
     },
     {
       "idsRate": 0.06,
@@ -160,7 +160,7 @@
       "avgSubs": 151.33333333333334,
       "avgIns": 178.43333333333334,
       "avgDels": 283.8666666666667,
-      "decodeMs": 16493
+      "decodeMs": 7384
     },
     {
       "idsRate": 0.08,
@@ -178,7 +178,7 @@
       "avgSubs": 59,
       "avgIns": 66.6,
       "avgDels": 105.3,
-      "decodeMs": 13835
+      "decodeMs": 6333
     },
     {
       "idsRate": 0.08,
@@ -196,7 +196,7 @@
       "avgSubs": 126.96666666666667,
       "avgIns": 151.13333333333333,
       "avgDels": 237.3,
-      "decodeMs": 16207
+      "decodeMs": 7093
     },
     {
       "idsRate": 0.08,
@@ -214,7 +214,7 @@
       "avgSubs": 200.63333333333333,
       "avgIns": 238.76666666666668,
       "avgDels": 374.4,
-      "decodeMs": 16109
+      "decodeMs": 7454
     },
     {
       "idsRate": 0.09,
@@ -232,7 +232,7 @@
       "avgSubs": 64.26666666666667,
       "avgIns": 76,
       "avgDels": 118.9,
-      "decodeMs": 13597
+      "decodeMs": 6410
     },
     {
       "idsRate": 0.09,
@@ -250,7 +250,7 @@
       "avgSubs": 141.66666666666666,
       "avgIns": 171.06666666666666,
       "avgDels": 262.46666666666664,
-      "decodeMs": 14182
+      "decodeMs": 7027
     },
     {
       "idsRate": 0.09,
@@ -268,7 +268,7 @@
       "avgSubs": 224.86666666666667,
       "avgIns": 265.3333333333333,
       "avgDels": 419.3666666666667,
-      "decodeMs": 14946
+      "decodeMs": 7396
     },
     {
       "idsRate": 0.1,
@@ -286,7 +286,7 @@
       "avgSubs": 71.46666666666667,
       "avgIns": 84.76666666666667,
       "avgDels": 132.16666666666666,
-      "decodeMs": 13380
+      "decodeMs": 6335
     },
     {
       "idsRate": 0.1,
@@ -304,7 +304,7 @@
       "avgSubs": 158.36666666666667,
       "avgIns": 183.36666666666667,
       "avgDels": 293.93333333333334,
-      "decodeMs": 14796
+      "decodeMs": 7024
     },
     {
       "idsRate": 0.1,
@@ -322,7 +322,7 @@
       "avgSubs": 247.2,
       "avgIns": 297.6333333333333,
       "avgDels": 464.1666666666667,
-      "decodeMs": 15389
+      "decodeMs": 7353
     },
     {
       "idsRate": 0.12,
@@ -340,7 +340,7 @@
       "avgSubs": 83.2,
       "avgIns": 99.7,
       "avgDels": 161.1,
-      "decodeMs": 15468
+      "decodeMs": 6288
     },
     {
       "idsRate": 0.12,
@@ -358,7 +358,7 @@
       "avgSubs": 183.9,
       "avgIns": 226,
       "avgDels": 357.5,
-      "decodeMs": 11978
+      "decodeMs": 7017
     },
     {
       "idsRate": 0.12,
@@ -376,8 +376,8 @@
       "avgSubs": 290.3333333333333,
       "avgIns": 355.1333333333333,
       "avgDels": 559.1333333333333,
-      "decodeMs": 11399
+      "decodeMs": 7334
     }
   ],
-  "timestamp": "2026-08-16T20:14:24.393Z"
+  "timestamp": "2026-08-17T05:31:28.649Z"
 }

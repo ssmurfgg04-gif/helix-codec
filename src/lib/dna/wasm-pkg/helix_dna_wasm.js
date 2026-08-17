@@ -534,6 +534,48 @@ export function complement(bits) {
 }
 
 /**
+ * Convolutional encode with K=7 Voyager code.
+ * @param {Uint8Array} info_bytes
+ * @returns {Uint8Array}
+ */
+export function conv_k7_encode(info_bytes) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(info_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.conv_k7_encode(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var v2 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Convolutional encode with K=9 NASA code.
+ * @param {Uint8Array} info_bytes
+ * @returns {Uint8Array}
+ */
+export function conv_k9_encode(info_bytes) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(info_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.conv_k9_encode(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var v2 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * Compress 2-bit packed DNA using order-1 context modeling.
  * Each base (A=0, C=1, G=2, T=3) is encoded with a context-dependent
  * model where the context is the previous base.
@@ -963,6 +1005,73 @@ export function version() {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export2(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * K=7 (Voyager) Indel-Tolerant Viterbi decode (byte-oriented).
+ * @param {Uint8Array} received_bytes
+ * @param {Uint8Array} llr_f64
+ * @param {number} num_info_bits
+ * @param {number} max_drift
+ * @param {number} insertion_penalty_x10
+ * @param {number} deletion_penalty_x10
+ * @returns {Uint8Array}
+ */
+export function viterbi_k7_decode(received_bytes, llr_f64, num_info_bits, max_drift, insertion_penalty_x10, deletion_penalty_x10) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(received_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(llr_f64, wasm.__wbindgen_export);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.viterbi_k7_decode(retptr, ptr0, len0, ptr1, len1, num_info_bits, max_drift, insertion_penalty_x10, deletion_penalty_x10);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var v3 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v3;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * K=9 Indel-Tolerant Viterbi decode (byte-oriented).
+ *
+ * # Arguments
+ * * `received_bytes` — received bytes (hard decisions)
+ * * `llr_bytes` — packed LLR values as IEEE 754 f64 little-endian bytes (8 bytes per LLR, one per bit)
+ * * `num_info_bits` — number of information bits
+ * * `max_drift` — maximum drift to track (default 15)
+ * * `insertion_penalty_x10` — insertion penalty × 10 (e.g. 15 for 1.5)
+ * * `deletion_penalty_x10` — deletion penalty × 10 (e.g. 10 for 1.0)
+ *
+ * # Returns
+ * Decoded bytes
+ * @param {Uint8Array} received_bytes
+ * @param {Uint8Array} llr_f64
+ * @param {number} num_info_bits
+ * @param {number} max_drift
+ * @param {number} insertion_penalty_x10
+ * @param {number} deletion_penalty_x10
+ * @returns {Uint8Array}
+ */
+export function viterbi_k9_decode(received_bytes, llr_f64, num_info_bits, max_drift, insertion_penalty_x10, deletion_penalty_x10) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(received_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(llr_f64, wasm.__wbindgen_export);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.viterbi_k9_decode(retptr, ptr0, len0, ptr1, len1, num_info_bits, max_drift, insertion_penalty_x10, deletion_penalty_x10);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var v3 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v3;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
     }
 }
 function __wbg_get_imports() {

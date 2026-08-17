@@ -25,6 +25,8 @@ export const bhe_validate: (a: number, b: number, c: number) => number;
 export const bit_parallel_hamming: (a: number, b: number, c: number, d: number) => number;
 export const bit_parallel_match: (a: number, b: number, c: number, d: number, e: number) => void;
 export const complement: (a: number, b: number, c: number) => void;
+export const conv_k7_encode: (a: number, b: number, c: number) => void;
+export const conv_k9_encode: (a: number, b: number, c: number) => void;
 export const dna_compress_order1: (a: number, b: number, c: number, d: number) => void;
 export const dna_decompress_order1: (a: number, b: number, c: number) => void;
 export const ldpc_create: (a: number, b: number, c: number) => number;
@@ -55,6 +57,8 @@ export const unpack_batch: (a: number, b: number, c: number, d: number, e: numbe
 export const unpack_bits_to_ascii: (a: number, b: number, c: number, d: number) => void;
 export const unpack_bits_to_dna: (a: number, b: number, c: number, d: number) => void;
 export const version: (a: number) => void;
+export const viterbi_k7_decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+export const viterbi_k9_decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
 export const __wbg_get_synthesisprofile_del_rate: (a: number) => number;
 export const __wbg_get_synthesisprofile_ins_rate: (a: number) => number;
 export const __wbg_get_synthesisprofile_sub_rate: (a: number) => number;

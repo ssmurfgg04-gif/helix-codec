@@ -1,0 +1,35 @@
+{
+  "wasmViterbi": true,
+  "wasmSpeedup": "4.6x (175ms vs 800ms per K=9 decode)",
+  "crcBugFix": "crc16Bytes() returns Uint8Array(2), not number — was storing 0x00 0x00 instead of actual CRC",
+  "singleReadViterbiLdpcCrc": {
+    "ids1pct": { "recovery": "93%", "crc": "87%", "ldpc": "93%", "notes": "Excellent — Viterbi+LDPC handles 1% DNA IDS" },
+    "ids2pct": { "recovery": "53%", "crc": "40%", "ldpc": "60%", "notes": "Moderate — needs coverage for reliable recovery" },
+    "ids3pct": { "recovery": "27%", "crc": "13%", "ldpc": "53%", "notes": "LDPC helps significantly but insufficient alone" },
+    "ids5pct": { "recovery": "7%", "crc": "7%", "ldpc": "40%", "notes": "Viterbi overloaded — needs MSA+consensus preprocessing" }
+  },
+  "perReadViterbiWithMajorityVote": {
+    "ids2pct_cov10": { "recovery": "100%", "notes": "Per-read + 10× coverage majority vote achieves full recovery" },
+    "ids4pct_cov10": { "recovery": "0%", "notes": "Per-read accuracy too low for majority vote at 4% IDS" },
+    "ids6pct_cov15": { "recovery": "0%", "notes": "Need MSA+consensus before Viterbi for IDS > 3%" }
+  },
+  "tuningRecommendations": {
+    "k9Penalties": {
+      "insertionPenalty": 1.5,
+      "deletionPenalty": 1.0,
+      "maxDrift": 15,
+      "notes": "Current defaults work well for ≤2% DNA IDS. For 3-5%, try ins=1.2 del=0.8"
+    },
+    "ldpcParity": {
+      "lowIDS": "4-6 bytes for IDS ≤ 2%",
+      "mediumIDS": "8-10 bytes for IDS 2-4%",
+      "highIDS": "10-12 bytes for IDS > 4%"
+    },
+    "nanopore9pct": {
+      "required": "MSA+consensus preprocessing before Viterbi",
+      "coverage": "30× minimum",
+      "pipeline": "MSA → consensus → Viterbi → LDPC → RS erasure"
+    }
+  },
+  "timestamp": "2026-08-17T05:30:00Z"
+}

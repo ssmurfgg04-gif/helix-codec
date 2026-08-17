@@ -10,7 +10,7 @@
 
 import { NASA_K9_CONFIG } from '../src/lib/dna/convolutional-k9';
 import { ConvolutionalCode, bytesToBits, bitsToBytes } from '../src/lib/dna/convolutional';
-import { IndelViterbiDecoder, DEFAULT_INDEL_VITERBI_CONFIG, IndelTolerantConvolutionalInnerCode } from '../src/lib/dna/convolutional-indel';
+import { IndelViterbiDecoder, DEFAULT_INDEL_VITERBI_CONFIG, IndelTolerantConvolutionalInnerCode, enableWasmViterbi, isWasmViterbiActive } from '../src/lib/dna/convolutional-indel';
 import { LDPCInnerCode, getCachedLDPCInner } from '../src/lib/dna/ldpc-codec';
 import { ReedSolomon } from '../src/lib/dna/reedsolomon';
 import { crc16Bytes } from '../src/lib/dna/crc16';
@@ -138,9 +138,9 @@ function runTest(
     // CRC-16
     const withCrc = new Uint8Array(ldpcCW.length + 2);
     withCrc.set(ldpcCW, 0);
-    const crc = crc16Bytes(ldpcCW);
-    withCrc[ldpcCW.length] = (crc >> 8) & 0xFF;
-    withCrc[ldpcCW.length + 1] = crc & 0xFF;
+    const crc = crc16Bytes(ldpcCW); // Uint8Array(2): [high, low]
+    withCrc[ldpcCW.length] = crc[0];
+    withCrc[ldpcCW.length + 1] = crc[1];
 
     // Conv encode
     let convOut: Uint8Array = withCrc;
@@ -212,8 +212,8 @@ function runTest(
     let crcPass = false;
     if (afterConv.length >= 2) {
       const dataPart = afterConv.slice(0, afterConv.length - 2);
-      const recvCrc = (afterConv[afterConv.length - 2] << 8) | afterConv[afterConv.length - 1];
-      crcPass = recvCrc === crc16Bytes(dataPart);
+      const computedCrc = crc16Bytes(dataPart); // Uint8Array(2): [high, low]
+      crcPass = afterConv[afterConv.length - 2] === computedCrc[0] && afterConv[afterConv.length - 1] === computedCrc[1];
     }
 
     // LDPC decode
@@ -272,6 +272,10 @@ async function main() {
   console.log('╔══════════════════════════════════════════════════════════════╗');
   console.log('║   Quick Cascade Validation — Viterbi+LDPC+RS               ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
+
+  // v65: Enable Rust WASM Viterbi (~5ms vs ~800ms per oligo for K=9)
+  const wasmOk = await enableWasmViterbi();
+  console.log(`Rust WASM Viterbi: ${wasmOk ? '✓ ENABLED' : '✗ disabled (using JS fallback)'}\n`);
 
   const rng = new Rng(42);
   const numOligos = 30; // small for K=9 speed

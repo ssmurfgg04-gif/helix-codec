@@ -142,6 +142,16 @@ export function bit_parallel_match(pattern: Uint8Array, text: Uint8Array): Uint3
 export function complement(bits: Uint8Array): Uint8Array;
 
 /**
+ * Convolutional encode with K=7 Voyager code.
+ */
+export function conv_k7_encode(info_bytes: Uint8Array): Uint8Array;
+
+/**
+ * Convolutional encode with K=9 NASA code.
+ */
+export function conv_k9_encode(info_bytes: Uint8Array): Uint8Array;
+
+/**
  * Compress 2-bit packed DNA using order-1 context modeling.
  * Each base (A=0, C=1, G=2, T=3) is encoded with a context-dependent
  * model where the context is the previous base.
@@ -250,6 +260,27 @@ export function unpack_bits_to_dna(packed: Uint8Array, num_bases: number): strin
  */
 export function version(): string;
 
+/**
+ * K=7 (Voyager) Indel-Tolerant Viterbi decode (byte-oriented).
+ */
+export function viterbi_k7_decode(received_bytes: Uint8Array, llr_f64: Uint8Array, num_info_bits: number, max_drift: number, insertion_penalty_x10: number, deletion_penalty_x10: number): Uint8Array;
+
+/**
+ * K=9 Indel-Tolerant Viterbi decode (byte-oriented).
+ *
+ * # Arguments
+ * * `received_bytes` — received bytes (hard decisions)
+ * * `llr_bytes` — packed LLR values as IEEE 754 f64 little-endian bytes (8 bytes per LLR, one per bit)
+ * * `num_info_bits` — number of information bits
+ * * `max_drift` — maximum drift to track (default 15)
+ * * `insertion_penalty_x10` — insertion penalty × 10 (e.g. 15 for 1.5)
+ * * `deletion_penalty_x10` — deletion penalty × 10 (e.g. 10 for 1.0)
+ *
+ * # Returns
+ * Decoded bytes
+ */
+export function viterbi_k9_decode(received_bytes: Uint8Array, llr_f64: Uint8Array, num_info_bits: number, max_drift: number, insertion_penalty_x10: number, deletion_penalty_x10: number): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -278,6 +309,8 @@ export interface InitOutput {
     readonly bit_parallel_hamming: (a: number, b: number, c: number, d: number) => number;
     readonly bit_parallel_match: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly complement: (a: number, b: number, c: number) => void;
+    readonly conv_k7_encode: (a: number, b: number, c: number) => void;
+    readonly conv_k9_encode: (a: number, b: number, c: number) => void;
     readonly dna_compress_order1: (a: number, b: number, c: number, d: number) => void;
     readonly dna_decompress_order1: (a: number, b: number, c: number) => void;
     readonly ldpc_create: (a: number, b: number, c: number) => number;
@@ -308,6 +341,8 @@ export interface InitOutput {
     readonly unpack_bits_to_ascii: (a: number, b: number, c: number, d: number) => void;
     readonly unpack_bits_to_dna: (a: number, b: number, c: number, d: number) => void;
     readonly version: (a: number) => void;
+    readonly viterbi_k7_decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+    readonly viterbi_k9_decode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly __wbg_get_synthesisprofile_del_rate: (a: number) => number;
     readonly __wbg_get_synthesisprofile_ins_rate: (a: number) => number;
     readonly __wbg_get_synthesisprofile_sub_rate: (a: number) => number;
