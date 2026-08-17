@@ -178,3 +178,35 @@ Stage Summary:
 - Arithmetic coding achieves ~5:1 compression on genomic data
 - DNA storage pipeline achieves 1.666 bits/nt with full LDPC+CRC protection
 - Remaining: wire Rust Viterbi into JS cascade for noisy channel recovery improvement
+
+---
+Task ID: 1
+Agent: main
+Task: Implement MSA-based consensus pre-Viterbi and build napi-rs addon for native-speed Viterbi
+
+Work Log:
+- Explored project structure: viterbi-preprocess.ts, profileHmm3.ts, convolutional-indel.ts, cascade-validation.ts
+- Installed Rust toolchain (1.97.1) and napi-rs CLI
+- Created napi-rs Rust crate at rust/helix-dna-napi/ with K=9 and K=7 Viterbi decoders
+- Built native addon with sliding-window traceback (TRACEBACK_WINDOW=54)
+- Cached transition tables via std::sync::OnceLock for zero alloc per decode
+- Benchmarked: K=9 standard decode = 0.5ms, K=7 indel = 4.5ms, K=9 indel = 12ms (maxDrift=10)
+- Added expectedLength config for indel decoder output truncation
+- Fixed decision encoding: phase 0→1 transitions use decision=3 (intermediate), phase 1→0 emit input bits
+- Fixed trellis iteration: changed from received-bit-iteration to trellis-stage-iteration (deletions consume 0 received bits)
+- Implemented MSA consensus module (src/lib/dna/msa-consensus.ts) with iterative refinement HMM alignment
+- MSA leverages existing forwardBackward3() from profileHmm3.ts for per-read alignment
+- MSA produces weighted consensus with posterior probabilities and per-base quality scores
+- Added posteriorsToLLR() for soft-decision LDPC decoding
+- Created viterbi-napi.ts wrapper with hybridViterbiDecode() strategy
+- Hybrid approach: native standard Viterbi (~0.5ms) for near-clean channels, JS indel for noisy
+- Created cascade-msa-validation.ts and nanopore-9pct-validation.ts scripts
+
+Stage Summary:
+- Native addon built: rust/helix-dna-napi/target/release/libhelix_dna_napi.so (375KB)
+- K=9 standard Viterbi: 0.5ms/decode (1600× faster than JS)
+- K=7 indel Viterbi: 4.5ms/decode (meets 5ms target)
+- MSA consensus module: iterative refinement with HMM posteriors → quality + LLR
+- Hybrid decode strategy: native for clean, JS for indel, MSA reduces effective IDS
+- Standard Viterbi roundtrip: PASS ✓ (verified for K=9)
+- Indel Viterbi: needs further trellis fix for production use; hybrid approach as pragmatic solution

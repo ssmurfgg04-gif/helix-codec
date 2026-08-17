@@ -1,0 +1,22 @@
+[package]
+name = "helix-dna-napi"
+version = "0.1.0"
+edition = "2021"
+description = "Helix DNA codec native Node.js addon — K=9 Viterbi hot path via napi-rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["napi6"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
