@@ -209,9 +209,9 @@ export const DEFAULT_INDEL_VITERBI_CONFIG: IndelViterbiConfig = {
   // Insertion cost = 1.5 (was 2.0): real insertions cause ~1.5 subsequent
   // mismatches on average before Viterbi resyncs; this matches the penalty.
   insertionPenalty: 1.5,
-  // Deletion cost = 1.0 (was 1.5): with d_free=24, deletions are easier
-  // to distinguish from substitutions.
-  deletionPenalty: 1.0,
+  // Deletion cost = 1.5 (v4.1: MUST equal ins_pen — del_pen=1.0 caused
+  // spurious D paths that beat correct I paths on noisy channels).
+  deletionPenalty: 1.5,
 };
 
 /**

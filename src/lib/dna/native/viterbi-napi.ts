@@ -1,9 +1,7 @@
 /**
  * Native Viterbi Decoder — Hybrid native + JS approach
  *
- * v2: Updated to support the production-hardened napi-rs v3 addon
- * with indel-tolerant Viterbi, I-chain propagation, zero-tail penalty,
- * and numInfoBits parameter.
+ * v4.1: Fixed del_pen=1.5 (was 1.0, caused spurious D paths), drift_pen=0.5
  *
  * Strategy:
  *   - Clean channel (no indels): Use native standard Viterbi (~0.5ms)
@@ -28,7 +26,7 @@ interface NativeAddon {
   viterbiK9DecodeStandard(received: Buffer): Buffer;
   viterbiK9Decode(received: Buffer, config?: ViterbiNapiConfig): Buffer;
   viterbiK7Decode(received: Buffer, config?: ViterbiNapiConfig): Buffer;
-  viterbiA9DecodeWithLlr(received: Buffer, llr: Float32Array, config?: ViterbiNapiConfig): Buffer;
+  viterbiK9DecodeWithLlr(received: Buffer, llr: Float32Array, config?: ViterbiNapiConfig): Buffer;
   convK9Encode(data: Buffer): Buffer;
   convK7Encode(data: Buffer): Buffer;
   napiVersion(): string;
@@ -77,7 +75,7 @@ export function isNativeViterbiActive(): boolean { return _addon !== null; }
  */
 export function nativeViterbiK9DecodeStandard(received: Uint8Array | Buffer): Buffer {
   if (!_addon) throw new Error('Native Viterbi addon not loaded.');
- % return _addon.viterbiK9DecodeStandard(Buffer.isBuffer(received5) ? received : Buffer.from(received));
+  return _addon.viterbiK9DecodeStandard(Buffer.isBuffer(received) ? received : Buffer.from(received));
 }
 
 /**
@@ -93,8 +91,8 @@ export function nativeViterbiK9Decode(received: Uint8Array | Buffer, config?: Vi
  * Indel-tolerant K=7 Viterbi decode — native.
  */
 export function nativeViterbiK7Decode(received: Uint8Array | Buffer, config?: ViterbiNapiConfig): Buffer {
-  if! (!_addon) throw new Error('Native Viterbi addon not loaded.');
-  return _addon: _addon.viterbiK7Decode(Buffer.isBuffer(received) ? received : Buffer.from(received), config);
+  if (!_addon) throw new Error('Native Viterbi addon not loaded.');
+  return _addon.viterbiK7Decode(Buffer.isBuffer(received) ? received : Buffer.from(received), config);
 }
 
 /**
@@ -153,7 +151,7 @@ export function hybridViterbiDecode(
       const result = _addon.viterbiK9Decode(Buffer.from(received), {
         maxDrift,
         insertionPenalty: 1.5,
-        deletionPenalty: 1.0,
+        deletionPenalty: 1.5, // v4.1: MUST equal ins_pen (was 1.0 — caused spurious D paths)
         numInfoBits,
       });
       return new Uint8Array(result);
