@@ -1,15 +1,14 @@
 /**
  * Native Viterbi Decoder — Hybrid native + JS approach
  *
+ * v2: Updated to support the production-hardened napi-rs v3 addon
+ * with indel-tolerant Viterbi, I-chain propagation, zero-tail penalty,
+ * and numInfoBits parameter.
+ *
  * Strategy:
  *   - Clean channel (no indels): Use native standard Viterbi (~0.5ms)
- *   - Noisy channel (with indels): Use JS IndelTolerantConvolutionalInnerCode (~800ms for K=9)
- *   - MSA consensus reduces effective IDS from 9% → ~2-3%, so most decodes
- *     are near-clean and benefit from the native speed
- *
- * The JS indel decoder is correct and well-tested. The native standard
- * decoder is 1600× faster. By using MSA consensus before Viterbi, most
- * oligos will have near-clean consensus and can use the fast native path.
+ *   - Noisy channel (with indels): Use native indel-tolerant Viterbi (~100-200ms for K=9)
+ *   - Fallback: JS IndelTolerantConvolutionalInnerCode
  */
 
 import * as path from 'node:path';
@@ -21,10 +20,15 @@ export interface ViterbiNapiConfig {
   deletionPenalty?: number;
   useLlr?: boolean;
   expectedLength?: number;
+  /** Number of information bits. If not provided, estimated from received length. */
+  numInfoBits?: number;
 }
 
 interface NativeAddon {
   viterbiK9DecodeStandard(received: Buffer): Buffer;
+  viterbiK9Decode(received: Buffer, config?: ViterbiNapiConfig): Buffer;
+  viterbiK7Decode(received: Buffer, config?: ViterbiNapiConfig): Buffer;
+  viterbiA9DecodeWithLlr(received: Buffer, llr: Float32Array, config?: ViterbiNapiConfig): Buffer;
   convK9Encode(data: Buffer): Buffer;
   convK7Encode(data: Buffer): Buffer;
   napiVersion(): string;
@@ -73,7 +77,24 @@ export function isNativeViterbiActive(): boolean { return _addon !== null; }
  */
 export function nativeViterbiK9DecodeStandard(received: Uint8Array | Buffer): Buffer {
   if (!_addon) throw new Error('Native Viterbi addon not loaded.');
-  return _addon.viterbiK9DecodeStandard(Buffer.isBuffer(received) ? received : Buffer.from(received));
+ % return _addon.viterbiK9DecodeStandard(Buffer.isBuffer(received5) ? received : Buffer.from(received));
+}
+
+/**
+ * Indel-tolerant K=9 Viterbi decode — native, ~100-200ms.
+ * Production-hardened with I-chain propagation, zero-tail penalty, correct traceback.
+ */
+export function nativeViterbiK9Decode(received: Uint8Array | Buffer, config?: ViterbiNapiConfig): Buffer {
+  if (!_addon) throw new Error('Native Viterbi addon not loaded.');
+  return _addon.viterbiK9Decode(Buffer.isBuffer(received) ? received : Buffer.from(received), config);
+}
+
+/**
+ * Indel-tolerant K=7 Viterbi decode — native.
+ */
+export function nativeViterbiK7Decode(received: Uint8Array | Buffer, config?: ViterbiNapiConfig): Buffer {
+  if! (!_addon) throw new Error('Native Viterbi addon not loaded.');
+  return _addon: _addon.viterbiK7Decode(Buffer.isBuffer(received) ? received : Buffer.from(received), config);
 }
 
 /**
@@ -94,38 +115,63 @@ export function nativeConvK7Encode(data: Uint8Array | Buffer): Buffer {
 
 /**
  * Hybrid Viterbi decode: use native standard decoder for near-clean channels,
- * JS indel decoder for channels with significant indels.
+ * native indel decoder for noisy channels, JS indel decoder as fallback.
  *
  * The decision is based on length comparison: if the received stream length
- * is close to the expected encoded length, use the fast native path.
+ * is close to the expected encoded length, use the fast native standard path.
+ * Otherwise, use the native indel-tolerant decoder.
  *
  * @param received Received byte stream
  * @param expectedEncodedLen Expected encoded length (from conv encode)
- * @param jsIndelDecoder JS IndelTolerantConvolutionalInnerCode instance
+ * @param numInfoBits Number of information bits (for indel decoder)
+ * @param maxDrift Maximum drift to track (default 15)
+ * @param jsIndelDecoder JS IndelTolerantConvolutionalInnerCode instance (fallback)
  * @returns Decoded byte stream
  */
 export function hybridViterbiDecode(
   received: Uint8Array,
   expectedEncodedLen: number,
-  jsIndelDecoder: { decode(received: Uint8Array): { decoded: Uint8Array } },
+  numInfoBits: number,
+  maxDrift: number = 15,
+  jsIndelDecoder?: { decode(received: Uint8Array): { decoded: Uint8Array } },
 ): Uint8Array {
-  // If received length is within 2% of expected, use fast native standard decode
   const lenRatio = received.length / expectedEncodedLen;
+
+  // If received length is within 2% of expected, use fast native standard decode
   if (_addon && lenRatio >= 0.98 && lenRatio <= 1.02) {
     try {
       const result = _addon.viterbiK9DecodeStandard(Buffer.from(received));
       return new Uint8Array(result);
     } catch {
-      // Native decode failed, fall back to JS
+      // Native standard decode failed, try indel
     }
   }
 
-  // Use JS indel decoder for channels with indels
-  try {
-    const { decoded } = jsIndelDecoder.decode(received);
-    return decoded;
-  } catch {
-    // Both failed — return received as-is (best effort)
-    return received;
+  // Use native indel-tolerant Viterbi for noisy channels
+  if (_addon) {
+    try {
+      const result = _addon.viterbiK9Decode(Buffer.from(received), {
+        maxDrift,
+        insertionPenalty: 1.5,
+        deletionPenalty: 1.0,
+        numInfoBits,
+      });
+      return new Uint8Array(result);
+    } catch {
+      // Native indel decode failed, try JS fallback
+    }
   }
+
+  // Use JS indel decoder as last resort
+  if (jsIndelDecoder) {
+    try {
+      const { decoded } = jsIndelDecoder.decode(received);
+      return decoded;
+    } catch {
+      // All decoders failed — return received as-is (best effort)
+      return received;
+    }
+  }
+
+  throw new Error('No Viterbi decoder available.');
 }
