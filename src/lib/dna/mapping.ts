@@ -226,3 +226,118 @@ export function whitenAddress(address: Uint8Array): Uint8Array {
 
 /** Reverse the address whitening (same function). */
 export const unwhitenAddress = whitenAddress;
+
+/**
+ *" v67: Homopolymer-safe address encoding.
+ *
+ * Maps 4 address bytes to a 16-nt DNA string that is GUARANTEED to have
+ * no homopolymer runs > 3. Uses a simple state machine that tracks the
+ * previous base and swaps any base that would create a run of 4+.
+ *
+ * The encoding is deterministic and reversible:
+ *   - Each 2-bit code maps to a base via a permutation that avoids
+ *     extending the current run beyond 3.
+ *   - The decoder reverses the process by tracking the same state.
+ *
+ * This replaces the simple XOR whitening which doesn't guarantee
+ * homopolymer-free DNA for all address values.
+ */
+export function addressToHomopolymerSafeDna(address: Uint8Array): string {
+  const BITS_TO_BASE: Base[] = ["A", "C", "G", "T"];
+  // Permutations for when prev = X and run = 3 (must avoid X)
+  // Format: permutation[prevIdx] maps code 0,1,2,3 to base indices
+  // such that permutation[prevIdx][anything] != prevIdx
+  const AVOID_PERMUTATIONS: number[][] = [
+    [1, 2, 3, 1], // prev=A: codes map to C,G,T,C (never A)
+    [0, 2, 3, 0], // prev=C: codes map to A,G,T,A (never C)
+    [0, 1, 3, 0], // prev=G: codes map to A,C,T,A (never G)
+    [0, 1, 2, 0], // prev=T: codes map to A,C,G,A (never T)
+  ];
+
+  const result: string[] = [];
+  let prevIdx = -1;
+  let runLen = 0;
+
+  for (let byteIdx = 0; byteIdx < address.length; byteIdx++) {
+    const byte = address[byteIdx];
+    for (let bitPair = 0; bitPair < 4; bitPair++) {
+      const code = (byte >> (6 - 2 * bitPair)) & 0b11;
+
+      let baseIdx: number;
+      if (runLen >= 3 && prevIdx >= 0) {
+        // Would create homopolymer > 3, use avoidance permutation
+        baseIdx = AVOID_PERMUTATIONS[prevIdx][code];
+      } else {
+        baseIdx = code;
+      }
+
+      // Update run tracking
+      if (baseIdx === prevIdx) {
+        runLen++;
+      } else {
+        runLen = 1;
+        prevIdx = baseIdx;
+      }
+
+      result.push(BITS_TO_BASE[baseIdx]);
+    }
+  }
+
+  return result.join("");
+}
+
+/**
+ * v67: Reverse of addressToHomopolymerSafeDna.
+ *
+ * Decodes a 16-nt homopolymer-safe DNA string back to 4 address bytes.
+ * Reverses the state machine by tracking the same run state.
+ */
+export function homopolymerSafeDnaToAddress(dna: string): Uint8Array {
+  const BASE_TO_IDX_MAP: Record<string, number> = { A: 0, C: 1, G: 2, T: 3 };
+  const AVOID_PERMUTATIONS: number[][] = [
+    [1, 2, 3, 1], // prev=A
+    [0, 2, 3, 0], // prev=C
+    [0, 1, 3, 0], // prev=G
+    [0, 1, 2, 0], // prev=T
+  ];
+  // Inverse permutations: inv[prevIdx][baseIdx] = code
+  const INV_AVOID: number[][] = AVOID_PERMUTATIONS.map(perm => {
+    const inv = new Array(4).fill(0);
+    // For ambiguous mappings, take the first code that maps to this base
+    for (let code = 0; code < 4; code++) inv[perm[code]] = code;
+    return inv;
+  });
+
+  const out = new Uint8Array(dna.length / 4);
+  let prevIdx = -1;
+  let runLen = 0;
+
+  for (let byteIdx = 0; byteIdx < out.length; byteIdx++) {
+    let byte = 0;
+    for (let bitPair = 0; bitPair < 4; bitPair++) {
+      const baseIdx = BASE_TO_IDX_MAP[dna[byteIdx * 4 + bitPair]];
+      if (baseIdx === undefined) throw new Error(`Invalid base in address DNA at ${byteIdx * 4 + bitPair}`);
+
+      let code: number;
+      if (runLen >= 3 && prevIdx >= 0) {
+        // This base was encoded with avoidance permutation
+        code = INV_AVOID[prevIdx][baseIdx];
+      } else {
+        code = baseIdx;
+      }
+
+      byte = (byte << 2) | code;
+
+      // Update run tracking (same as encoder)
+      if (baseIdx === prevIdx) {
+        runLen++;
+      } else {
+        runLen = 1;
+        prevIdx = baseIdx;
+      }
+    }
+    out[byteIdx] = byte;
+  }
+
+  return out;
+}

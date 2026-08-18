@@ -54,7 +54,7 @@ export const ULTIMATE_DENSITY_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "illumina",
   // v56 fix: WASM full_decode broken for 500nt+ — use HMM path for all decode.
@@ -141,7 +141,7 @@ export const ULTIMATE_NANOPORE_V52_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0, // conv code already provides burst tolerance
   channel: "nanopore",
   lowCoverageTrigger: 5,
@@ -183,7 +183,7 @@ export const ULTIMATE_V55_DENSITY_CONFIG: CodecConfig = {
   // Density: 1.663 b/nt (was 1.708 with 4B — 2.6% density loss for reliability).
   // Arithmetic mode is implemented but blocked by address clustering (v59 fix:
   // k-mer clustering now wired in, but arithmetic decode path needs more work).
-  mappingMode: "constrained",
+  mappingMode: "yinyang", // v67: yinyang — homopolymer-free by construction, zero erasures
   innerParityBytes: 8, // v59: was 4, increased to 8 for reliable hash verification
   outerParityRatio: 0.03,
   constraints: {
@@ -192,7 +192,7 @@ export const ULTIMATE_V55_DENSITY_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "illumina",
   // v58: WASM full_decode is now fixed. Use lowCoverageTrigger=5 so WASM
@@ -230,7 +230,7 @@ export const ULTIMATE_V55_OMNI_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 4,
   channel: "nanopore",
   lowCoverageTrigger: 5,
@@ -246,7 +246,7 @@ export const V51_DEFAULT_CONFIG: CodecConfig = {
   primerLength: 12,
   innerCode: "ldpc",
   ldpcDecoder: "auto",
-  mappingMode: "constrained",
+  mappingMode: "yinyang", // v67: yinyang mode — 2.0 bits/nt, homopolymer-free by construction, zero erasures
   innerParityBytes: 4,
   outerParityRatio: 0.1,
   constraints: {
@@ -255,7 +255,7 @@ export const V51_DEFAULT_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "illumina",
   lowCoverageTrigger: 5,
@@ -367,7 +367,7 @@ export const ULTIMATE_V61_ARITHMETIC_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "illumina",
   lowCoverageTrigger: 5,
@@ -413,7 +413,7 @@ export const ULTIMATE_V61_NANOPORE_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "nanopore",
   lowCoverageTrigger: 5,
@@ -469,7 +469,7 @@ export const ULTIMATE_V63_HD_CONFIG: CodecConfig = {
   ldpcDecoder: "auto",
   // v63: Direct mode + longer oligos + lighter parity = true density win.
   // arithmetic-v2 is REGRESSION at every oligo length (see note above).
-  mappingMode: "constrained",
+  mappingMode: "yinyang", // v67: yinyang — homopolymer-free by construction
   innerParityBytes: 4, // v63: 4B reliable thanks to v61 hash-FAIL fixes
   outerParityRatio: 0.02, // v63: 2% outer RS — lighter than v55's 3%
   constraints: {
@@ -478,7 +478,7 @@ export const ULTIMATE_V63_HD_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "illumina",
   lowCoverageTrigger: 5,
@@ -532,7 +532,7 @@ export const ULTIMATE_V64_REAL_2024_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1,
+  maxRetries: 50,
   interleaveDepth: 0,
   channel: "nanopore",
   lowCoverageTrigger: 5,

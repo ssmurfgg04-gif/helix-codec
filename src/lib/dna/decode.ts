@@ -27,7 +27,7 @@ import { ReedSolomon } from "./reedsolomon";
 import { ReedSolomon216 } from "./reedsolomon216";
 import { LDPCInnerCode, getCachedLDPCInner } from "./ldpc-codec";
 import { verifyCrc16, crc16, crc16Bytes } from "./crc16";
-import { dnaToBytes, bytesToDna, xorWithSeed, gcContent, maxHomopolymerRun, unwhitenAddress, whitenAddress, ADDRESS_WHITENING } from "./mapping";
+import { dnaToBytes, bytesToDna, xorWithSeed, gcContent, maxHomopolymerRun, unwhitenAddress, whitenAddress, ADDRESS_WHITENING, homopolymerSafeDnaToAddress, addressToHomopolymerSafeDna } from "./mapping";
 import { goldmanDnaToBytes } from "./goldman";
 import { yinyangDecode as yinyangDecodeFn, yinyangEncode as yinyangEncodeFn } from "./yinyang";
 import { constrainedDnaToBytes, constrainedDnaToBytesWithErasure, splitConstrainedDnaToBytesWithErasure } from "./constrained-mapping";
@@ -274,9 +274,9 @@ function clusterReads(
         const addressDna = inner.slice(0, addressNt);
         addressBytes = dnaToBytes(addressDna);
       } else if (useConstrained) {
-        // Split constrained mode: address uses direct mapping (no erasures).
+        // v67: Homopolymer-safe address encoding — use dedicated decoder
         const addressDna = inner.slice(0, addressNt);
-        addressBytes = dnaToBytes(addressDna);
+        addressBytes = homopolymerSafeDnaToAddress(addressDna);
       } else {
         // Direct / SRT mapping: address uses direct 2-bit mapping.
         const addressDna = inner.slice(0, addressNt);
@@ -425,6 +425,9 @@ function clusterReadsWithKmer(
       // Use appropriate decode for the address region based on mapping mode.
       if (useYYC) {
         addressBytes = yinyangDecodeSync(addressDna, layoutAddressBytes);
+      } else if (useConstrained) {
+        // v67: Homopolymer-safe address decoding
+        addressBytes = homopolymerSafeDnaToAddress(addressDna);
       } else {
         addressBytes = dnaToBytes(addressDna);
       }
@@ -436,7 +439,9 @@ function clusterReadsWithKmer(
         // actually corrupted (e.g., 1 substitution that changes the index).
         const refDna = useYYC
           ? yinyangEncodeFn(whitenAddress(unwhitened))
-          : bytesToDna(whitenAddress(unwhitened));
+          : useConstrained
+            ? addressToHomopolymerSafeDna(whitenAddress(unwhitened))
+            : bytesToDna(whitenAddress(unwhitened));
         const dist = hamming(addressDna, refDna);
         if (dist <= 2) {
           assignedIdx = idx;

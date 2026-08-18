@@ -37,7 +37,7 @@
  *   - Goldman et al. (2013). Nature 494:77-80 (rotational codebook concept).
  */
 
-import { Base, gcContent, maxHomopolymerRun } from "./mapping";
+import { Base, gcContent, maxHomopolymerRun, addressToHomopolymerSafeDna, homopolymerSafeDnaToAddress } from "./mapping";
 
 // ---------------------------------------------------------------------------
 // GC rotating codebooks (from constraints.ts, adapted for split mapping)
@@ -517,8 +517,9 @@ export function bytesToSplitConstrainedDna(
     return { dna: result.dna, codebookSequence: result.codebookSequence };
   }
 
-  // Part 1: Direct 2-bit mapping for the first `directBytes` bytes
-  const directDna = bytesToDnaDirect(data.slice(0, directBytes));
+  // Part 1: v67 Homopolymer-safe mapping for the first `directBytes` bytes (address)
+  // Uses addressToHomopolymerSafeDna which guarantees no homopolymer > 3
+  const directDna = addressToHomopolymerSafeDna(data.slice(0, directBytes));
 
   // Part 2: Constrained mapping with GC balancing for the remaining bytes.
   // Seed the constrained encoder's run tracker with the state
@@ -634,19 +635,12 @@ export function splitConstrainedDnaToBytesWithErasure(
   const out = new Uint8Array(numBytes);
   const erasures = new Array<boolean>(numBytes * 8).fill(false);
 
-  // Part 1: Direct 2-bit decode for the first `directBytes` bytes (no erasures)
+  // Part 1: v67 Homopolymer-safe address decode for the first `directBytes` bytes
   const directNt = directBytes * 4;
+  const addressDna2 = dna.slice(0, directNt);
+  const addressBytes2 = homopolymerSafeDnaToAddress(addressDna2);
   for (let i = 0; i < directBytes; i++) {
-    let byte = 0;
-    for (let bitPair = 0; bitPair < 4; bitPair++) {
-      const base = dna[i * 4 + bitPair];
-      const idx = BASE_TO_IDX[base as Base];
-      if (idx === undefined) {
-        throw new Error(`Invalid DNA base at position ${i * 4 + bitPair}`);
-      }
-      byte = (byte << 2) | idx;
-    }
-    out[i] = byte;
+    out[i] = addressBytes2[i];
   }
 
   // Part 2: Constrained decode for the remaining bytes

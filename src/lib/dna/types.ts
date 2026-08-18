@@ -69,6 +69,12 @@ export interface CodecMetadata {
   version: number;
   /** Encoding timestamp (ISO). */
   encodedAt: string;
+  /** v67: Shard index (0-based) when auto-sharding is used. */
+  shardIndex?: number;
+  /** v67: Total number of shards when auto-sharding is used. */
+  shardCount?: number;
+  /** v67: Per-shard metadata when auto-sharding is used. */
+  shardMetadatas?: CodecMetadata[];
 }
 
 /** Full encoded file = metadata + oligos. */
@@ -320,7 +326,7 @@ export const DEFAULT_CONFIG: CodecConfig = {
     maxHomopolymer: 3,
   },
   compress: true,
-  maxRetries: 1, // 1 retry = 9x faster encode, outer RS recovers failures
+  maxRetries: 50, // v67: increased to 50 — ensures constraint satisfaction for yinyang/constrained modes
   interleaveDepth: 0, // 0 = no interleaving (default). Set to 4 for burst protection.
   channel: "illumina", // v51+: Viterbi preprocess only runs when channel === "nanopore"
   lowCoverageTrigger: 5, // v51+: below 5 reads/oligo, use Profile-HMM fusion

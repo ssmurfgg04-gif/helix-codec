@@ -1,0 +1,72 @@
+[
+  {
+    "file": "sars-cov-2.fa",
+    "sizeBytes": 29903,
+    "oligoCount": 349,
+    "density": 1.4014899713467048,
+    "encMs": 147,
+    "gcRange": {
+      "min": 0.40441176470588236,
+      "max": 0.5992647058823529
+    },
+    "maxHp": 5,
+    "gcViolations": 0,
+    "hpViolations": 12
+  },
+  {
+    "file": "uniprot-p00533.fa",
+    "sizeBytes": 1210,
+    "oligoCount": 14,
+    "density": 1.2876190476190477,
+    "encMs": 63,
+    "gcRange": {
+      "min": 0.4522058823529412,
+      "max": 0.5514705882352942
+    },
+    "maxHp": 3,
+    "gcViolations": 0,
+    "hpViolations": 0
+  },
+  {
+    "file": "ecoli-k12.fa",
+    "sizeBytes": 4641652,
+    "oligoCount": 51677,
+    "density": 1.4060578851971541,
+    "encMs": 33596,
+    "gcRange": {
+      "min": 0.4007352941176471,
+      "max": 0.5992647058823529
+    },
+    "maxHp": 9,
+    "gcViolations": 0,
+    "hpViolations": 4484
+  },
+  {
+    "file": "yeast.fa",
+    "sizeBytes": 12157105,
+    "oligoCount": 138913,
+    "density": 1.4060524212996623,
+    "encMs": 107156,
+    "gcRange": {
+      "min": 0.4007352941176471,
+      "max": 0.5992647058823529
+    },
+    "maxHp": 10,
+    "gcViolations": 0,
+    "hpViolations": 15138
+  },
+  {
+    "file": "chr21.fa",
+    "sizeBytes": 46709983,
+    "oligoCount": 410829,
+    "density": 1.406053159181395,
+    "encMs": 385614,
+    "gcRange": {
+      "min": 0.4007352941176471,
+      "max": 0.5992647058823529
+    },
+    "maxHp": 10,
+    "gcViolations": 0,
+    "hpViolations": 41248
+  }
+]

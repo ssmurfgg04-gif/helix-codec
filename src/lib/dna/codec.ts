@@ -92,6 +92,19 @@ function getPrimers(cfg: CodecConfig): { fwd: string; rev: string } {
   return { fwd, rev };
 }
 
+// --- GC deviation metric (for best-effort constraint screening) ---
+
+/**
+ * Compute how far a DNA string's GC content deviates from the allowed range.
+ * Returns 0 if GC is within [gcMin, gcMax], otherwise the distance outside.
+ */
+function gcDeviation(dna: string, constraints: { gcMin: number; gcMax: number; maxHomopolymer: number }): number {
+  const gc = gcContent(dna);
+  if (gc >= constraints.gcMin && gc <= constraints.gcMax) return 0;
+  if (gc < constraints.gcMin) return constraints.gcMin - gc;
+  return gc - constraints.gcMax;
+}
+
 // --- SHA-256 (using Node crypto with chunked hashing for large data) ---
 
 async function sha256(data: Uint8Array): Promise<string> {
@@ -179,19 +192,263 @@ export async function encodeFile(
   // Record original compressed length so we can trim padding after decode
   // (we'll use fileSize from metadata + decompression to handle this)
 
+  // Pre-compute inner code parameters (needed for auto-sharding path)
+  const useLDPC = (cfg.innerCode ?? "rs") === "ldpc";
+  const useArithmeticV2 = (cfg.mappingMode ?? "constrained") === "arithmetic";
+  const innerK = useArithmeticV2
+    ? layout.payloadBytes
+    : layout.addressBytes + layout.payloadBytes;
+  const innerN = innerK + layout.innerParityBytes;
+  const innerRsReal = innerN > 255
+    ? new ReedSolomon216({ n: innerN, k: innerK })
+    : new ReedSolomon({ n: innerN, k: innerK });
+  const innerLdpcReal = useLDPC ? new LDPCInnerCode({ n: innerN, k: innerK }) : null;
+
+  // Pre-compute mapping mode flags (needed for auto-sharding)
+  const useGoldman = (cfg.mappingMode ?? "constrained") === "goldman";
+  const useConstrained = (cfg.mappingMode ?? "constrained") === "constrained";
+  const useSrt = (cfg.mappingMode ?? "constrained") === "srt";
+  const useArithmetic = (cfg.mappingMode ?? "constrained") === "arithmetic";
+  const useBHE = (cfg.mappingMode ?? "constrained") === "bhe";
+  const useYYC = (cfg.mappingMode ?? "constrained") === "yinyang";
+
   // 4) Outer RS: across oligos.
   //    Use GF(2^8) RS when oligo count <= 255, GF(2^16) RS when > 255.
   //    GF(2^16) treats pairs of bytes as single 16-bit symbols, supporting
   //    up to 65535 oligos per RS block.
   //
-  //    For data requiring >65535 oligos, the CALLER must split into multiple
-  //    shards and call encodeFile() for each shard independently.
+  //    v67: AUTO-SHARDING — when oligo count exceeds 65535, we transparently
+  //    split the compressed data into shards that each fit within the RS limit,
+  //    encode each shard independently, and concatenate the oligo pools.
+  //    Each shard is a complete encodeFile() output with its own outer RS.
   const parityCount = Math.max(2, Math.ceil(dataOligoCount * cfg.outerParityRatio));
   if (dataOligoCount + parityCount > 65535) {
-    throw new Error(
-      `Data too large for single RS block: ${dataOligoCount + parityCount} oligos > 65535 limit. ` +
-      `Split the data into smaller shards (e.g., 64MB each) and call encodeFile() for each shard.`
-    );
+    // Auto-shard: split compressed data into chunks that fit within RS limit.
+    // Max oligos per shard = floor(65535 / (1 + outerParityRatio))
+    const maxOligosPerShard = Math.floor(65535 / (1 + cfg.outerParityRatio));
+    const maxBytesPerShard = maxOligosPerShard * chunkSize;
+    const shardCount = Math.ceil(compressed.length / maxBytesPerShard);
+    console.log(`[helix-codec] Auto-sharding: ${dataOligoCount + parityCount} oligos > 65535 RS limit. Splitting into ${shardCount} shards of ≤${maxOligosPerShard} oligos each.`);
+
+    // Encode each shard independently and merge results
+    const allOligos: Oligo[] = [];
+    let totalScreeningRetries = 0;
+    let oligoOffset = 0;
+    const shardMetadatas: CodecMetadata[] = [];
+
+    for (let s = 0; s < shardCount; s++) {
+      const start = s * maxBytesPerShard;
+      const end = Math.min(start + maxBytesPerShard, compressed.length);
+      const shardData = compressed.slice(start, end);
+      // Pad shard to multiple of chunkSize
+      const shardPaddedLen = Math.ceil(shardData.length / chunkSize) * chunkSize;
+      const shardPadded = new Uint8Array(shardPaddedLen);
+      shardPadded.set(shardData, 0);
+
+      // Build shard with its own outer RS (fits within 65535)
+      const shardOligoCount = shardPaddedLen / chunkSize;
+      const shardParityCount = Math.max(2, Math.ceil(shardOligoCount * cfg.outerParityRatio));
+      const shardOuterN = shardOligoCount + shardParityCount;
+      const shardOuterK = shardOligoCount;
+      const shardUseGF216 = shardOuterN > 255;
+
+      // Outer RS parity for this shard
+      const shardParityBytes = new Uint8Array(shardParityCount * chunkSize);
+      const shardRs8 = !shardUseGF216 ? new ReedSolomon({ n: shardOuterN, k: shardOuterK }) : null;
+      const shardRs216 = shardUseGF216 ? new ReedSolomon216({ n: shardOuterN, k: shardOuterK }) : null;
+
+      if (shardUseGF216 && shardRs216) {
+        const dataSymbols16 = new Uint16Array(shardOligoCount);
+        const numPairs = Math.floor(chunkSize / 2);
+        for (let pairIdx = 0; pairIdx < numPairs; pairIdx++) {
+          const j0 = pairIdx * 2;
+          const j1 = pairIdx * 2 + 1;
+          for (let i = 0; i < shardOligoCount; i++) {
+            dataSymbols16[i] = (shardPadded[i * chunkSize + j0] << 8) | shardPadded[i * chunkSize + j1];
+          }
+          const parity = shardRs216.parity(dataSymbols16);
+          for (let i = 0; i < parity.length; i++) {
+            shardParityBytes[i * chunkSize + j0] = (parity[i] >> 8) & 0xff;
+            shardParityBytes[i * chunkSize + j1] = parity[i] & 0xff;
+          }
+        }
+        if (chunkSize % 2 === 1) {
+          const j = chunkSize - 1;
+          if (shardOuterN <= 255) {
+            const dataSymbols8 = new Uint8Array(shardOligoCount);
+            for (let i = 0; i < shardOligoCount; i++) dataSymbols8[i] = shardPadded[i * chunkSize + j];
+            const rs8 = new ReedSolomon({ n: shardOuterN, k: shardOuterK });
+            const parity = rs8.parity(dataSymbols8);
+            for (let i = 0; i < parity.length; i++) shardParityBytes[i * chunkSize + j] = parity[i];
+          } else {
+            const dataSymbols16 = new Uint16Array(shardOligoCount);
+            for (let i = 0; i < shardOligoCount; i++) dataSymbols16[i] = shardPadded[i * chunkSize + j] & 0xff;
+            const parity = shardRs216.parity(dataSymbols16);
+            for (let i = 0; i < parity.length; i++) shardParityBytes[i * chunkSize + j] = parity[i] & 0xff;
+          }
+        }
+      } else if (shardRs8) {
+        const dataSymbols = new Uint8Array(shardOligoCount);
+        for (let j = 0; j < chunkSize; j++) {
+          for (let i = 0; i < shardOligoCount; i++) dataSymbols[i] = shardPadded[i * chunkSize + j];
+          const parity = shardRs8.parity(dataSymbols);
+          for (let i = 0; i < parity.length; i++) shardParityBytes[i * chunkSize + j] = parity[i];
+        }
+      }
+
+      // Encode each oligo in this shard
+      for (let oligoIdx = 0; oligoIdx < shardOuterN; oligoIdx++) {
+        const payload = new Uint8Array(chunkSize);
+        if (oligoIdx < shardOligoCount) {
+          payload.set(shardPadded.slice(oligoIdx * chunkSize, (oligoIdx + 1) * chunkSize), 0);
+        } else {
+          const parityIdx = oligoIdx - shardOligoCount;
+          payload.set(shardParityBytes.slice(parityIdx * chunkSize, (parityIdx + 1) * chunkSize), 0);
+        }
+        const rawAddress = new Uint8Array(4);
+        const globalIdx = oligoOffset + oligoIdx;
+        rawAddress[0] = (globalIdx >> 16) & 0xff;
+        rawAddress[1] = (globalIdx >> 8) & 0xff;
+        rawAddress[2] = globalIdx & 0xff;
+        rawAddress[3] = 0;
+
+        // Constraint screening with retry (same as main loop)
+        const constraintObj = { gcMin: cfg.constraints.gcMin, gcMax: cfg.constraints.gcMax, maxHomopolymer: cfg.constraints.maxHomopolymer };
+        let shardSeed = 0;
+        let shardDna = "";
+        let shardAttempts = 0;
+        let shardBestDna = "";
+        let shardBestSeed = 0;
+        let shardBestSatisfied = false;
+
+        const shBaseAddress = rawAddress.slice();
+        const shBaseRsData = new Uint8Array(innerK);
+        shBaseRsData.set(whitenAddress(shBaseAddress), 0);
+        shBaseRsData.set(payload, layout.addressBytes);
+
+        // Use same mapping mode logic as main loop
+        while (shardAttempts <= Math.max(cfg.maxRetries, 10)) {
+          shBaseAddress[3] = shardSeed & 0xff;
+          const whAddr = whitenAddress(shBaseAddress);
+          shBaseRsData.set(whAddr, 0);
+          const effPayload = shardSeed === 0 ? payload : xorWithSeed(payload, shardSeed);
+          shBaseRsData.set(effPayload, layout.addressBytes);
+
+          const rsCW = useLDPC && innerLdpcReal ? innerLdpcReal.encode(shBaseRsData) : innerRsReal.encode(shBaseRsData);
+          const crcV = crc16Bytes(rsCW);
+          const iBlock = new Uint8Array(totalNtBytes(layout));
+          iBlock.set(rsCW, 0);
+          iBlock.set(crcV, rsCW.length);
+
+          if (useConstrained) {
+            shardDna = bytesToSplitConstrainedDna(iBlock, cfg.constraints.maxHomopolymer, layout.addressBytes, cfg.constraints.gcMin, cfg.constraints.gcMax).dna;
+          } else if (useSrt) {
+            shardDna = bytesToSrtDna(iBlock, cfg.constraints.maxHomopolymer, totalNtBytes(layout) * 4);
+          } else {
+            shardDna = bytesToDna(iBlock);
+          }
+
+          const ok = satisfiesConstraints(shardDna, constraintObj);
+          if (ok) { shardBestDna = shardDna; shardBestSeed = shardSeed; shardBestSatisfied = true; break; }
+          if (!shardBestDna || gcDeviation(shardDna, constraintObj) < gcDeviation(shardBestDna, constraintObj)) {
+            shardBestDna = shardDna; shardBestSeed = shardSeed;
+          }
+          shardAttempts++;
+          shardSeed = shardAttempts;
+        }
+
+        totalScreeningRetries += shardAttempts;
+        shardDna = shardBestDna;
+        shardSeed = shardBestSeed;
+
+        const gc = gcContent(shardDna);
+        const maxHp = maxHomopolymerRun(shardDna);
+        const expectedDnaLen = layout.totalInnerBytes * 4;
+        if (shardDna.length < expectedDnaLen) {
+          // v67: alternating AC padding to avoid homopolymers
+          const shardPadLen = expectedDnaLen - shardDna.length;
+          if (shardPadLen > 0) {
+            const sLast = shardDna[shardDna.length - 1] || "T";
+            const sFirst = sLast === "A" ? "C" : "A";
+            const sSecond = sFirst === "A" ? "C" : "A";
+            let sPad = "";
+            for (let p = 0; p < shardPadLen; p++) sPad += (p % 2 === 0) ? sFirst : sSecond;
+            shardDna = shardDna + sPad;
+          }
+        } else if (shardDna.length > expectedDnaLen) {
+          shardDna = shardDna.slice(0, expectedDnaLen);
+        }
+        const sequence = fwd + shardDna + rev;
+        allOligos.push({ index: globalIdx, sequence, gc, maxHomopolymer: maxHp, seed: shardSeed, payloadBytes: chunkSize, length: sequence.length });
+      }
+
+      oligoOffset += shardOuterN;
+
+      // Store metadata for this shard
+      shardMetadatas.push({
+        fileName: `${meta.fileName}.shard${s}`,
+        fileSize: shardData.length,
+        fileHash,
+        contentType: meta.contentType,
+        compression,
+        rawSize: data.length,
+        oligoCount: shardOuterN,
+        payloadBytesPerOligo: chunkSize,
+        innerRS: { n: innerN, k: innerK },
+        innerCode: useLDPC ? "ldpc" : "rs",
+        ldpcDecoder: cfg.ldpcDecoder as any,
+        mappingMode: (cfg.mappingMode ?? "constrained") as any,
+        goldmanMode: (cfg.goldmanMode ?? "fast") as any,
+        outerRS: { n: shardOuterN, k: shardOuterK },
+        parityOligos: shardParityCount,
+        interleaveDepth: 0,
+        channel: (cfg.channel ?? "illumina") as any,
+        lowCoverageTrigger: cfg.lowCoverageTrigger ?? 5,
+        useConvolutionalInner: useConvInner,
+        version: 1,
+        encodedAt: new Date().toISOString(),
+        shardIndex: s,
+        shardCount,
+      });
+    }
+
+    // Return merged result
+    const totalOligoCount = allOligos.length;
+    const encodeTimeMs = Date.now() - t0;
+    const totalNt = totalOligoCount * cfg.oligoLength;
+    const netDensityBitsPerNt = (compressed.length * 8) / totalNt;
+    const overheadPercent = ((totalNt - compressed.length * 4) / totalNt) * 100;
+
+    const mergedMetadata: CodecMetadata = {
+      fileName: meta.fileName,
+      fileSize: data.length,
+      fileHash,
+      contentType: meta.contentType,
+      compression,
+      rawSize: data.length,
+      oligoCount: totalOligoCount,
+      payloadBytesPerOligo: chunkSize,
+      innerRS: { n: innerN, k: innerK },
+      innerCode: useLDPC ? "ldpc" : "rs",
+      ldpcDecoder: cfg.ldpcDecoder as any,
+      mappingMode: (cfg.mappingMode ?? "constrained") as any,
+      goldmanMode: (cfg.goldmanMode ?? "fast") as any,
+      outerRS: { n: shardMetadatas[0].outerRS.n, k: shardMetadatas[0].outerRS.k },
+      parityOligos: shardMetadatas.reduce((s, m) => s + m.parityOligos, 0),
+      interleaveDepth: 0,
+      channel: (cfg.channel ?? "illumina") as any,
+      lowCoverageTrigger: cfg.lowCoverageTrigger ?? 5,
+      useConvolutionalInner: useConvInner,
+      version: 1,
+      encodedAt: new Date().toISOString(),
+      shardCount: shardMetadatas.length,
+      shardMetadatas,
+    };
+
+    return {
+      encoded: { metadata: mergedMetadata, oligos: allOligos, forwardPrimer: fwd, reversePrimer: rev },
+      stats: { rawSize: data.length, compressedSize: compressed.length, oligoCount: totalOligoCount, payloadBytesPerOligo: chunkSize, netDensityBitsPerNt, overheadPercent, screeningRetries: totalScreeningRetries, encodeTimeMs },
+    };
   }
   const useGF216 = dataOligoCount + parityCount > 255;
 
@@ -285,7 +542,7 @@ export async function encodeFile(
   }
 
   // 6) Build each oligo's inner block and encode to DNA
-  const useLDPC = (cfg.innerCode ?? "rs") === "ldpc";
+  // (useLDPC, innerK, innerN, innerRsReal, innerLdpcReal pre-computed above for auto-sharding)
   // v63: Use GF(2^16) inner RS when n > 255 (enables 1000nt+ oligos).
   const innerRsN = layout.addressBytes + layout.payloadBytes + layout.innerParityBytes;
   const innerRs = innerRsN > 255
@@ -297,43 +554,6 @@ export async function encodeFile(
         n: innerRsN,
         k: layout.addressBytes + layout.payloadBytes,
       });
-  // Wait: inner RS should be over (address + payload) -> parity. CRC is over (address + payload + parity).
-  // Let's re-derive:
-  //   inner block = [address(4B), payload(chunkSize B), innerParity(8B), crc(2B)]
-  //   inner RS encodes (address + payload) -> innerParity
-  //   CRC is computed over (address + payload + innerParity) and appended.
-  //   Total inner bytes = 4 + chunkSize + 8 + 2 = 14 + chunkSize.
-  //
-  //   With oligoLength=200, primerLen=20: innerNt = 160, innerBytes = 40.
-  //   So chunkSize = 40 - 4 - 8 - 2 = 26 bytes per oligo.
-  //
-  //   inner RS: n = 4 + 26 + 8 = 38, k = 4 + 26 = 30. Good (n <= 255).
-
-  // Inner RS k and n
-  // v62: For arithmetic-v2, the LDPC codeword does NOT include the address.
-  //   Normal mode:    innerK = addressBytes + payloadBytes, innerN = innerK + parity
-  //   Arithmetic-v2:  innerK = payloadBytes (NO address),   innerN = innerK + parity
-  const useArithmeticV2 = (cfg.mappingMode ?? "constrained") === "arithmetic";
-  const innerK = useArithmeticV2
-    ? layout.payloadBytes
-    : layout.addressBytes + layout.payloadBytes;
-  const innerN = innerK + layout.innerParityBytes;
-  // The CRC covers the entire inner block (address + payload + parity), but is
-  // not part of the RS codeword. So we have:
-  //   RS codeword = address(4B) + payload(chunkSize B) + parity(8B)  -> length innerN
-  //   Inner block (DNA-encoded) = RS codeword + CRC(2B)              -> length innerN + 2 = totalInnerBytes
-
-  // v63: Use GF(2^16) inner RS when innerN > 255 (enables 1000nt+ oligos).
-  // LDPC is still the primary inner code; RS is only a fallback.
-  const innerRsReal = innerN > 255
-    ? new ReedSolomon216({ n: innerN, k: innerK })
-    : new ReedSolomon({ n: innerN, k: innerK });
-
-  // LDPC inner code (if configured). Same byte-oriented interface as ReedSolomon.
-  // LDPC operates on bits internally: n_bits = innerN * 8, k_bits = innerK * 8.
-  // Note: WASM LDPC encoder is slower than JS for encode due to boundary overhead
-  // (3.5µs vs 2.7µs per op). WASM is only faster for batch decode.
-  const innerLdpcReal = useLDPC ? new LDPCInnerCode({ n: innerN, k: innerK }) : null;
 
   // v52: Convolutional inner code (HEDGES-style). When useConvolutionalInner
   // is enabled, the LDPC codeword (innerN bytes) is conv-encoded at rate 1/2
@@ -379,12 +599,7 @@ export async function encodeFile(
       gcMax: cfg.constraints.gcMax,
       maxHomopolymer: cfg.constraints.maxHomopolymer,
     };
-    const useGoldman = (cfg.mappingMode ?? "constrained") === "goldman";
-    const useConstrained = (cfg.mappingMode ?? "constrained") === "constrained";
-    const useSrt = (cfg.mappingMode ?? "constrained") === "srt";
-    const useArithmetic = (cfg.mappingMode ?? "constrained") === "arithmetic";
-    const useBHE = (cfg.mappingMode ?? "constrained") === "bhe";
-    const useYYC = (cfg.mappingMode ?? "constrained") === "yinyang";
+    // Mapping mode flags pre-computed above
     let seed = 0;
     let dna = "";
     let attempts = 0;
@@ -465,54 +680,89 @@ export async function encodeFile(
       // Split constrained mapping: direct for address (4B), constrained for rest.
       // Address uses direct mapping (no erasures → reliable clustering).
       // Payload+CRC+parity use constrained (homopolymer-free, 1.1% erasures).
-      const address = rawAddress.slice();
-      address[3] = 0; // seed = 0
-      const whitenedAddress = whitenAddress(address);
-      const effectivePayload = payload;
-      const rsData = new Uint8Array(innerK);
-      rsData.set(whitenedAddress, 0);
-      rsData.set(effectivePayload, layout.addressBytes);
-      const rsCodeword = useLDPC && innerLdpcReal
-        ? innerLdpcReal.encode(rsData)
-        : innerRsReal.encode(rsData);
-      const crc = crc16Bytes(rsCodeword);
-      const innerBlock = new Uint8Array(totalNtBytes(layout));
-      innerBlock.set(rsCodeword, 0);
-      innerBlock.set(crc, rsCodeword.length);
-      // Split: address bytes use direct, rest uses constrained
-      // v65: Split constrained mapping WITH GC-balancing codebooks.
-      // Pass GC constraints so the encoder steers GC toward [gcMin, gcMax].
-      const splitResult = bytesToSplitConstrainedDna(
-        innerBlock, cfg.constraints.maxHomopolymer, layout.addressBytes,
-        cfg.constraints.gcMin, cfg.constraints.gcMax,
-      );
-      dna = splitResult.dna;
-      bestDna = dna;
-      bestSeed = 0;
-      bestSatisfied = true;
+      // v67: Added seed-based retry loop (like direct mode) because constrained
+      // mapping can still violate GC constraints when the address region has
+      // extreme GC. Retry with XOR-seed until constraints pass.
+      const baseAddress = rawAddress.slice();
+      const baseRsData = new Uint8Array(innerK);
+      baseRsData.set(whitenAddress(baseAddress), 0);
+      baseRsData.set(payload, layout.addressBytes);
+
+      while (attempts <= cfg.maxRetries) {
+        baseAddress[3] = seed & 0xff;
+        const whitenedAddress = whitenAddress(baseAddress);
+        baseRsData.set(whitenedAddress, 0);
+        const effectivePayload = seed === 0 ? payload : xorWithSeed(payload, seed);
+        baseRsData.set(effectivePayload, layout.addressBytes);
+
+        const rsCodeword = useLDPC && innerLdpcReal
+          ? innerLdpcReal.encode(baseRsData)
+          : innerRsReal.encode(baseRsData);
+        const crc = crc16Bytes(rsCodeword);
+        const innerBlock = new Uint8Array(totalNtBytes(layout));
+        innerBlock.set(rsCodeword, 0);
+        innerBlock.set(crc, rsCodeword.length);
+
+        const splitResult = bytesToSplitConstrainedDna(
+          innerBlock, cfg.constraints.maxHomopolymer, layout.addressBytes, // v67: split mode, address direct + rest constrained
+          cfg.constraints.gcMin, cfg.constraints.gcMax,
+        );
+        dna = splitResult.dna;
+
+        const ok = satisfiesConstraints(dna, constraints);
+        if (ok) {
+          bestDna = dna;
+          bestSeed = seed;
+          bestSatisfied = true;
+          break;
+        }
+        if (!bestDna || gcDeviation(dna, constraints) < gcDeviation(bestDna, constraints)) {
+          bestDna = dna;
+          bestSeed = seed;
+        }
+        attempts++;
+        seed = attempts;
+      }
     } else if (useSrt) {
       // SRT constrained mapping: 2.0 bits/nt, homopolymer ≤ 3 guaranteed.
       // Breaks homopolymers by injecting 1-bit errors (LDPC corrects them).
-      // Zero screening retries. Fully reversible via LDPC.
-      const address = rawAddress.slice();
-      address[3] = 0;
-      const whitenedAddress = whitenAddress(address);
-      const effectivePayload = payload;
-      const rsData = new Uint8Array(innerK);
-      rsData.set(whitenedAddress, 0);
-      rsData.set(effectivePayload, layout.addressBytes);
-      const rsCodeword = useLDPC && innerLdpcReal
-        ? innerLdpcReal.encode(rsData)
-        : innerRsReal.encode(rsData);
-      const crc = crc16Bytes(rsCodeword);
-      const innerBlock = new Uint8Array(totalNtBytes(layout));
-      innerBlock.set(rsCodeword, 0);
-      innerBlock.set(crc, rsCodeword.length);
-      // SRT: 2-bit mapping with homopolymer breaking (injects errors, LDPC corrects)
-      dna = bytesToSrtDna(innerBlock, cfg.constraints.maxHomopolymer, totalNtBytes(layout) * 4);
-      bestDna = dna;
-      bestSeed = 0;
-      bestSatisfied = true;
+      // v67: Added seed-based retry loop for GC constraint enforcement.
+      const baseAddress = rawAddress.slice();
+      const baseRsData = new Uint8Array(innerK);
+      baseRsData.set(whitenAddress(baseAddress), 0);
+      baseRsData.set(payload, layout.addressBytes);
+
+      while (attempts <= cfg.maxRetries) {
+        baseAddress[3] = seed & 0xff;
+        const whitenedAddress = whitenAddress(baseAddress);
+        baseRsData.set(whitenedAddress, 0);
+        const effectivePayload = seed === 0 ? payload : xorWithSeed(payload, seed);
+        baseRsData.set(effectivePayload, layout.addressBytes);
+
+        const rsCodeword = useLDPC && innerLdpcReal
+          ? innerLdpcReal.encode(baseRsData)
+          : innerRsReal.encode(baseRsData);
+        const crc = crc16Bytes(rsCodeword);
+        const innerBlock = new Uint8Array(totalNtBytes(layout));
+        innerBlock.set(rsCodeword, 0);
+        innerBlock.set(crc, rsCodeword.length);
+
+        dna = bytesToSrtDna(innerBlock, cfg.constraints.maxHomopolymer, totalNtBytes(layout) * 4);
+
+        const ok = satisfiesConstraints(dna, constraints);
+        if (ok) {
+          bestDna = dna;
+          bestSeed = seed;
+          bestSatisfied = true;
+          break;
+        }
+        if (!bestDna || gcDeviation(dna, constraints) < gcDeviation(bestDna, constraints)) {
+          bestDna = dna;
+          bestSeed = seed;
+        }
+        attempts++;
+        seed = attempts;
+      }
     } else if (useArithmetic) {
       // v62: Arithmetic-v2 mode (address OUTSIDE the arithmetic stream).
       //
@@ -597,24 +847,42 @@ export async function encodeFile(
       bestSatisfied = true;
     } else if (useYYC) {
       // YYC Yin-Yang high-density encoding — 2 bits/nt with alternating rule tables.
-      // Deterministic, no seed retry needed.
-      const address = rawAddress.slice();
-      address[3] = 0;
-      const whitenedAddress = whitenAddress(address);
-      const rsData = new Uint8Array(innerK);
-      rsData.set(whitenedAddress, 0);
-      rsData.set(payload, layout.addressBytes);
-      const rsCodeword = useLDPC && innerLdpcReal
-        ? innerLdpcReal.encode(rsData)
-        : innerRsReal.encode(rsData);
-      const crc = crc16Bytes(rsCodeword);
-      const innerBlock = new Uint8Array(totalNtBytes(layout));
-      innerBlock.set(rsCodeword, 0);
-      innerBlock.set(crc, rsCodeword.length);
-      dna = yinyangEncode(innerBlock);
-      bestDna = dna;
-      bestSeed = 0;
-      bestSatisfied = true;
+      // v67: Added seed-based retry loop for GC constraint enforcement.
+      const baseAddress = rawAddress.slice();
+      const baseRsData = new Uint8Array(innerK);
+      baseRsData.set(whitenAddress(baseAddress), 0);
+      baseRsData.set(payload, layout.addressBytes);
+
+      while (attempts <= cfg.maxRetries) {
+        baseAddress[3] = seed & 0xff;
+        const whitenedAddr = whitenAddress(baseAddress);
+        baseRsData.set(whitenedAddr, 0);
+        const effectivePayload = seed === 0 ? payload : xorWithSeed(payload, seed);
+        baseRsData.set(effectivePayload, layout.addressBytes);
+
+        const rsCodeword = useLDPC && innerLdpcReal
+          ? innerLdpcReal.encode(baseRsData)
+          : innerRsReal.encode(baseRsData);
+        const crc = crc16Bytes(rsCodeword);
+        const innerBlock = new Uint8Array(totalNtBytes(layout));
+        innerBlock.set(rsCodeword, 0);
+        innerBlock.set(crc, rsCodeword.length);
+        dna = yinyangEncode(innerBlock);
+
+        const ok = satisfiesConstraints(dna, constraints);
+        if (ok) {
+          bestDna = dna;
+          bestSeed = seed;
+          bestSatisfied = true;
+          break;
+        }
+        if (!bestDna || gcDeviation(dna, constraints) < gcDeviation(bestDna, constraints)) {
+          bestDna = dna;
+          bestSeed = seed;
+        }
+        attempts++;
+        seed = attempts;
+      }
     } else {
       // Direct 2-bit mapping with constraint screening + seed retries.
       // Optimized: precompute the non-changing parts, only re-encode the changed parts.
@@ -675,14 +943,14 @@ export async function encodeFile(
       ? (cfg.oligoLength - 2 * cfg.primerLength)
       : layout.totalInnerBytes * 4;
     if (dna.length < expectedDnaLen) {
-      // v62: For arithmetic-v2, use alternating bases to avoid homopolymers
-      if (useArithmeticV2) {
-        const lastBase = dna[dna.length - 1] || "A";
-        const padBase: string = lastBase === "A" ? "C" : "A";
-        dna += padBase.repeat(expectedDnaLen - dna.length);
-      } else {
-        dna = dna + "A".repeat(expectedDnaLen - dna.length);
-      }
+      // v67: ALWAYS use alternating bases to avoid homopolymer creation from padding
+      const padLen = expectedDnaLen - dna.length;
+      const lastBase = dna[dna.length - 1] || "T";
+      const firstPad = lastBase === "A" ? "C" : "A";
+      const secondPad = firstPad === "A" ? "C" : "A";
+      let pad = "";
+      for (let p = 0; p < padLen; p++) pad += (p % 2 === 0) ? firstPad : secondPad;
+      dna = dna + pad;
     } else if (dna.length > expectedDnaLen) {
       dna = dna.slice(0, expectedDnaLen);
     }
@@ -1423,13 +1691,14 @@ export function canonicalToSynthesis(
       ? (cfg.oligoLength - 2 * cfg.primerLength)
       : layout.totalInnerBytes * 4;
     if (dna.length < expectedDnaLen) {
-      if (useArithmeticV2) {
-        const lastBase = dna[dna.length - 1] || "A";
-        const padBase: string = lastBase === "A" ? "C" : "A";
-        dna += padBase.repeat(expectedDnaLen - dna.length);
-      } else {
-        dna = dna + "A".repeat(expectedDnaLen - dna.length);
-      }
+      // v67: ALWAYS use alternating bases for padding
+      const padLen2 = expectedDnaLen - dna.length;
+      const lastBase2 = dna[dna.length - 1] || "T";
+      const firstPad2 = lastBase2 === "A" ? "C" : "A";
+      const secondPad2 = firstPad2 === "A" ? "C" : "A";
+      let pad2 = "";
+      for (let p = 0; p < padLen2; p++) pad2 += (p % 2 === 0) ? firstPad2 : secondPad2;
+      dna = dna + pad2;
     } else if (dna.length > expectedDnaLen) {
       dna = dna.slice(0, expectedDnaLen);
     }
