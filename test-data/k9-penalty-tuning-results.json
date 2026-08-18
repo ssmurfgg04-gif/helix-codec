@@ -1,0 +1,302 @@
+{
+  "results": [
+    {
+      "subRate": 0,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.6666666666666666
+    },
+    {
+      "subRate": 0,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7666666666666667
+    },
+    {
+      "subRate": 0.005,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.6
+    },
+    {
+      "subRate": 0.005,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0.005,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8666666666666667
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8666666666666667
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8666666666666667
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 4,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.7333333333333333
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 8,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8333333333333334
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 10,
+      "useStandard": true,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 0.8666666666666667
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 4,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 53.4
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 8,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 59.333333333333336
+    },
+    {
+      "subRate": 0.01,
+      "ldpcParity": 10,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 64.23333333333333
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 4,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 53.63333333333333
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 8,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 60.333333333333336
+    },
+    {
+      "subRate": 0.02,
+      "ldpcParity": 10,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 62.766666666666666
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 4,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 53.5
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 8,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 59.7
+    },
+    {
+      "subRate": 0.03,
+      "ldpcParity": 10,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 65.63333333333334
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 4,
+      "useStandard": false,
+      "recovered": 29,
+      "total": 30,
+      "rate": 0.9666666666666667,
+      "avgMs": 53.1
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 8,
+      "useStandard": false,
+      "recovered": 30,
+      "total": 30,
+      "rate": 1,
+      "avgMs": 58.833333333333336
+    },
+    {
+      "subRate": 0.05,
+      "ldpcParity": 10,
+      "useStandard": false,
+      "recovered": 27,
+      "total": 30,
+      "rate": 0.9,
+      "avgMs": 61.53333333333333
+    },
+    {
+      "subRate": 0.08,
+      "ldpcParity": 4,
+      "useStandard": false,
+      "recovered": 15,
+      "total": 30,
+      "rate": 0.5,
+      "avgMs": 52.266666666666666
+    },
+    {
+      "subRate": 0.08,
+      "ldpcParity": 8,
+      "useStandard": false,
+      "recovered": 19,
+      "total": 30,
+      "rate": 0.6333333333333333,
+      "avgMs": 58.03333333333333
+    },
+    {
+      "subRate": 0.08,
+      "ldpcParity": 10,
+      "useStandard": false,
+      "recovered": 12,
+      "total": 30,
+      "rate": 0.4,
+      "avgMs": 60.9
+    }
+  ],
+  "timestamp": "2026-08-18T20:18:19.412Z"
+}

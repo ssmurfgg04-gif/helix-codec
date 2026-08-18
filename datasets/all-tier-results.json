@@ -1,0 +1,20 @@
+[
+  {
+    "file": "ecoli-k12.fa",
+    "preset": "v51-default",
+    "pass": true,
+    "oligoCount": 51677,
+    "density": 1.4060578851971541,
+    "encMs": 73306,
+    "decMs": 4402,
+    "gcV": 0,
+    "hpV": 9892,
+    "gcMin": 0.4007352941176471,
+    "gcMax": 0.5992647058823529,
+    "maxHp": 10,
+    "roundtrip": true,
+    "hashOk": true,
+    "dataSize": 4641652,
+    "screeningRetries": 0
+  }
+]

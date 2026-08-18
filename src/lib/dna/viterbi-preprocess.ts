@@ -35,6 +35,16 @@ import { SequencingRead } from "./simulate";
 import { forwardBackward3, reconstructReadFromPath, Hmm3Params, DEFAULT_HMM3_PARAMS, Hmm3PathStep } from "./profileHmm3";
 import { ConvolutionalCode, bytesToBits, bitsToBytes, DEFAULT_CONV_CONFIG } from "./convolutional";
 
+// v68: napi-rs native Viterbi for the convolutional Viterbi step
+// (when useConvolutionalViterbi=true, use native K=9 instead of JS K=3)
+import {
+  enableNativeViterbi as enableNapiViterbi,
+  isNativeViterbiActive as isNapiViterbiActive,
+  nativeViterbiK9DecodeStandard,
+  nativeViterbiK9Decode,
+  nativeConvK9Encode,
+} from "./native/viterbi-napi";
+
 /**
  * Tuning parameters for the Viterbi preprocessor.
  */
@@ -58,6 +68,12 @@ export interface ViterbiPreprocessConfig {
    */
   useConvolutionalViterbi: boolean;
   /**
+   * v68: Use napi-rs native K=9 Viterbi instead of JS K=3 for the
+   * convolutional Viterbi step. ~0.5ms vs ~10ms per oligo.
+   * Default: true (auto-detects availability).
+   */
+  useNativeViterbi: boolean;
+  /**
    * HMM transition parameters. Defaults tuned for ONT R10.4.1 (9% total IDS).
    */
   hmmParams: Hmm3Params;
@@ -68,6 +84,7 @@ export const DEFAULT_VITERBI_CONFIG: ViterbiPreprocessConfig = {
   hmmBandWidth: 12,
   minClusterForHmm: 2,
   useConvolutionalViterbi: false,
+  useNativeViterbi: true, // v68: use napi-rs K=9 when available
   hmmParams: {
     ...DEFAULT_HMM3_PARAMS,
     // ONT R10.4.1 has higher indel rates than Illumina

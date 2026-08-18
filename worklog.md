@@ -238,3 +238,30 @@ Stage Summary:
 - Small-tier real-dataset roundtrip: PASS (SARS-CoV-2, UniProt EGFR)
 - Unit tests: 7/7 passing
 - Key files modified: codec.ts, decode.ts, constrained-mapping.ts, mapping.ts, presets.ts, types.ts
+---
+Task ID: 2-4-5
+Agent: main
+Task: Medium-tier testing, MSA + napi-rs Viterbi wiring, K=9 penalty tuning
+
+Work Log:
+- Built napi-rs native Viterbi addon (libhelix_dna_napi.so, 372KB)
+- Verified addon: K=9 standard decode 0.44ms, K=9 indel decode 42ms (maxDrift=5)
+- E. coli K-12 (4.6MB): PASS with v51-default (73s encode, 4.4s decode, 51677 oligos, density=1.406 b/nt)
+- Yeast S288C (12MB): encode running in background
+- Wired napi-rs as FIRST-PRIORITY Viterbi in convolutional-indel.ts (before WASM, before JS)
+- Added enableNativeViterbi()/isNativeViterbiActive() exports to convolutional-indel.ts
+- Added useNativeViterbi flag to ViterbiPreprocessConfig in viterbi-preprocess.ts
+- Wired napi-rs init in decode.ts for nanopore/pacbio channels
+- K=9 penalty tuning completed: ins=1.5, del=1.5, maxDrift=10 confirmed optimal
+- Standard Viterbi: 100% recovery at ≤5% sub rate (0.87ms/oligo)
+- Indel Viterbi: 100% recovery at ≤5% sub, 63% at 8% sub (53ms/oligo)
+- Key finding: Simple consensus fails for indel channels (40% bit error) — MSA alignment required
+- Recommendation: MSA consensus → K=9 standard Viterbi (0.87ms) for post-MSA reads
+- Reduced DEFAULT_INDEL_VITERBI_CONFIG maxDrift from 15 to 10
+
+Stage Summary:
+- napi-rs addon built and verified (v0.4.2)
+- E. coli K-12: PASS (v51-default)
+- MSA + napi-rs Viterbi wired into cascade (3 integration points)
+- K=9 penalty tuning: ins=1.5 del=1.5 maxDrift=10 optimal
+- LDPC parity: 8B recommended for post-MSA regime

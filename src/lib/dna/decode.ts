@@ -694,6 +694,11 @@ export async function decodeReads(
   const channel = metadata.channel ?? cfg.channel ?? "illumina";
   if (channel === "nanopore" || channel === "pacbio") {
     const { viterbiPreprocessReads } = await import("./viterbi-preprocess");
+    // v68: Try to enable napi-rs native Viterbi for faster K=9 decode
+    try {
+      const { enableNativeViterbi } = await import("./convolutional-indel");
+      await enableNativeViterbi();
+    } catch { /* napi-rs not available, will use WASM/JS fallback */ }
     // v52: pass useConvolutionalViterbi flag if encoder used conv inner
     const correctedClusters = viterbiPreprocessReads(clusters, channel, {
       useConvolutionalViterbi: useConvInner,
