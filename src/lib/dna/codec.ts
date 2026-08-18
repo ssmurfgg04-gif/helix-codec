@@ -480,7 +480,13 @@ export async function encodeFile(
       innerBlock.set(rsCodeword, 0);
       innerBlock.set(crc, rsCodeword.length);
       // Split: address bytes use direct, rest uses constrained
-      dna = bytesToSplitConstrainedDna(innerBlock, cfg.constraints.maxHomopolymer, layout.addressBytes);
+      // v65: Split constrained mapping WITH GC-balancing codebooks.
+      // Pass GC constraints so the encoder steers GC toward [gcMin, gcMax].
+      const splitResult = bytesToSplitConstrainedDna(
+        innerBlock, cfg.constraints.maxHomopolymer, layout.addressBytes,
+        cfg.constraints.gcMin, cfg.constraints.gcMax,
+      );
+      dna = splitResult.dna;
       bestDna = dna;
       bestSeed = 0;
       bestSatisfied = true;
@@ -1359,7 +1365,11 @@ export function canonicalToSynthesis(
       seed = 0;
     } else if (useConstrained) {
       // Split constrained mapping
-      dna = bytesToSplitConstrainedDna(block.innerBytes, cfg.constraints.maxHomopolymer, layout.addressBytes);
+      const splitResult2 = bytesToSplitConstrainedDna(
+        block.innerBytes, cfg.constraints.maxHomopolymer, layout.addressBytes,
+        cfg.constraints.gcMin, cfg.constraints.gcMax,
+      );
+      dna = splitResult2.dna;
       seed = 0;
     } else if (useSrt) {
       // SRT constrained mapping

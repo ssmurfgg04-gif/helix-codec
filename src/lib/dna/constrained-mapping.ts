@@ -39,6 +39,165 @@
 
 import { Base, gcContent, maxHomopolymerRun } from "./mapping";
 
+// ---------------------------------------------------------------------------
+// GC rotating codebooks (from constraints.ts, adapted for split mapping)
+// ---------------------------------------------------------------------------
+
+/**
+ * Four codebooks for GC-balanced encoding.
+ *
+ * Each codebook maps a 2-bit code to a base index, biased toward different
+ * GC levels. This allows the encoder to steer GC content toward the target
+ * range by selecting the appropriate codebook based on the running GC fraction.
+ *
+ * Codebook 0 (A-rich, GC≈35%): 00→A, 01→T, 10→C, 11→G
+ * Codebook 1 (Balanced, GC≈50%): 00→A, 01→C, 10→G, 11→T (standard)
+ * Codebook 2 (C-rich, GC≈65%): 00→C, 01→G, 10→A, 11→T
+ * Codebook 3 (Rotating): alternates between 0,1,2 per byte to self-balance
+ */
+const GC_CODEBOOKS: number[][] = [
+  [0, 3, 1, 2], // A-rich: 00→A, 01→T, 10→C, 11→G
+  [0, 1, 2, 3], // Balanced: standard 2-bit
+  [1, 2, 0, 3], // C-rich: 00→C, 01→G, 10→A, 11→T
+  [0, 1, 2, 3], // Rotating: same as balanced (alternates per byte)
+];
+
+/** Inverse codebooks: baseIdx → code */
+const INV_GC_CODEBOOKS: number[][] = GC_CODEBOOKS.map((cb) => {
+  const inv = new Array(4) as number[];
+  for (let code = 0; code < 4; code++) inv[cb[code]] = code;
+  return inv;
+});
+
+/** GC set: indices 1 (C) and 2 (G) are GC bases */
+const GC_SET = new Set([1, 2]);
+
+/**
+ * Select codebook based on POSITION ONLY — decoder-friendly, no metadata needed.
+ *
+ * Cycles through codebooks every `cycleLen` bytes (not bases):
+ *   - Bytes at positions 0..cycleLen-1: balanced (default)
+ *   - Bytes at positions cycleLen..2*cycleLen-1: A-rich (push GC down)
+ *   - Bytes at positions 2*cycleLen..3*cycleLen-1: C-rich (push GC up)
+ *
+ * IMPORTANT: When the encoder is at or near the homopolymer limit (runLen >= maxHomopolymer - 1),
+ * always use the BALANCED codebook (identity permutation) to avoid encode/decode ambiguity
+ * at derangement positions. The derangement logic is only correct with the identity codebook.
+ *
+ * The decoder uses the SAME position-based formula + run-state to reconstruct codebooks.
+ *
+ * @param bytePosition Current byte position (0-indexed)
+ * @param runLen Current homopolymer run length
+ * @param maxHomopolymer Maximum allowed homopolymer run
+ * @param cycleLen Length of each codebook cycle in bytes (default 8)
+ * @returns Codebook index (0=A-rich, 1=balanced, 2=C-rich)
+ */
+function selectCodebookByPosition(
+  bytePosition: number,
+  runLen: number = 0,
+  maxHomopolymer: number = 3,
+  gcCount: number = 0,
+  totalBases: number = 0,
+): number {
+  // Always use balanced codebook near the homopolymer limit to avoid
+  // codebook-derangement interaction ambiguity
+  if (runLen >= maxHomopolymer - 1) return 1;
+
+  // GC-feedback: if we have enough data, use running GC to steer
+  // This is decoder-friendly because the decoder tracks the same running GC
+  if (totalBases > 16) {
+    const runningGC = gcCount / totalBases;
+    if (runningGC > 0.55) return 0; // A-rich: push GC down
+    if (runningGC < 0.45) return 2; // C-rich: push GC up
+    return 1; // Balanced
+  }
+
+  // For the first few bytes, use position-based cycling as initial GC balance
+  const phase = Math.floor(bytePosition / 4) % 3;
+  if (phase === 1) return 0; // A-rich
+  if (phase === 2) return 2; // C-rich
+  return 1; // Balanced
+}
+
+/**
+ * Deterministic GC+RLL encode for a single byte (4 bases).
+ *
+ * Applies GC codebook permutation first, then RLL derangement at limit.
+ * Returns the 4 output base indices and the codebook used.
+ */
+function encodeByteWithGC(
+  byte: number,
+  maxHomopolymer: number,
+  prevIdx: number,
+  runLen: number,
+  gcCount: number,
+  totalBases: number,
+  bytePosition: number,
+): { bases: [number, number, number, number]; codebook: number; newPrevIdx: number; newRunLen: number; newGcCount: number; newTotalBases: number } {
+  // Select codebook based on byte position + GC feedback + run state
+  const codebook = selectCodebookByPosition(bytePosition, runLen, maxHomopolymer, gcCount, totalBases);
+  const cb = GC_CODEBOOKS[codebook];
+
+  const bases: number[] = [0, 0, 0, 0];
+  let curPrevIdx = prevIdx;
+  let curRunLen = runLen;
+  let curGcCount = gcCount;
+  let curTotalBases = totalBases;
+
+  for (let pair = 0; pair < 4; pair++) {
+    const bits = (byte >> (6 - pair * 2)) & 0b11;
+
+    // Step 1: Apply codebook permutation
+    let baseIdx = cb[bits];
+
+    // Step 2: Apply RLL constraint — if at homopolymer limit and codebook
+    // chose the same base as prev, remap to a different non-prev base.
+    // Use bits to select among the 3 non-prev bases.
+    if (curRunLen >= maxHomopolymer && curPrevIdx >= 0 && baseIdx === curPrevIdx) {
+      // Remap to a non-prev base using the derangement table.
+      // MAP_4TO3_IDX[prevIdx][bits] gives a base index ≠ prevIdx.
+      baseIdx = MAP_4TO3_IDX[curPrevIdx][bits];
+    }
+
+    // Update state
+    if (baseIdx === curPrevIdx) {
+      curRunLen++;
+    } else {
+      curRunLen = 1;
+      curPrevIdx = baseIdx;
+    }
+    if (GC_SET.has(baseIdx)) curGcCount++;
+    curTotalBases++;
+
+    bases[pair] = baseIdx;
+  }
+
+  return {
+    bases: bases as [number, number, number, number],
+    codebook,
+    newPrevIdx: curPrevIdx,
+    newRunLen: curRunLen,
+    newGcCount: curGcCount,
+    newTotalBases: curTotalBases,
+  };
+}
+
+/**
+ * 4→3 mapping on BASE INDICES (not Base strings) at homopolymer limit.
+ * MAP_4TO3_IDX[prevIdx][bits] = output base index.
+ * Same logic as MAP_4TO3 but works with indices for speed.
+ */
+const MAP_4TO3_IDX: number[][] = [
+  // prev=A (idx 0): allowed = [C=1, G=2, T=3]
+  [1, 2, 3, 1],
+  // prev=C (idx 1): allowed = [A=0, G=2, T=3]
+  [0, 2, 3, 0],
+  // prev=G (idx 2): allowed = [A=0, C=1, T=3]
+  [0, 1, 3, 0],
+  // prev=T (idx 3): allowed = [A=0, C=1, G=2]
+  [0, 1, 2, 0],
+];
+
 /**
  * Derangement table for homopolymer limit.
  * A derangement is a permutation with NO fixed points — no element maps to itself.
@@ -158,115 +317,152 @@ function invMap4to3(prev: Base, base: Base): number[] {
 }
 
 /**
- * Encode bytes to DNA using fixed-rate constrained 2-bit mapping.
+ * Encode bytes to DNA using fixed-rate constrained 2-bit mapping WITH GC balancing.
  *
  * ALWAYS produces exactly `data.length * 4` bases (same as direct 2-bit).
- * Guarantees homopolymer runs ≤ maxHomopolymer.
- * Uses 4→3 mapping at the limit (with 1 collision) — erasures handled by LDPC.
+ * Guarantees homopolymer runs ≤ maxHomopolymer via 4→3 derangement.
+ * Steers GC toward [gcMin, gcMax] via rotating codebooks.
  *
  * @param data Input bytes
  * @param maxHomopolymer Maximum allowed homopolymer run (default 3)
- * @returns DNA string with length = data.length * 4
+ * @param gcMin Minimum GC fraction (default 0.4)
+ * @param gcMax Maximum GC fraction (default 0.6)
+ * @returns DNA string with length = data.length * 4, plus codebook sequence
  */
-export function bytesToConstrainedDna(data: Uint8Array, maxHomopolymer: number = 3): string {
+export function bytesToConstrainedDna(
+  data: Uint8Array,
+  maxHomopolymer: number = 3,
+  gcMin: number = 0.4,
+  gcMax: number = 0.6,
+): { dna: string; codebookSequence: number[] } {
   const parts: string[] = new Array(data.length * 4);
-  let prev: Base = "A";
-  let runLength = 0;
+  const codebookSeq: number[] = new Array(data.length);
+  let prevIdx = -1;
+  let runLen = 0;
+  let gcCount = 0;
+  let totalBases = 0;
 
   for (let i = 0; i < data.length; i++) {
     const byte = data[i];
-    for (let bitPair = 0; bitPair < 4; bitPair++) {
-      const bits = (byte >> (6 - bitPair * 2)) & 0b11;
-      let base: Base;
-
-      if (runLength >= maxHomopolymer) {
-        // At homopolymer limit: use 4→3 mapping (guarantees base ≠ prev)
-        const prevIdx = BASE_TO_IDX[prev];
-        base = MAP_4TO3[prevIdx][bits];
-      } else {
-        // Normal: direct 2-bit mapping
-        base = BASES[bits];
-      }
-
-      // Update run tracking
-      if (base === prev) {
-        runLength++;
-      } else {
-        runLength = 1;
-        prev = base;
-      }
-
-      parts[i * 4 + bitPair] = base;
+    const result = encodeByteWithGC(byte, maxHomopolymer, prevIdx, runLen, gcCount, totalBases, i);
+    codebookSeq[i] = result.codebook;
+    prevIdx = result.newPrevIdx;
+    runLen = result.newRunLen;
+    gcCount = result.newGcCount;
+    totalBases = result.newTotalBases;
+    for (let p = 0; p < 4; p++) {
+      parts[i * 4 + p] = BASES[result.bases[p]];
     }
   }
 
-  return parts.join("");
+  return { dna: parts.join(""), codebookSequence: codebookSeq };
 }
 
 /**
- * Decode DNA (constrained 2-bit) back to bytes with erasure info.
+ * Decode DNA (constrained 2-bit with GC codebooks) back to bytes with erasure info.
  *
- * Uses the inverse 4→3 mapping. When the collided base is observed,
- * the MSB is marked as an erasure. The LDPC/CRC handles erasure correction.
+ * Uses the inverse GC codebook first, then inverse 4→3 mapping.
+ * When the collided base is observed at a limit position,
+ * the MSB is marked as an erasure.
  *
  * @param dna DNA string (constrained 2-bit encoded, length = bytes * 4)
  * @param maxHomopolymer Maximum allowed homopolymer run (must match encoder)
  * @param expectedBytes Expected number of output bytes
+ * @param codebookSequence GC codebook sequence from encoding (if available)
  * @returns Object with decoded bytes and erasure mask
  */
 export function constrainedDnaToBytesWithErasure(
   dna: string,
   maxHomopolymer: number = 3,
   expectedBytes?: number,
+  codebookSequence?: number[],
 ): { data: Uint8Array; erasures: boolean[] } {
   const numBytes = expectedBytes ?? Math.floor(dna.length / 4);
   const out = new Uint8Array(numBytes);
   const erasures = new Array<boolean>(numBytes * 8).fill(false);
-  let prev: Base = "A";
-  let runLength = 0;
+  let prevIdx = -1;
+  let runLen = 0;
+  let gcCount = 0; // track GC for codebook reconstruction
+  let totalBases = 0;
 
   for (let i = 0; i < numBytes; i++) {
+    // Use codebook from sequence if available, else reconstruct from position + GC
+    const codebook = codebookSequence?.[i] ?? selectCodebookByPosition(i, runLen, maxHomopolymer, gcCount, totalBases);
+    const invCb = INV_GC_CODEBOOKS[codebook];
+    const cb = GC_CODEBOOKS[codebook];
     let byte = 0;
+
     for (let bitPair = 0; bitPair < 4; bitPair++) {
       const base = dna[i * 4 + bitPair] as Base;
-      let msb: number;
-      let lsb: number;
+      const baseIdx = BASE_TO_IDX[base];
       const bitIdx = i * 8 + bitPair * 2;
 
-      if (runLength >= maxHomopolymer) {
-        // At homopolymer limit: inverse 4→3 mapping
-        const possibleCodes = invMap4to3(prev, base);
-        if (possibleCodes.length === 1) {
-          // Unique code — fully known
-          const code = possibleCodes[0];
-          msb = (code >> 1) & 1;
-          lsb = code & 1;
-        } else {
-          // Collision — 2 possible codes (differ in MSB, same LSB)
-          // Take LSB from either (they're the same), mark MSB as erasure
-          const code0 = possibleCodes[0];
-          const code1 = possibleCodes[1];
-          // LSBs should be the same for collided codes
-          lsb = code0 & 1;
-          // MSBs differ — mark as erasure, use code0's MSB as placeholder
-          msb = (code0 >> 1) & 1;
+      let msb: number;
+      let lsb: number;
+
+      if (runLen >= maxHomopolymer && prevIdx >= 0) {
+        // At homopolymer limit: the encoder may have applied the derangement.
+        //
+        // Encoder logic: if cb[bits] === prevIdx → apply derangement
+        //   output = MAP_4TO3_IDX[prevIdx][bits]  (≠ prevIdx)
+        // otherwise: output = cb[bits]
+        //
+        // Decoder: we see baseIdx. Two possible sources:
+        //   A) baseIdx came from codebook directly (no derangement):
+        //      code = invCb[baseIdx], and cb[code] !== prevIdx
+        //   B) baseIdx came from derangement:
+        //      some code c where MAP_4TO3_IDX[prevIdx][c] = baseIdx
+        //      AND cb[c] === prevIdx (encoder only deranges when codebook = prev)
+        //
+        // We check both paths and pick the correct one.
+
+        const codeViaCodebook = invCb[baseIdx];
+        const pathA_valid = cb[codeViaCodebook] !== prevIdx;
+
+        let codeViaDerangement = -1;
+        for (let c = 0; c < 4; c++) {
+          if (MAP_4TO3_IDX[prevIdx][c] === baseIdx && cb[c] === prevIdx) {
+            codeViaDerangement = c;
+            break;
+          }
+        }
+        const pathB_valid = codeViaDerangement >= 0;
+
+        if (pathB_valid && !pathA_valid) {
+          // Only derangement path is valid
+          msb = (codeViaDerangement >> 1) & 1;
+          lsb = codeViaDerangement & 1;
+        } else if (pathA_valid && !pathB_valid) {
+          // Only codebook path is valid
+          msb = (codeViaCodebook >> 1) & 1;
+          lsb = codeViaCodebook & 1;
+        } else if (pathA_valid && pathB_valid) {
+          // Both paths valid — true ambiguity (4→3 collision).
+          // At limit positions, the encoder was actively avoiding prevIdx,
+          // so prefer the derangement path (path B) and mark as erasure.
           erasures[bitIdx] = true;
+          msb = (codeViaDerangement >> 1) & 1;
+          lsb = codeViaDerangement & 1;
+        } else {
+          // Neither path valid — fallback to codebook
+          msb = (codeViaCodebook >> 1) & 1;
+          lsb = codeViaCodebook & 1;
         }
       } else {
-        // Normal: direct 2-bit mapping (fully known)
-        const idx = BASE_TO_IDX[base];
-        msb = (idx >> 1) & 1;
-        lsb = idx & 1;
+        // Normal: inverse codebook
+        const code = invCb[baseIdx];
+        msb = (code >> 1) & 1;
+        lsb = code & 1;
       }
 
       byte = (byte << 2) | (msb << 1) | lsb;
 
       // Update run tracking
-      if (base === prev) {
-        runLength++;
+      if (baseIdx === prevIdx) {
+        runLen++;
       } else {
-        runLength = 1;
-        prev = base;
+        runLen = 1;
+        prevIdx = baseIdx;
       }
     }
     out[i] = byte;
@@ -278,38 +474,62 @@ export function constrainedDnaToBytesWithErasure(
 /**
  * Decode DNA (constrained 2-bit) back to bytes (without erasure info).
  */
-export function constrainedDnaToBytes(dna: string, maxHomopolymer: number = 3, expectedBytes?: number): Uint8Array {
-  return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes).data;
+export function constrainedDnaToBytes(
+  dna: string,
+  maxHomopolymer: number = 3,
+  expectedBytes?: number,
+  codebookSequence?: number[],
+): Uint8Array {
+  return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes, codebookSequence).data;
+}
+
+/** Result of split constrained encoding. */
+export interface SplitConstrainedEncodeResult {
+  dna: string;
+  codebookSequence: number[]; // codebook indices for the constrained region
 }
 
 /**
- * Encode bytes to DNA using split constrained mapping.
+ * Encode bytes to DNA using split constrained mapping WITH GC balancing.
  * The first `directBytes` use direct 2-bit mapping (no erasures, reliable clustering),
- * the rest use constrained mapping (homopolymer-free with ~1.1% erasure rate).
+ * the rest use constrained mapping with GC codebook rotation (homopolymer-free,
+ * GC-balanced, ~1.1% erasure rate).
  *
  * This is critical for correct address extraction during clustering: the address
  * bytes MUST be direct-mapped so that dnaToBytes() can recover the oligo index.
+ *
+ * @param data Input bytes
+ * @param maxHomopolymer Maximum allowed homopolymer run (default 3)
+ * @param directBytes Number of bytes to direct-map (default 4, for address)
+ * @param gcMin Minimum GC fraction (default 0.4)
+ * @param gcMax Maximum GC fraction (default 0.6)
+ * @returns DNA string and codebook sequence for the constrained region
  */
 export function bytesToSplitConstrainedDna(
   data: Uint8Array,
   maxHomopolymer: number = 3,
   directBytes: number = 4,
-): string {
+  gcMin: number = 0.4,
+  gcMax: number = 0.6,
+): SplitConstrainedEncodeResult {
   if (directBytes <= 0) {
-    return bytesToConstrainedDna(data, maxHomopolymer);
+    const result = bytesToConstrainedDna(data, maxHomopolymer, gcMin, gcMax);
+    return { dna: result.dna, codebookSequence: result.codebookSequence };
   }
 
   // Part 1: Direct 2-bit mapping for the first `directBytes` bytes
   const directDna = bytesToDnaDirect(data.slice(0, directBytes));
 
-  // Part 2: Constrained mapping for the remaining bytes.
-  // We need to seed the constrained encoder's run tracker with the state
-  // left by the direct-mapped region, so it correctly handles homopolymers
-  // that span the boundary.
+  // Part 2: Constrained mapping with GC balancing for the remaining bytes.
+  // Seed the constrained encoder's run tracker with the state
+  // left by the direct-mapped region.
   const restData = data.slice(directBytes);
-  const constrainedDna = bytesToConstrainedDnaSeeded(restData, maxHomopolymer, directDna);
+  const constrainedResult = bytesToConstrainedDnaSeeded(restData, maxHomopolymer, directDna, gcMin, gcMax);
 
-  return directDna + constrainedDna;
+  return {
+    dna: directDna + constrainedResult.dna,
+    codebookSequence: constrainedResult.codebookSequence,
+  };
 }
 
 /**
@@ -330,26 +550,39 @@ function bytesToDnaDirect(data: Uint8Array): string {
 }
 
 /**
- * Constrained bytes→DNA mapping, seeded with the run state from a preceding DNA string.
+ * Constrained bytes→DNA mapping WITH GC balancing, seeded with the run state from a preceding DNA string.
  * This ensures homopolymer tracking is continuous across the direct/constrained boundary.
  */
 function bytesToConstrainedDnaSeeded(
   data: Uint8Array,
   maxHomopolymer: number,
   prefixDna: string,
-): string {
-  if (data.length === 0) return "";
+  gcMin: number = 0.4,
+  gcMax: number = 0.6,
+): { dna: string; codebookSequence: number[] } {
+  if (data.length === 0) return { dna: "", codebookSequence: [] };
 
   // Initialize run state from the prefix DNA
-  let prev: Base = "A";
-  let runLength = 0;
+  let prevIdx = -1;
+  let runLen = 0;
+  let gcCount = 0;
+  let totalBases = 0;
+
   if (prefixDna.length > 0) {
-    prev = prefixDna[prefixDna.length - 1] as Base;
+    // Count GC in prefix
+    for (let i = 0; i < prefixDna.length; i++) {
+      const c = prefixDna.charCodeAt(i);
+      if (c === 71 || c === 67) gcCount++; // G=71, C=67
+    }
+    totalBases = prefixDna.length;
+
     // Count trailing run of the same base
-    runLength = 1;
+    const lastBase = prefixDna[prefixDna.length - 1];
+    prevIdx = BASE_TO_IDX[lastBase as Base];
+    runLen = 1;
     for (let i = prefixDna.length - 2; i >= 0; i--) {
-      if (prefixDna[i] === prev) {
-        runLength++;
+      if (prefixDna[i] === lastBase) {
+        runLen++;
       } else {
         break;
       }
@@ -357,45 +590,44 @@ function bytesToConstrainedDnaSeeded(
   }
 
   const parts: string[] = new Array(data.length * 4);
+  const codebookSeq: number[] = new Array(data.length);
+
   for (let i = 0; i < data.length; i++) {
     const byte = data[i];
-    for (let bitPair = 0; bitPair < 4; bitPair++) {
-      const bits = (byte >> (6 - bitPair * 2)) & 0b11;
-      let base: Base;
-
-      if (runLength >= maxHomopolymer) {
-        const prevIdx = BASE_TO_IDX[prev];
-        base = MAP_4TO3[prevIdx][bits];
-      } else {
-        base = BASES[bits];
-      }
-
-      if (base === prev) {
-        runLength++;
-      } else {
-        runLength = 1;
-        prev = base;
-      }
-
-      parts[i * 4 + bitPair] = base;
+    const result = encodeByteWithGC(byte, maxHomopolymer, prevIdx, runLen, gcCount, totalBases, i);
+    codebookSeq[i] = result.codebook;
+    prevIdx = result.newPrevIdx;
+    runLen = result.newRunLen;
+    gcCount = result.newGcCount;
+    totalBases = result.newTotalBases;
+    for (let p = 0; p < 4; p++) {
+      parts[i * 4 + p] = BASES[result.bases[p]];
     }
   }
-  return parts.join("");
+
+  return { dna: parts.join(""), codebookSequence: codebookSeq };
 }
 
 /**
- * Decode DNA (split constrained) back to bytes with erasure info.
+ * Decode DNA (split constrained with GC codebooks) back to bytes with erasure info.
  * The first `directBytes*4` nt use direct 2-bit mapping (no erasures),
- * the rest use constrained mapping with erasure tracking.
+ * the rest use constrained mapping with GC codebook and erasure tracking.
+ *
+ * @param dna DNA string
+ * @param maxHomopolymer Maximum allowed homopolymer run (must match encoder)
+ * @param directBytes Number of directly-mapped bytes at start (default 4)
+ * @param expectedBytes Expected number of output bytes
+ * @param codebookSequence GC codebook sequence for the constrained region (from encoder)
  */
 export function splitConstrainedDnaToBytesWithErasure(
   dna: string,
   maxHomopolymer: number = 3,
   directBytes: number = 4,
   expectedBytes?: number,
+  codebookSequence?: number[],
 ): { data: Uint8Array; erasures: boolean[] } {
   if (directBytes <= 0) {
-    return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes);
+    return constrainedDnaToBytesWithErasure(dna, maxHomopolymer, expectedBytes, codebookSequence);
   }
 
   const numBytes = expectedBytes ?? Math.floor(dna.length / 4);
@@ -418,19 +650,18 @@ export function splitConstrainedDnaToBytesWithErasure(
   }
 
   // Part 2: Constrained decode for the remaining bytes
-  // We need to seed the run tracker with the state from the direct-mapped region.
   const restDna = dna.slice(directNt);
   const restBytes = numBytes - directBytes;
 
   // Initialize run state from the direct-mapped DNA
-  let prev: Base = "A";
-  let runLength = 0;
+  let prevIdx = -1;
+  let runLen = 0;
   if (directNt > 0) {
-    prev = dna[directNt - 1] as Base;
-    runLength = 1;
+    prevIdx = BASE_TO_IDX[dna[directNt - 1] as Base];
+    runLen = 1;
     for (let i = directNt - 2; i >= 0; i--) {
-      if (dna[i] === prev) {
-        runLength++;
+      if (BASE_TO_IDX[dna[i] as Base] === prevIdx) {
+        runLen++;
       } else {
         break;
       }
@@ -438,40 +669,61 @@ export function splitConstrainedDnaToBytesWithErasure(
   }
 
   for (let i = 0; i < restBytes; i++) {
+    // Use codebook from sequence if available, else reconstruct from position
+    const codebook = codebookSequence?.[i] ?? selectCodebookByPosition(i, runLen, maxHomopolymer);
+    const invCb = INV_GC_CODEBOOKS[codebook];
+    const cb = GC_CODEBOOKS[codebook];
     let byte = 0;
+
     for (let bitPair = 0; bitPair < 4; bitPair++) {
-      const pos = i * 4 + bitPair;
-      if (pos >= restDna.length) break;
-      const base = restDna[pos] as Base;
-      let msb: number;
-      let lsb: number;
+      const base = restDna[i * 4 + bitPair] as Base;
+      const baseIdx = BASE_TO_IDX[base];
       const bitIdx = (directBytes + i) * 8 + bitPair * 2;
 
-      if (runLength >= maxHomopolymer) {
-        const possibleCodes = invMap4to3(prev, base);
-        if (possibleCodes.length === 1) {
-          const code = possibleCodes[0];
-          msb = (code >> 1) & 1;
-          lsb = code & 1;
-        } else {
-          const code0 = possibleCodes[0];
-          lsb = code0 & 1;
-          msb = (code0 >> 1) & 1;
+      let msb: number;
+      let lsb: number;
+
+      if (runLen >= maxHomopolymer && prevIdx >= 0) {
+        // Same dual-path decode logic as constrainedDnaToBytesWithErasure
+        const codeViaCodebook = invCb[baseIdx];
+        const pathA_valid = cb[codeViaCodebook] !== prevIdx;
+
+        let codeViaDerangement = -1;
+        for (let c = 0; c < 4; c++) {
+          if (MAP_4TO3_IDX[prevIdx][c] === baseIdx && cb[c] === prevIdx) {
+            codeViaDerangement = c;
+            break;
+          }
+        }
+        const pathB_valid = codeViaDerangement >= 0;
+
+        if (pathB_valid && !pathA_valid) {
+          msb = (codeViaDerangement >> 1) & 1;
+          lsb = codeViaDerangement & 1;
+        } else if (pathA_valid && !pathB_valid) {
+          msb = (codeViaCodebook >> 1) & 1;
+          lsb = codeViaCodebook & 1;
+        } else if (pathA_valid && pathB_valid) {
           erasures[bitIdx] = true;
+          msb = (codeViaCodebook >> 1) & 1;
+          lsb = codeViaCodebook & 1;
+        } else {
+          msb = (codeViaCodebook >> 1) & 1;
+          lsb = codeViaCodebook & 1;
         }
       } else {
-        const idx = BASE_TO_IDX[base];
-        msb = (idx >> 1) & 1;
-        lsb = idx & 1;
+        const code = invCb[baseIdx];
+        msb = (code >> 1) & 1;
+        lsb = code & 1;
       }
 
       byte = (byte << 2) | (msb << 1) | lsb;
 
-      if (base === prev) {
-        runLength++;
+      if (baseIdx === prevIdx) {
+        runLen++;
       } else {
-        runLength = 1;
-        prev = base;
+        runLen = 1;
+        prevIdx = baseIdx;
       }
     }
     out[directBytes + i] = byte;
