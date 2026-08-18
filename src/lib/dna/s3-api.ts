@@ -42,7 +42,7 @@ export interface S3Stat {
  * Parse a DNA URI (dna://pool/key).
  */
 export function parseDnaUri(uri: string): S3Uri {
-  const match = uri.match(/^dna:\/\/([^\/]+)\/?(.*)$/);
+  const match = uri.match(/^dna:\/\/([^/]+)\/?(.*)$/);
   if (!match) {
     throw new Error(`Invalid DNA URI: ${uri}. Expected format: dna://pool/key`);
   }

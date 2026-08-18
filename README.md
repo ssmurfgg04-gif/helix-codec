@@ -2,6 +2,8 @@
 
 **DNA storage codec. Encode digital files to synthetic DNA oligos and decode noisy sequencing reads back to the original file. Built with TypeScript + Rust WASM for hot paths.**
 
+> **📖 [How to Use Guide](HOW_TO_USE.md)** — Installation, API usage, running tests, and AI agent instructions.
+
 ---
 
 ## Overview

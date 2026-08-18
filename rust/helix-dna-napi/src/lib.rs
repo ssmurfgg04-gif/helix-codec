@@ -269,5 +269,5 @@ pub fn viterbi_k9_decode_standard(received: Buffer) -> Buffer {
 
 #[napi]
 pub fn napi_version() -> String {
-    format!("helix-dna-napi v0.4.1 — Viterbi v4.1 (compact trellis, balanced penalties, adaptive drift, LLR)")
+    format!("helix-dna-napi v0.4.2 — Viterbi v4.2 (compact trellis, balanced penalties, adaptive drift, LLR, realistic IDS thresholds)")
 }
