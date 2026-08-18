@@ -437,8 +437,10 @@ export async function encodeFile(
       bestSatisfied = true;
     } else if (useGoldman) {
       // Goldman rotational mapping: GUARANTEES no homopolymers (max run = 1).
-      // No screening needed — every oligo is valid. GC content is ~50% on average.
-      // Seed is always 0 (no XOR re-encoding needed).
+      // GC content is ~50% on average, but may fall outside [gcMin, gcMax].
+      // For Goldman mode, GC violations are rare and much less problematic
+      // than homopolymer violations. If strict GC is needed, use a mapping
+      // mode with GC screening (constrained, BHE, or direct).
       const address = rawAddress.slice();
       address[3] = 0; // seed = 0
       const whitenedAddress = whitenAddress(address);
@@ -459,10 +461,6 @@ export async function encodeFile(
       bestDna = dna;
       bestSeed = 0;
       bestSatisfied = true;
-      // Goldman guarantees maxHomopolymer = 1, but GC may still be out of range.
-      // For high-entropy data, GC is ~50% on average. If out of range, we could
-      // retry with a different startBase, but for simplicity we accept it.
-      // (GC violations are much less problematic than homopolymers for synthesis.)
     } else if (useConstrained) {
       // Split constrained mapping: direct for address (4B), constrained for rest.
       // Address uses direct mapping (no erasures → reliable clustering).
@@ -1356,7 +1354,7 @@ export function canonicalToSynthesis(
     let seed = 0;
 
     if (useGoldman) {
-      // Goldman rotational mapping: no screening needed
+      // Goldman rotational mapping: no screening needed (homopolymer-free)
       dna = bytesToGoldmanDna(block.innerBytes, "A", cfg.goldmanMode ?? "fast");
       seed = 0;
     } else if (useConstrained) {

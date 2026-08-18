@@ -2,7 +2,9 @@
  * Full Viterbi+OSD+LDPC+RS Cascade Validation
  *
  * This is the REAL validation script that wires the complete decode cascade:
+ *   0. MSA-based consensus preprocessing (Profile HMM alignment)
  *   1. Indel-Tolerant Viterbi (K=9, d_free=24) — handles insertions/deletions
+ *      (napi-rs native addon when available, JS fallback otherwise)
  *   2. OSD-0/1/2/3 cascade — soft-decision decoding for residual errors
  *   3. LDPC belief propagation (8-10B parity for Nanopore) — inner code
  *   4. Outer RS erasure recovery — covers any remaining LDPC failures
@@ -29,8 +31,39 @@ import { ReedSolomon, RSDecodeResult } from '../src/lib/dna/reedsolomon';
 import { ArithmeticEncoder, ArithmeticDecoder, AdaptiveModel } from '../src/lib/dna/arithmetic-coder';
 import { crc16, verifyCrc16, crc16Bytes } from '../src/lib/dna/crc16';
 import { crc32 } from '../src/lib/dna/crc32';
+import { viterbiPreprocessCluster, DEFAULT_VITERBI_CONFIG, ViterbiPreprocessConfig } from '../src/lib/dna/viterbi-preprocess';
+import { SequencingRead } from '../src/lib/dna/simulate';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Native napi-rs Viterbi addon (optional — falls back to JS if unavailable)
+// ---------------------------------------------------------------------------
+
+let nativeViterbi: any = null;
+try {
+  nativeViterbi = await import('../rust/helix-dna-napi/index.js');
+} catch {
+  // Native addon not built — will use JS Viterbi fallback
+}
+
+const USE_NATIVE_VITERBI = !!nativeViterbi;
+console.log(`[cascade] Native Viterbi: ${USE_NATIVE_VITERBI ? 'AVAILABLE (napi-rs)' : 'not available (using JS fallback)'}`);
+
+// MSA preprocessing config — tune for Nanopore 9% IDS
+const MSA_CONFIG: ViterbiPreprocessConfig = {
+  ...DEFAULT_VITERBI_CONFIG,
+  enabled: true,
+  hmmBandWidth: 15,       // wider band for higher IDS
+  minClusterForHmm: 2,
+  useConvolutionalViterbi: false,
+  hmmParams: {
+    ...DEFAULT_VITERBI_CONFIG.hmmParams,
+    matchToInsert: 0.06,   // Nanopore R10.4.1: ~6% insertion rate
+    matchToDelete: 0.06,   // Nanopore R10.4.1: ~6% deletion rate
+    matchToMatch: 0.88,    // 1 - ins - del
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -238,7 +271,9 @@ interface CascadeResult {
   recoveredOligos: number;
   recoveryRate: number;
   // Breakdown by decode stage
+  msaCorrected: number;      // oligos that went through MSA preprocessing
   viterbiSuccesses: number;
+  nativeViterbiUsed: number;  // oligos decoded by native napi-rs addon
   osdSuccesses: number;
   osdOrderUsed: number[]; // which OSD order succeeded (0,1,2,3 or -1)
   ldpcSuccesses: number;
@@ -270,7 +305,9 @@ function runCascadeTest(
 
   const totalOligos = payloads.length;
   let recoveredOligos = 0;
+  let msaCorrected = 0;
   let viterbiSuccesses = 0;
+  let nativeViterbiUsed = 0;
   let osdSuccesses = 0;
   let ldpcSuccesses = 0;
   let rsErasures = 0;
@@ -406,18 +443,53 @@ function runCascadeTest(
     // Generate multiple noisy reads (coverage)
     const reads: string[] = [];
     const readQualities: Float32Array[] = [];
+    const sequencingReads: SequencingRead[] = [];
     for (let r = 0; r < coverage; r++) {
       const { noisy, qualityScores, substitutions, insertions, deletions } =
         applyNoisyChannel(originalDna, subRate, insRate, delRate, rng);
       reads.push(noisy);
       readQualities.push(qualityScores);
+      // Build SequencingRead for MSA preprocessing
+      const qScores = new Uint8Array(noisy.length);
+      for (let p = 0; p < noisy.length; p++) {
+        qScores[p] = Math.min(40, Math.max(2, Math.round(qualityScores[p] / 0.2303)));
+      }
+      sequencingReads.push({ sequence: noisy, quality: qScores });
       totalSubs += substitutions;
       totalIns += insertions;
       totalDels += deletions;
     }
 
-    // Step 1: Soft consensus to reduce errors
-    const { consensus: consensusDna, perBaseLLR } = softConsensus(reads, readQualities, originalDna.length);
+    // Step 0: MSA-based consensus preprocessing (Profile HMM alignment)
+    // This is critical for noisy Nanopore channels: the HMM correctly identifies
+    // insertion and deletion positions and removes/fills them at the RIGHT place,
+    // unlike simple position-wise voting which misaligns after indels.
+    let consensusDna: string;
+    let perBaseLLR: Float32Array;
+
+    if (coverage >= 2 && MSA_CONFIG.enabled) {
+      msaCorrected++;
+      // Use MSA-based preprocessing: HMM aligns each read to the cluster consensus
+      const correctedReads = viterbiPreprocessCluster(sequencingReads, MSA_CONFIG);
+      // Build soft consensus from MSA-corrected reads
+      const correctedSeqs = correctedReads.map(r => r.sequence);
+      const correctedQuals = correctedReads.map(r => {
+        const q = r.quality ?? new Uint8Array(r.sequence.length).fill(20);
+        const llrs = new Float32Array(r.sequence.length);
+        for (let p = 0; p < r.sequence.length; p++) {
+          llrs[p] = (q[p] || 20) * 0.2303;
+        }
+        return llrs;
+      });
+      const result = softConsensus(correctedSeqs, correctedQuals, originalDna.length);
+      consensusDna = result.consensus;
+      perBaseLLR = result.perBaseLLR;
+    } else {
+      // Fallback: simple soft consensus without MSA
+      const result = softConsensus(reads, readQualities, originalDna.length);
+      consensusDna = result.consensus;
+      perBaseLLR = result.perBaseLLR;
+    }
 
     // Convert DNA back to bits, then to bytes
     const bits: number[] = [];
@@ -434,6 +506,7 @@ function runCascadeTest(
     }
 
     // Step 2: Convolutional decode (Indel-Viterbi)
+    // Try native napi-rs addon first (5-100× faster), fall back to JS
     let afterConv: Uint8Array;
     let convSuccess = false;
 
@@ -452,10 +525,32 @@ function runCascadeTest(
           bitLLRs[b] = hardBit === 0 ? baseLlr : -baseLlr;
         }
 
-        const { decoded, corrected } = convInner.decode(consensusBytes, bitLLRs);
-        afterConv = decoded;
-        convSuccess = true;
-        viterbiSuccesses++;
+        // Try native napi-rs Viterbi first (much faster for K=9)
+        if (USE_NATIVE_VITERBI && nativeViterbi.viterbi_k9_decode_with_llr) {
+          try {
+            const nativeResult = nativeViterbi.viterbi_k9_decode_with_llr(
+              Buffer.from(consensusBytes),
+              bitLLRs,
+              { max_drift: 15, insertion_penalty: 1.5, deletion_penalty: 1.5, use_llr: true, num_info_bits: innerDataBytes * 8 },
+            );
+            afterConv = new Uint8Array(nativeResult);
+            convSuccess = true;
+            viterbiSuccesses++;
+            nativeViterbiUsed++;
+          } catch {
+            // Native decode failed — fall back to JS
+            const { decoded, corrected } = convInner.decode(consensusBytes, bitLLRs);
+            afterConv = decoded;
+            convSuccess = true;
+            viterbiSuccesses++;
+          }
+        } else {
+          // JS fallback
+          const { decoded, corrected } = convInner.decode(consensusBytes, bitLLRs);
+          afterConv = decoded;
+          convSuccess = true;
+          viterbiSuccesses++;
+        }
       } catch {
         afterConv = consensusBytes.slice(0, innerDataBytes);
       }
@@ -607,7 +702,9 @@ function runCascadeTest(
     totalOligos,
     recoveredOligos,
     recoveryRate: recoveredOligos / totalOligos,
+    msaCorrected,
     viterbiSuccesses,
+    nativeViterbiUsed,
     osdSuccesses,
     osdOrderUsed,
     ldpcSuccesses,
@@ -724,7 +821,9 @@ async function runCascadeValidation(config: CascadeConfig = DEFAULT_CASCADE_CONF
     nanopore9pct: results.filter(r => Math.abs(r.idsRate - 0.09) < 0.001),
     // Aggregate: which decode stage contributes most to recovery?
     stageContribution: {
+      totalMsa: results.reduce((s, r) => s + r.msaCorrected, 0),
       totalViterbi: results.reduce((s, r) => s + r.viterbiSuccesses, 0),
+      totalNativeViterbi: results.reduce((s, r) => s + r.nativeViterbiUsed, 0),
       totalLdpc: results.reduce((s, r) => s + r.ldpcSuccesses, 0),
       totalOsd: results.reduce((s, r) => s + r.osdSuccesses, 0),
       totalRs: results.reduce((s, r) => s + r.rsRecovered, 0),
@@ -791,7 +890,8 @@ async function main() {
   // Stage contribution
   const sc = summary.stageContribution;
   console.log('\n=== Decode Stage Contribution ===');
-  console.log(`  Viterbi successes:  ${sc.totalViterbi}`);
+  console.log(`  MSA preprocessed:   ${sc.totalMsa}`);
+  console.log(`  Viterbi successes:  ${sc.totalViterbi} (native: ${sc.totalNativeViterbi})`);
   console.log(`  LDPC successes:     ${sc.totalLdpc}`);
   console.log(`  OSD successes:      ${sc.totalOsd}`);
   console.log(`  RS erasure recov:   ${sc.totalRs}`);
