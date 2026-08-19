@@ -1,0 +1,11 @@
+======================================================================
+  helix-codec Medium-Tier Real-Dataset Validation
+======================================================================
+  Resuming: 1 tests already completed
+  SKIP ecoli-k12.fa (already completed)
+
+  Loading yeast.fa...
+  Loaded: 12157105 bytes
+
+  Encoding yeast.fa (11.59 MB, 12157105 bytes)...
+  Start: 2026-08-19T03:43:56.852Z

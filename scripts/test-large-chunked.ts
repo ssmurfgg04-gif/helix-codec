@@ -1,8 +1,11 @@
 /**
- * Robust medium-tier test: E. coli K-12 + Yeast S288C
- * 
- * Processes one dataset at a time, saves incrementally, 
- * works within long timeouts.
+ * Large-tier test: Human chr21 (4MB chunk to fit in memory).
+ *
+ * The full chr21 is ~46MB; encoding all of it causes OOM in our environment.
+ * We take a 4MB chunk of the actual sequence (skipping N's) and run the
+ * full encode → simulate → decode roundtrip with the v51-default preset.
+ *
+ * Resume-capable: saves incremental results to datasets/large-results.json.
  */
 import { encodeFile } from "../src/lib/dna/codec";
 import { decodeReads } from "../src/lib/dna/decode";
@@ -19,6 +22,7 @@ function parseFasta(content: string): string {
 
 interface Result {
   file: string;
+  chunkBytes: number;
   preset: string;
   pass: boolean;
   oligoCount: number;
@@ -36,11 +40,11 @@ interface Result {
   error?: string;
 }
 
-async function testOne(data: Uint8Array, name: string): Promise<Result> {
+async function testChunk(data: Uint8Array, name: string): Promise<Result> {
   const cfg = V51_DEFAULT_CONFIG;
-  console.log(`\n  Encoding ${name} (${(data.length/1024/1024).toFixed(2)} MB, ${data.length} bytes)...`);
+  console.log(`\n  Encoding ${name} (${(data.length / 1024 / 1024).toFixed(2)} MB, ${data.length} bytes)...`);
   console.log(`  Start: ${new Date().toISOString()}`);
-  
+
   const t0 = Date.now();
   let enc: any, stats: any;
   try {
@@ -49,7 +53,7 @@ async function testOne(data: Uint8Array, name: string): Promise<Result> {
     stats = result.stats;
   } catch (e: any) {
     console.log(`  ENCODE ERROR: ${e.message?.slice(0, 300)}`);
-    return { file: name, preset: "v51-default", pass: false, oligoCount: 0, density: 0, encMs: Date.now() - t0, decMs: 0, gcV: 0, hpV: 0, gcMin: 0, gcMax: 0, maxHp: 0, roundtrip: false, hashOk: false, dataSize: data.length, error: e.message?.slice(0, 300) };
+    return { file: name, chunkBytes: data.length, preset: "v51-default", pass: false, oligoCount: 0, density: 0, encMs: Date.now() - t0, decMs: 0, gcV: 0, hpV: 0, gcMin: 0, gcMax: 0, maxHp: 0, roundtrip: false, hashOk: false, dataSize: data.length, error: e.message?.slice(0, 300) };
   }
   const encMs = Date.now() - t0;
   console.log(`  Encode done: ${encMs}ms`);
@@ -66,21 +70,20 @@ async function testOne(data: Uint8Array, name: string): Promise<Result> {
   console.log(`  Encoded: ${stats.oligoCount} oligos, density=${stats.netDensityBitsPerNt.toFixed(3)} b/nt`);
   console.log(`  Constraints: GC=[${gcMin.toFixed(3)},${gcMax.toFixed(3)}], maxHp=${maxHp}, gcViol=${gcV}, hpViol=${hpV}`);
 
-  // Use 10× coverage for faster decode
   console.log(`  Simulating reads (10× coverage)...`);
   const sim = simulate(enc.oligos, { ...PRESET_CLEAN, coverage: 10, simulator: "basic" });
   console.log(`  Simulated ${sim.totalReads} reads, decoding...`);
-  
+
   const d0 = Date.now();
   let dec: any;
   try {
     dec = await decodeReads(sim.reads, enc.metadata, cfg, enc.forwardPrimer, enc.reversePrimer);
   } catch (e: any) {
     console.log(`  DECODE ERROR: ${e.message?.slice(0, 300)}`);
-    return { file: name, preset: "v51-default", pass: false, oligoCount: stats.oligoCount, density: stats.netDensityBitsPerNt, encMs, decMs: Date.now() - d0, gcV, hpV, gcMin, gcMax, maxHp, roundtrip: false, hashOk: false, dataSize: data.length, error: e.message?.slice(0, 300) };
+    return { file: name, chunkBytes: data.length, preset: "v51-default", pass: false, oligoCount: stats.oligoCount, density: stats.netDensityBitsPerNt, encMs, decMs: Date.now() - d0, gcV, hpV, gcMin, gcMax, maxHp, roundtrip: false, hashOk: false, dataSize: data.length, error: e.message?.slice(0, 300) };
   }
   const decMs = Date.now() - d0;
-  
+
   let roundtrip = false;
   if (dec.data && dec.data.length === data.length) {
     roundtrip = true;
@@ -88,7 +91,7 @@ async function testOne(data: Uint8Array, name: string): Promise<Result> {
       if (dec.data[i] !== data[i]) { roundtrip = false; break; }
     }
   }
-  
+
   const hashOk = dec.hashMatches;
   // Note: hpViol > 0 is a known v51-default encoder issue across all tiers
   // (E.coli: hpViol=9892, chr21 chunks: hpViol=1467-2028). The actual
@@ -97,58 +100,71 @@ async function testOne(data: Uint8Array, name: string): Promise<Result> {
   const pass = roundtrip && hashOk && gcV === 0;
   console.log(`  Decode done: ${decMs}ms, roundtrip=${roundtrip}, hash=${hashOk}`);
   console.log(`  [${pass ? "PASS" : "FAIL"}] ${name}` + (hpV > 0 ? ` (NOTE: ${hpV} homopolymer violations — known v51 encoder issue)` : ""));
-  
-  return { file: name, preset: "v51-default", pass, oligoCount: stats.oligoCount, density: stats.netDensityBitsPerNt, encMs, decMs, gcV, hpV, gcMin, gcMax, maxHp, roundtrip, hashOk, dataSize: data.length };
+
+  return { file: name, chunkBytes: data.length, preset: "v51-default", pass, oligoCount: stats.oligoCount, density: stats.netDensityBitsPerNt, encMs, decMs, gcV, hpV, gcMin, gcMax, maxHp, roundtrip, hashOk, dataSize: data.length };
 }
 
 async function main() {
   console.log("=".repeat(70));
-  console.log("  helix-codec Medium-Tier Real-Dataset Validation");
+  console.log("  helix-codec Large-Tier Real-Dataset Validation (chr21 chunks)");
   console.log("=".repeat(70));
 
   const results: Result[] = [];
-  const dir = path.join(__dirname, "..", "datasets", "medium");
-
-  // Load any existing results for resume
-  const outPath = path.join(__dirname, "..", "datasets", "medium-results.json");
+  const outPath = path.join(__dirname, "..", "datasets", "large-results.json");
   const existingResults: Result[] = (() => {
     try { return JSON.parse(fs.readFileSync(outPath, "utf-8")); } catch { return []; }
   })();
-  const completed = new Set(existingResults.map(r => `${r.file}:${r.preset}`));
+  const completed = new Set(existingResults.map(r => `${r.file}:${r.chunkBytes}`));
   if (completed.size > 0) {
-    console.log(`  Resuming: ${completed.size} tests already completed`);
+    console.log(`  Resuming: ${completed.size} chunks already completed`);
     results.push(...existingResults);
   }
 
-  for (const f of ["ecoli-k12.fa", "yeast.fa"]) {
-    const key = `${f}:v51-default`;
+  // Load chr21
+  const faPath = path.join(__dirname, "..", "datasets", "large", "chr21.fa");
+  console.log(`\n  Loading chr21.fa...`);
+  const content = fs.readFileSync(faPath, "utf-8");
+  const seq = parseFasta(content);
+  console.log(`  Total sequence length: ${seq.length} chars (${(seq.length / 1024 / 1024).toFixed(2)} MB)`);
+
+  // Skip N's at start; take chunks from actual sequence
+  const firstNonN = seq.split("").findIndex(c => c !== "N");
+  console.log(`  First non-N position: ${firstNonN}`);
+
+  // Take 4 chunks of 1MB each from different parts of chr21
+  const CHUNK_SIZE = 1_000_000;
+  const chunks = [
+    { name: "chr21-1mb-a", start: firstNonN },
+    { name: "chr21-1mb-b", start: firstNonN + 10_000_000 },
+    { name: "chr21-1mb-c", start: firstNonN + 20_000_000 },
+    { name: "chr21-1mb-d", start: firstNonN + 30_000_000 },
+  ];
+
+  for (const c of chunks) {
+    if (c.start + CHUNK_SIZE > seq.length) {
+      console.log(`  SKIP ${c.name}: out of bounds (start=${c.start}, len=${seq.length})`);
+      continue;
+    }
+    const key = `${c.name}:${CHUNK_SIZE}`;
     if (completed.has(key)) {
-      console.log(`  SKIP ${f} (already completed)`);
+      console.log(`  SKIP ${c.name} (already completed)`);
       continue;
     }
-    
-    const p = path.join(dir, f);
-    if (!fs.existsSync(p)) {
-      console.log(`  SKIP: ${f} not found at ${p}`);
-      continue;
-    }
-    
-    console.log(`\n  Loading ${f}...`);
-    const seq = parseFasta(fs.readFileSync(p, "utf-8"));
-    const data = new Uint8Array(Buffer.from(seq, "utf-8"));
-    console.log(`  Loaded: ${data.length} bytes`);
-    
-    const result = await testOne(data, f);
+
+    const subSeq = seq.slice(c.start, c.start + CHUNK_SIZE);
+    const data = new Uint8Array(Buffer.from(subSeq, "utf-8"));
+    console.log(`\n  Loading ${c.name} (offset ${c.start}, ${data.length} bytes)...`);
+
+    const result = await testChunk(data, c.name);
     results.push(result);
 
-    // Save incrementally
     fs.writeFileSync(outPath, JSON.stringify(results, null, 2));
     console.log(`  Saved incremental results`);
   }
 
   // Summary
   console.log("\n" + "=".repeat(70));
-  console.log("  MEDIUM-TIER SUMMARY");
+  console.log("  LARGE-TIER SUMMARY");
   console.log("=".repeat(70));
   for (const r of results) {
     const status = r.pass ? "PASS" : "FAIL";

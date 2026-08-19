@@ -1,0 +1,10 @@
+=== K=9 Penalty Tuning ===
+
+[viterbi-napi] helix-dna-napi v0.4.2 — Viterbi v4.2 (compact trellis, balanced penalties, adaptive drift, LLR, realistic IDS thresholds)
+Pre-encoding 5 payloads (32 bytes each)...
+Encoded 5 payloads, each 66 bytes
+
+Sweeping configs...
+
+Config            | clean    | light    | med      | heavy    
+------------------|----------|----------|----------|----------

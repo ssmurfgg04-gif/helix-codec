@@ -1,0 +1,254 @@
+{
+  "generatedAt": "2026-08-19T03:53:18.546Z",
+  "samplesPerScenario": 5,
+  "scenarios": [
+    "clean",
+    "light-1i-1d",
+    "med-3i-2d"
+  ],
+  "results": [
+    {
+      "ins": 1,
+      "del": 1,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 93.6,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 1,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 140,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 1,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 182.9,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 1.5,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 94.8,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 1.5,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 143.8,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 1.5,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 183.8,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 2,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 91.2,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 2,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 137.9,
+      "samples": 10
+    },
+    {
+      "ins": 1,
+      "del": 2,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 181.3,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 94.5,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 140.7,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 183.4,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1.5,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 92.1,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1.5,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 136.9,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 1.5,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 179.5,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 2,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 92.3,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 2,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 137.7,
+      "samples": 10
+    },
+    {
+      "ins": 1.5,
+      "del": 2,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 181,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 93.3,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 137,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 179.9,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1.5,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 92.2,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1.5,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 137.4,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 1.5,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 181.4,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 2,
+      "drift": 10,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 90.3,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 2,
+      "drift": 15,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 135.6,
+      "samples": 10
+    },
+    {
+      "ins": 2,
+      "del": 2,
+      "drift": 20,
+      "success": 1,
+      "meanBer": 0,
+      "meanMs": 179.9,
+      "samples": 10
+    }
+  ]
+}

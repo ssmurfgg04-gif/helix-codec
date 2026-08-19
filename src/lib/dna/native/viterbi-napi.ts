@@ -35,14 +35,44 @@ interface NativeAddon {
 let _addon: NativeAddon | null = null;
 let _loadAttempted = false;
 
+// Resolve project root robustly. In tsx/ESM, `__dirname` is shimmed to the
+// file's directory, so going up 4 levels from src/lib/dna/native/ lands at
+// project root. We also try a few fallbacks to be safe.
+function projectRootCandidates(): string[] {
+  const roots = new Set<string>();
+  try { roots.add(path.resolve(__dirname, '../../../../')); } catch { /* */ }
+  try {
+    // import.meta.url — works under native ESM (node --experimental-vm-modules etc.)
+    const url = (import.meta as any)?.url;
+    if (typeof url === 'string') {
+      roots.add(path.resolve(new URL(url).pathname, '../../../../'));
+    }
+  } catch { /* */ }
+  // Walk up from cwd looking for rust/helix-dna-napi
+  try {
+    let dir = process.cwd();
+    for (let i = 0; i < 8; i++) {
+      if (fs.existsSync(path.join(dir, 'rust/helix-dna-napi'))) {
+        roots.add(dir);
+        break;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch { /* */ }
+  return Array.from(roots);
+}
+
 function tryLoadAddon(): NativeAddon | null {
   if (_loadAttempted) return _addon;
   _loadAttempted = true;
   try {
-    const candidates = [
-      path.resolve(__dirname, '../../../../rust/helix-dna-napi/target/release/libhelix_dna_napi.so'),
-      path.resolve(__dirname, '../../../../rust/helix-dna-napi/target/release/libhelix_dna_napi.dylib'),
-    ];
+    const candidates: string[] = [];
+    for (const root of projectRootCandidates()) {
+      candidates.push(path.resolve(root, 'rust/helix-dna-napi/target/release/libhelix_dna_napi.so'));
+      candidates.push(path.resolve(root, 'rust/helix-dna-napi/target/release/libhelix_dna_napi.dylib'));
+    }
     for (const addonPath of candidates) {
       if (!fs.existsSync(addonPath)) continue;
       try {
@@ -53,7 +83,10 @@ function tryLoadAddon(): NativeAddon | null {
           _addon = addon;
           return _addon;
         }
-      } catch { /* skip */ }
+      } catch (e: any) {
+        // Log the dlopen failure so silent misconfiguration is visible
+        try { console.warn(`[viterbi-napi] dlopen failed for ${addonPath}: ${e.message}`); } catch { /* */ }
+      }
     }
     return null;
   } catch { return null; }
