@@ -1,12 +1,10 @@
 ======================================================================
-  helix-codec Yeast Chunked Validation (3MB chunks)
+  helix-codec Medium-Tier Real-Dataset Validation
 ======================================================================
 
-  Loading yeast.fa...
-  Total sequence length: 12157105 chars (11.59 MB)
+  Loading ecoli-k12.fa...
+  Loaded: 4641652 bytes
 
-  Loading yeast-1mb-a (offset 0, 1000000 bytes)...
-
-  Encoding yeast-1mb-a (0.95 MB, 1000000 bytes)...
-  Start: 2026-08-19T03:57:56.517Z
+  Encoding ecoli-k12.fa (4.43 MB, 4641652 bytes)...
+  Start: 2026-08-20T06:00:34.150Z
 [helix-codec] Encoding without encryption. DNA storage data is vulnerable to unauthorized read/write when stored without encryption. Pass encryptPassword in the config to enable XChaCha20-Poly1305 authenticated encryption.

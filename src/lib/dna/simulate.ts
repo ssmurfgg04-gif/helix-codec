@@ -35,6 +35,8 @@ import {
   NANOPORE_WETLAB,
   PACBIO_WETLAB,
 } from "./dt4dds-simulate";
+// v69: napi-rs native simulation hot path (FIRST PRIORITY for bulk read simulation)
+import { getNativeAddon } from "./native/helix-napi";
 
 export interface MutationConfig {
   /** Per-position substitution rate (0..1). */
@@ -464,6 +466,131 @@ export function simulate(
   const droppedOligos: number[] = [];
   const perOligoStats: SimulationResult["perOligoStats"] = [];
 
+  // v69: napi-rs native simulation FIRST PRIORITY (bulk path).
+  // For each oligo, call the native simulate_oligo_reads which returns a flat
+  // array of [coverage_u32, r0_len_u32, r0_bytes, r1_len_u32, r1_bytes, ...]
+  // We parse it into SequencingRead objects on the JS side.
+  const nativeAddon = getNativeAddon();
+  if (nativeAddon && oligos.length > 0) {
+    for (const oligo of oligos) {
+      // Synthesis dropout (use the same RNG as the JS path)
+      if (rng.next() < cfg.dropoutRate) {
+        droppedOligos.push(oligo.index);
+        perOligoStats.push({
+          index: oligo.index,
+          avgSubstitutions: 0,
+          avgInsertions: 0,
+          avgDeletions: 0,
+          readCount: 0,
+        });
+        continue;
+      }
+
+      try {
+        // Strip primers (simulate only the inner oligo region)
+        const seq = oligo.sequence;
+        const nativeResult = nativeAddon.simulateOligoReads(seq, {
+          substitutionRate: cfg.substitutionRate,
+          insertionRate: cfg.insertionRate,
+          deletionRate: cfg.deletionRate,
+          coverage: cfg.coverage,
+          dropoutRate: 0, // already handled above
+          seed: cfg.seed || 0,
+          positionDependent: false, // basic simulator: uniform rates
+          fivePrimeMult: 1.0,
+          threePrimeMult: 1.0,
+        });
+
+        // Parse flat output: [coverage_u32, r0_len_u32, r0_bytes, ...]
+        const view = new DataView(nativeResult.buffer, nativeResult.byteOffset, nativeResult.byteLength);
+        let pos = 0;
+        if (pos + 4 > nativeResult.byteLength) continue;
+        const actualCoverage = view.getUint32(pos, true); // little-endian
+        pos += 4;
+
+        let totalSubs = 0;
+        let totalIns = 0;
+        let totalDels = 0;
+        for (let r = 0; r < actualCoverage; r++) {
+          if (pos + 4 > nativeResult.byteLength) break;
+          const rlen = view.getUint32(pos, true);
+          pos += 4;
+          if (pos + rlen > nativeResult.byteLength) break;
+          // Decode bytes back to string
+          let readSeq = '';
+          for (let i = 0; i < rlen; i++) {
+            readSeq += String.fromCharCode(nativeResult[pos + i]);
+          }
+          pos += rlen;
+          // Estimate error counts from length delta (best-effort)
+          const origLen = seq.length;
+          const newLen = readSeq.length;
+          const ins = Math.max(0, newLen - origLen);
+          const dels = Math.max(0, origLen - newLen);
+          let subs = 0;
+          const minLen = Math.min(origLen, newLen);
+          for (let i = 0; i < minLen; i++) {
+            if (readSeq[i] !== seq[i]) subs++;
+          }
+          totalSubs += subs;
+          totalIns += ins;
+          totalDels += dels;
+          reads.push({
+            oligoIndex: oligo.index,
+            readIndex: r,
+            sequence: readSeq,
+            quality: new Uint8Array(rlen).fill(20),
+            substitutions: subs,
+            insertions: ins,
+            deletions: dels,
+          } as any);
+        }
+        perOligoStats.push({
+          index: oligo.index,
+          avgSubstitutions: totalSubs / Math.max(1, actualCoverage),
+          avgInsertions: totalIns / Math.max(1, actualCoverage),
+          avgDeletions: totalDels / Math.max(1, actualCoverage),
+          readCount: actualCoverage,
+        });
+      } catch {
+        // Native sim failed for this oligo — fall back to JS simulateRead
+        let totalSubs = 0;
+        let totalIns = 0;
+        let totalDels = 0;
+        for (let r = 0; r < cfg.coverage; r++) {
+          const read = simulateRead(oligo, cfg, rng);
+          reads.push(read);
+          totalSubs += read.substitutions;
+          totalIns += read.insertions;
+          totalDels += read.deletions;
+        }
+        perOligoStats.push({
+          index: oligo.index,
+          avgSubstitutions: totalSubs / cfg.coverage,
+          avgInsertions: totalIns / cfg.coverage,
+          avgDeletions: totalDels / cfg.coverage,
+          readCount: cfg.coverage,
+        });
+      }
+    }
+
+    const totalReads = reads.length;
+    const avgReadLength =
+      totalReads === 0 ? 0 : reads.reduce((s, r) => s + r.sequence.length, 0) / totalReads;
+    const totalErrors = reads.reduce((s, r) => s + r.substitutions + r.insertions + r.deletions, 0);
+
+    return {
+      reads,
+      droppedOligos,
+      perOligoStats,
+      totalReads,
+      avgReadLength,
+      totalErrors,
+      simulationTimeMs: Date.now() - t0,
+    };
+  }
+
+  // JS fallback (original path)
   for (const oligo of oligos) {
     // Synthesis dropout
     if (rng.next() < cfg.dropoutRate) {

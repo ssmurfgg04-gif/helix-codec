@@ -649,33 +649,55 @@ export async function encodeFile(
       dna = bytesToDna(innerBlock);
       bestDna = dna;
       bestSeed = 0;
-      bestSatisfied = true;
+      // v69: conv-inner direct mapping is deterministic but may violate GC.
+      // Verify constraints; if violated, we can't retry (deterministic) but
+      // mark as unsatisfied so the caller knows.
+      bestSatisfied = satisfiesConstraints(dna, constraints);
     } else if (useGoldman) {
       // Goldman rotational mapping: GUARANTEES no homopolymers (max run = 1).
       // GC content is ~50% on average, but may fall outside [gcMin, gcMax].
-      // For Goldman mode, GC violations are rare and much less problematic
-      // than homopolymer violations. If strict GC is needed, use a mapping
-      // mode with GC screening (constrained, BHE, or direct).
-      const address = rawAddress.slice();
-      address[3] = 0; // seed = 0
-      const whitenedAddress = whitenAddress(address);
-      const effectivePayload = payload; // no XOR (seed = 0)
-      const rsData = new Uint8Array(innerK);
-      rsData.set(whitenedAddress, 0);
-      rsData.set(effectivePayload, layout.addressBytes);
-      const rsCodeword = useLDPC && innerLdpcReal
-        ? innerLdpcReal.encode(rsData)
-        : innerRsReal.encode(rsData);
-      const crc = crc16Bytes(rsCodeword);
-      const innerBlock = new Uint8Array(totalNtBytes(layout));
-      innerBlock.set(rsCodeword, 0);
-      innerBlock.set(crc, rsCodeword.length);
-      // Goldman mapping: bytes → trits → DNA (homopolymer-free)
-      const goldmanMode = cfg.goldmanMode ?? "fast";
-      dna = bytesToGoldmanDna(innerBlock, "A", goldmanMode);
-      bestDna = dna;
-      bestSeed = 0;
-      bestSatisfied = true;
+      // v69: Apply seed-based retry loop for GC constraint enforcement.
+      // Previously this branch set bestSatisfied=true unconditionally without
+      // ever calling satisfiesConstraints — Goldman's rotational codebook has
+      // wide per-oligo GC variance (±10pp) and silently emitted oligos with
+      // GC as low as 0.39 (PR #84 CI failure).
+      const baseAddress = rawAddress.slice();
+      const baseRsData = new Uint8Array(innerK);
+      baseRsData.set(whitenAddress(baseAddress), 0);
+      baseRsData.set(payload, layout.addressBytes);
+
+      while (attempts <= cfg.maxRetries) {
+        baseAddress[3] = seed & 0xff;
+        const whitenedAddress = whitenAddress(baseAddress);
+        baseRsData.set(whitenedAddress, 0);
+        const effectivePayload = seed === 0 ? payload : xorWithSeed(payload, seed);
+        baseRsData.set(effectivePayload, layout.addressBytes);
+
+        const rsCodeword = useLDPC && innerLdpcReal
+          ? innerLdpcReal.encode(baseRsData)
+          : innerRsReal.encode(baseRsData);
+        const crc = crc16Bytes(rsCodeword);
+        const innerBlock = new Uint8Array(totalNtBytes(layout));
+        innerBlock.set(rsCodeword, 0);
+        innerBlock.set(crc, rsCodeword.length);
+
+        const goldmanMode = cfg.goldmanMode ?? "fast";
+        dna = bytesToGoldmanDna(innerBlock, "A", goldmanMode);
+
+        const ok = satisfiesConstraints(dna, constraints);
+        if (ok) {
+          bestDna = dna;
+          bestSeed = seed;
+          bestSatisfied = true;
+          break;
+        }
+        if (!bestDna || gcDeviation(dna, constraints) < gcDeviation(bestDna, constraints)) {
+          bestDna = dna;
+          bestSeed = seed;
+        }
+        attempts++;
+        seed = attempts;
+      }
     } else if (useConstrained) {
       // Split constrained mapping: direct for address (4B), constrained for rest.
       // Address uses direct mapping (no erasures → reliable clustering).
@@ -822,7 +844,8 @@ export async function encodeFile(
 
       bestDna = dna;
       bestSeed = 0;
-      bestSatisfied = true;
+      // v69: arithmetic-v2 deterministic, but verify constraints.
+      bestSatisfied = satisfiesConstraints(dna, constraints);
     } else if (useBHE) {
       // BHE FSM deterministic encoding — zero retries, guaranteed constraints.
       // Uses the full bhe-encode.ts module with BigInt variable-base conversion.
@@ -844,7 +867,8 @@ export async function encodeFile(
       dna = bheEncode(innerBlock, { maxRun: cfg.constraints.maxHomopolymer, enforceGC: true, gcMin: cfg.constraints.gcMin, gcMax: cfg.constraints.gcMax });
       bestDna = dna;
       bestSeed = 0;
-      bestSatisfied = true;
+      // v69: BHE claims enforceGC, but verify and mark unsatisfied if it failed.
+      bestSatisfied = satisfiesConstraints(dna, constraints);
     } else if (useYYC) {
       // YYC Yin-Yang high-density encoding — 2 bits/nt with alternating rule tables.
       // v67: Added seed-based retry loop for GC constraint enforcement.
@@ -931,6 +955,22 @@ export async function encodeFile(
     screeningRetries += attempts;
     dna = bestDna;
     seed = bestSeed;
+
+    // v69: Surface silent screening failures. Previously bestSatisfied=false
+    // was set but never logged — the oligo was emitted silently with the
+    // constraint violation only caught at downstream tests.
+    if (!bestSatisfied) {
+      const gc = gcContent(bestDna);
+      const maxHp = maxHomopolymerRun(bestDna);
+      const gcViol = gc < constraints.gcMin || gc > constraints.gcMax;
+      const hpViol = maxHp > constraints.maxHomopolymer;
+      console.warn(
+        `[codec] oligo ${oligoIdx} constraints NOT satisfied after ${attempts} attempt(s): ` +
+        `GC=${gc.toFixed(3)} (range [${constraints.gcMin}, ${constraints.gcMax}]${gcViol ? ' VIOLATION' : ''}), ` +
+        `maxHp=${maxHp} (limit ${constraints.maxHomopolymer}${hpViol ? ' VIOLATION' : ''}). ` +
+        `Best-effort oligo emitted. Mapping mode=${useGoldman ? 'goldman' : useBHE ? 'bhe' : useArithmetic ? 'arithmetic' : useConvInner ? 'conv' : 'other'}`
+      );
+    }
 
     // Compute stats on the payload region (excluding primers)
     const gc = gcContent(dna);

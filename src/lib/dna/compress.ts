@@ -54,6 +54,9 @@
  */
 
 import * as pako from 'pako';
+// v69: napi-rs native compression (FIRST PRIORITY when tier = 'auto' and
+// the data doesn't match another compressor's magic bytes)
+import { getNativeAddon } from './native/helix-napi';
 
 // ---------------------------------------------------------------------------
 // fflate import (high-speed JS-native DEFLATE — used as ZSTD tier)
@@ -1679,6 +1682,29 @@ export function compress(data: Uint8Array, config: CompressConfig = {}): Compres
  */
 export function decompress(data: Uint8Array, config: CompressConfig = {}): Uint8Array {
   const cfg = { ...DEFAULT_COMPRESS_CONFIG, ...config };
+
+  // v69: Check for helix-napi native compression format FIRST.
+  // Native format magic: 0x48 0x4E 0x41 0x50 (H-N-A-P for "Helix NAPI")
+  // followed by 0x01 (version). Tag bytes: 0x80 (back-ref), 0x81 (RLE), 0x82 (literal)
+  if (
+    cfg.tier === 'auto' || cfg.tier === undefined
+  ) {
+    if (
+      data.length >= 5 &&
+      data[0] === 0x48 && data[1] === 0x4E &&
+      data[2] === 0x41 && data[3] === 0x50 &&
+      data[4] === 0x01
+    ) {
+      try {
+        const native = require('./native/helix-napi').getNativeAddon();
+        if (native) {
+          // Strip magic bytes (5 bytes) and decompress
+          const payload = data.slice(5);
+          return new Uint8Array(native.decompressZstd(payload));
+        }
+      } catch { /* fall through */ }
+    }
+  }
 
   // Try to determine the compression format from magic bytes
   if (cfg.tier === 'auto' || cfg.tier === undefined) {

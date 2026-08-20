@@ -1,6 +1,7 @@
 //! helix-dna-napi: Native Node.js addon for K=9 Viterbi decoder
 //!
 //! v4.1: Production-hardened indel-tolerant Viterbi.
+//! v5.0: Added pack.rs, bhe.rs, compress.rs, ecc.rs, simulate.rs modules.
 //!
 //! Fixes over v3:
 //!   - CRITICAL: deletion_penalty = insertion_penalty = 1.5
@@ -9,6 +10,13 @@
 //!   - Adaptive maxDrift: auto-expand when received length diverges
 //!   - Compact traceback: back_ptr u16 + meta u8 (3 bytes/cell vs 14)
 //!   - LLR soft-decision support retained
+
+// v5.0: Sub-modules for the 5 Rust rewrites
+pub mod pack;
+pub mod bhe;
+pub mod compress;
+pub mod ecc;
+pub mod simulate;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

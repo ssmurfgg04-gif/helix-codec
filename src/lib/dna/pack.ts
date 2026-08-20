@@ -24,6 +24,8 @@
 import { simdUnpack, initSimdUnpack, isSimdAvailable } from "./simd-unpack";
 import { initSimdWasm, simdWasmUnpack, isSimdWasmReady } from "./simd-wasm-unpack";
 import { rustUnpackBitsToDna, rustPackDnaToBits, isRustWasmReady } from "./rust-wasm";
+// v69: napi-rs native FIRST PRIORITY (faster than WASM, true FFI)
+import { getNativeAddon } from "./native/helix-napi";
 
 // ---------------------------------------------------------------------------
 // Lookup tables for fast char ↔ 2-bit conversion
@@ -57,6 +59,14 @@ const BITS_TO_CHAR: string[] = ['A', 'C', 'G', 'T'];
  *   packDnaToBits('AAAA')  // Uint8Array [0x00]
  */
 export function packDnaToBits(dna: string): Uint8Array {
+  // v69: napi-rs native FIRST PRIORITY — true FFI, fastest path
+  const addon = getNativeAddon();
+  if (addon) {
+    try {
+      const result = addon.packDnaToBits(dna);
+      if (result && result.length > 0) return result;
+    } catch { /* fall through */ }
+  }
   // Rust WASM acceleration (SIMD + native bit ops)
   if (isRustWasmReady()) {
     const rustResult = rustPackDnaToBits(dna);
@@ -95,6 +105,15 @@ export function unpackBitsToDna(bits: Uint8Array, numBases: number): string {
     throw new Error(
       `numBases (${numBases}) exceeds packed capacity (${bits.length * 4})`,
     );
+  }
+
+  // v69: napi-rs native FIRST PRIORITY — true FFI, fastest path
+  const addon = getNativeAddon();
+  if (addon) {
+    try {
+      const result = addon.unpackBitsToDna(bits, numBases);
+      if (result && result.length > 0) return result;
+    } catch { /* fall through */ }
   }
 
   // Rust WASM acceleration (SIMD + native bit ops, 6× faster than JS scalar)
@@ -236,6 +255,11 @@ export function bitParallelHamming(a: Uint8Array, b: Uint8Array): number {
       `Arrays must have same length: ${a.length} vs ${b.length}`,
     );
   }
+  // v69: napi-rs native FIRST PRIORITY
+  const addon = getNativeAddon();
+  if (addon) {
+    try { return addon.bitParallelHamming(a, b); } catch { /* fall through */ }
+  }
 
   let popcount = 0;
   for (let i = 0; i < a.length; i++) {
@@ -343,6 +367,11 @@ export function bitParallelMatch(pattern: Uint8Array, text: Uint8Array): number[
  *   complement(packDnaToBits('ACGT'))  // packDnaToBits('TGCA')
  */
 export function complement(bits: Uint8Array): Uint8Array {
+  // v69: napi-rs native FIRST PRIORITY
+  const addon = getNativeAddon();
+  if (addon) {
+    try { return addon.complementPacked(bits); } catch { /* fall through */ }
+  }
   const out = new Uint8Array(bits.length);
   for (let i = 0; i < bits.length; i++) {
     out[i] = bits[i] ^ 0xFF;
@@ -372,6 +401,11 @@ export function complement(bits: Uint8Array): Uint8Array {
  */
 export function reverseComplement(bits: Uint8Array, numBases: number): Uint8Array {
   if (numBases === 0) return new Uint8Array(0);
+  // v69: napi-rs native FIRST PRIORITY
+  const addon = getNativeAddon();
+  if (addon) {
+    try { return addon.reverseComplementPacked(bits, numBases); } catch { /* fall through */ }
+  }
 
   // Step 1: Complement (XOR each byte)
   const comp = complement(bits);

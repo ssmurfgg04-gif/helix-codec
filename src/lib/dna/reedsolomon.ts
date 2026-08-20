@@ -26,6 +26,8 @@ import { createRequire } from 'node:module';
 const require2 = createRequire(import.meta.url ?? __filename);
 const rsLib = require2("reedsolomon");
 import { gfMul, gfDiv, gfInverse, gfPow } from "./gf256";
+// v69: napi-rs native Reed-Solomon (FIRST PRIORITY for encode/parity)
+import { getNativeAddon } from "./native/helix-napi";
 
 export interface RSConfig {
   n: number; // total codeword length (data + parity), <= 255
@@ -67,6 +69,14 @@ export class ReedSolomon {
   encode(data: Uint8Array): Uint8Array {
     if (data.length !== this.k) {
       throw new Error(`RS encode expects ${this.k} bytes, got ${data.length}`);
+    }
+    // v69: napi-rs native FIRST PRIORITY — true FFI RS encode
+    const addon = getNativeAddon();
+    if (addon) {
+      try {
+        const result = addon.rsEncode(data, this.nsym);
+        if (result && result.length === this.n) return result;
+      } catch { /* fall through */ }
     }
     const msg = new Int32Array(this.n);
     for (let i = 0; i < this.k; i++) msg[i] = data[i];
